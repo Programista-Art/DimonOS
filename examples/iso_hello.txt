@@ -1,0 +1,2 @@
+Hello from Dimon-16 ISO image!
+This is a text file loaded from disk (INT 6) and printed via INT 2.
