@@ -11,6 +11,12 @@ An educational 16-bit computer system and operating system written in C and Asse
 
 ## Dimon-16 Processor Architecture
 
+<!-- ![Dimon](img/2.png) -->
+<p align="center">
+  <img src="img/2.png" width="48%" />
+  <img src="img/3.png" width="48%" />
+</p>
+
 | Component | Specification |
 |---|---|
 | Word Size | 16-bit |
@@ -76,7 +82,7 @@ DimonOS includes a freestanding 32-bit Multiboot x86 native kernel (`arch/x86/`)
 - **Hardware Drivers**: 8259 PIC interrupt remapping, 8254 PIT 1000 Hz timer, PS/2 Keyboard controller with Scancode Set 1 decoding, PS/2 Mouse driver with hardware cursor, and COM1 serial output.
 - **Embedded Storage**: Embeds `os.bin` and virtual `dimon.iso` disk volumes directly into kernel images.
 
-### Quick Start: Running in QEMU
+### Quick Start: Running in QEMU on Linux
 ```bash
 # Build kernel and bootable ISO
 make baremetal-iso
@@ -86,6 +92,10 @@ make qemu
 
 # Or boot directly with QEMU:
 qemu-system-i386 -cdrom dimon-baremetal.iso
+```
+### Quick Start: Running in QEMU on Windows 11
+```
+& "C:\Program Files\qemu\qemu-system-i386.exe" -cdrom dimon-baremetal.iso
 ```
 
 ### Running on Real Hardware (USB Drive)
@@ -139,3 +149,13 @@ make test          # Run automated unit and CLI tests
 make gui-test      # Run automated headless TUI GUI test
 make clean         # Clean all build artifacts
 ```
+
+## Screenshots
+| | | |
+| :---: | :---: | :---: |
+| ![Dimon OS](img/1.png) | ![Dimon OS](img/3.png) | ![Dimon OS](img/4.png) |
+| ![Dimon OS](img/5.png) | ![Dimon OS](img/6.png) | ![Dimon OS](img/2.png) | 
+
+
+
+
