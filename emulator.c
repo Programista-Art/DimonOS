@@ -8,140 +8,79 @@
 #include <termios.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
-#include "dimon16.h"
+#include "dimon64.h"
+#include <inttypes.h>
 #include "font8x16.h"
 
-static const uint32_t vga_palette[16] = {
-    0x000000, /* 0: Black */
-    0x0000AA, /* 1: Blue */
-    0x00AA00, /* 2: Green */
-    0x00AAAA, /* 3: Cyan */
-    0xAA0000, /* 4: Red */
-    0xAA00AA, /* 5: Magenta */
-    0xAA5500, /* 6: Brown */
-    0xAAAAAA, /* 7: Light Gray */
-    0x555555, /* 8: Dark Gray */
-    0x5555FF, /* 9: Light Blue */
-    0x55FF55, /* 10: Light Green */
-    0x55FFFF, /* 11: Light Cyan */
-    0xFF5555, /* 12: Light Red */
-    0xFF55FF, /* 13: Light Magenta */
-    0xFFFF55, /* 14: Yellow */
-    0xFFFFFF  /* 15: White */
+/* 12x19 32-bit Arrow Cursor */
+static const char *cursor_arrow[19] = {
+    "X           ",
+    "XX          ",
+    "X.X         ",
+    "X..X        ",
+    "X...X       ",
+    "X....X      ",
+    "X.....X     ",
+    "X......X    ",
+    "X.......X   ",
+    "X........X  ",
+    "X.....XXXXX ",
+    "X..X..X     ",
+    "X.X X..X    ",
+    "XX   X..X   ",
+    "X     X..X  ",
+    "      X..X  ",
+    "       XX   ",
+    "            ",
+    "            "
 };
 
-/* --- Convert CP437 character to UTF-8 for ANSI terminal TUI --- */
-static const char *cp437_to_utf8(uint8_t ch) {
-    if (ch >= 0x20 && ch <= 0x7E) {
-        static char s[2];
-        s[0] = (char)ch;
-        s[1] = 0;
-        return s;
-    }
-    switch (ch) {
-        case 0: return " ";
-        case 1: return "☺";
-        case 2: return "☻";
-        case 3: return "♥";
-        case 4: return "♦";
-        case 5: return "♣";
-        case 6: return "♠";
-        case 7: return "•";
-        case 8: return "◘";
-        case 9: return "○";
-        case 10: return "◙";
-        case 11: return "♂";
-        case 12: return "♀";
-        case 13: return "♪";
-        case 14: return "♫";
-        case 15: return "☼";
-        case 16: return "►";
-        case 17: return "◄";
-        case 18: return "↕";
-        case 19: return "‼";
-        case 20: return "¶";
-        case 21: return "§";
-        case 22: return "▬";
-        case 23: return "↨";
-        case 24: return "↑";
-        case 25: return "↓";
-        case 26: return "→";
-        case 27: return "←";
-        case 28: return "∟";
-        case 29: return "↔";
-        case 30: return "▲";
-        case 31: return "▼";
-        case 0x7F: return "⌂";
-        /* Box drawing and semigraphics */
-        case 0xB0: return "░";
-        case 0xB1: return "▒";
-        case 0xB2: return "▓";
-        case 0xB3: return "│";
-        case 0xB4: return "┤";
-        case 0xB5: return "╡";
-        case 0xB6: return "╢";
-        case 0xB7: return "╖";
-        case 0xB8: return "╕";
-        case 0xB9: return "╣";
-        case 0xBA: return "║";
-        case 0xBB: return "╗";
-        case 0xBC: return "╝";
-        case 0xBD: return "╜";
-        case 0xBE: return "╛";
-        case 0xBF: return "┐";
-        case 0xC0: return "└";
-        case 0xC1: return "┴";
-        case 0xC2: return "┬";
-        case 0xC3: return "├";
-        case 0xC4: return "─";
-        case 0xC5: return "┼";
-        case 0xC6: return "╞";
-        case 0xC7: return "╟";
-        case 0xC8: return "╚";
-        case 0xC9: return "╔";
-        case 0xCA: return "╩";
-        case 0xCB: return "╦";
-        case 0xCC: return "╠";
-        case 0xCD: return "═";
-        case 0xCE: return "╬";
-        case 0xCF: return "╧";
-        case 0xD0: return "╨";
-        case 0xD1: return "╤";
-        case 0xD2: return "╥";
-        case 0xD3: return "╙";
-        case 0xD4: return "╘";
-        case 0xD5: return "╒";
-        case 0xD6: return "╓";
-        case 0xD7: return "╫";
-        case 0xD8: return "╪";
-        case 0xD9: return "┘";
-        case 0xDA: return "┌";
-        case 0xDB: return "█";
-        case 0xDC: return "▄";
-        case 0xDD: return "▌";
-        case 0xDE: return "▐";
-        case 0xDF: return "▀";
-        case 0xFA: return "·";
-        case 0xFB: return "√";
-        case 0xFC: return "ⁿ";
-        case 0xFD: return "²";
-        case 0xFE: return "■";
-        default: {
-            static char def[2];
-            def[0] = (ch >= 32 && ch < 127) ? (char)ch : ' ';
-            def[1] = 0;
-            return def;
+static const char *g_dump_vram_path = NULL;
+static const char *g_inject_keys = NULL;
+static int g_click_x[64];
+static int g_click_y[64];
+static int g_click_count = 0;
+
+/* Push scripted key events (automated GUI tests).
+ * Plain chars map to keycodes; backslash escapes: \n=Enter, \e=ESC,
+ * \b=Backspace, \t=Tab, \\=backslash, \U/D/L/R=arrows, \1..\9=F1..F9. */
+static void inject_keys(VM *vm, const char *spec) {
+    for (const char *p = spec; *p; p++) {
+        uint16_t code = 0;
+        if (*p == '\\') {
+            p++;
+            if (!*p) break;
+            switch (*p) {
+                case 'n': code = 13; break;
+                case 'e': code = 27; break;
+                case 'b': code = 8; break;
+                case 't': code = 9; break;
+                case '\\': code = 92; break;
+                case 'U': code = KEY_UP; break;
+                case 'D': code = KEY_DOWN; break;
+                case 'L': code = KEY_LEFT; break;
+                case 'R': code = KEY_RIGHT; break;
+                case '1': case '2': case '3': case '4': case '5':
+                case '6': case '7': case '8': case '9':
+                    code = (uint16_t)(KEY_F1 + (*p - '1'));
+                    break;
+                default: code = (uint8_t)*p; break;
+            }
+        } else {
+            code = (uint8_t)*p;
         }
+        if (code) vm_event_push(vm, EVT_KEY, code, 0);
     }
 }
 
 typedef struct {
-    int mode;       /* 0=none, 1=X11, 2=TUI */
-    int req_mode;   /* -1=auto, 1=X11, 2=TUI */
+    int mode;       /* 0=none, 1=X11, 2=TUI, 3=headless (VRAM memory only) */
+    int req_mode;   /* -1=auto, 1=X11, 2=TUI, 3=headless */
     int scale;      /* 1 or 2 */
     VM  *vm;
 
@@ -154,11 +93,15 @@ typedef struct {
     int      win_w;
     int      win_h;
     Atom     wm_delete_window;
+    int      mouse_x;
+    int      mouse_y;
 
     /* TUI state */
     int tui_initialized;
     struct termios orig_termios;
     uint32_t last_timer_ms;
+    int      tui_cols;
+    int      tui_rows;
 } GuiApp;
 
 static GuiApp g_app;
@@ -208,40 +151,69 @@ static void tui_init(void) {
 }
 
 static void tui_flush_screen(VM *vm) {
-    if (!vm) return;
-    char outbuf[65536];
+    if (!vm || !vm->mem) return;
+    struct winsize ws;
+    int cols = 80, rows = 25;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_col >= 40 && ws.ws_col <= 240) cols = ws.ws_col;
+        if (ws.ws_row >= 15 && ws.ws_row <= 100) rows = ws.ws_row;
+    }
+    g_app.tui_cols = cols;
+    g_app.tui_rows = rows;
+
+    uint32_t *lfb = (uint32_t *)(vm->mem + DIMON64_VRAM_BASE);
+    static char outbuf[262144];
     int pos = 0;
     pos += snprintf(outbuf + pos, sizeof(outbuf) - pos, "\033[H");
-    int last_fg = -1, last_bg = -1;
+    int last_fr = -1, last_fg = -1, last_fb = -1;
+    int last_br = -1, last_bg = -1, last_bb = -1;
 
-    for (int y = 0; y < VRAM_ROWS; y++) {
-        for (int x = 0; x < VRAM_COLS; x++) {
-            uint16_t addr = (uint16_t)(VRAM_ADDR + (y * VRAM_COLS + x) * 2);
-            uint8_t ch = vm->mem[addr];
-            uint8_t attr = vm->mem[addr + 1];
-            int fg = attr & 0x0F;
-            int bg = (attr >> 4) & 0x0F;
+    for (int ty = 0; ty < rows; ty++) {
+        int py_top = (ty * 2) * DIMON64_LFB_HEIGHT / (rows * 2);
+        int py_bot = (ty * 2 + 1) * DIMON64_LFB_HEIGHT / (rows * 2);
+        if (py_top >= DIMON64_LFB_HEIGHT) py_top = DIMON64_LFB_HEIGHT - 1;
+        if (py_bot >= DIMON64_LFB_HEIGHT) py_bot = DIMON64_LFB_HEIGHT - 1;
 
-            if (fg != last_fg || bg != last_bg) {
-                int ansi_fg = (fg < 8) ? (30 + fg) : (90 + fg - 8);
-                int ansi_bg = (bg < 8) ? (40 + bg) : (100 + bg - 8);
-                pos += snprintf(outbuf + pos, sizeof(outbuf) - pos, "\033[%d;%dm", ansi_fg, ansi_bg);
-                last_fg = fg;
-                last_bg = bg;
+        uint32_t *row_top = &lfb[py_top * DIMON64_LFB_WIDTH];
+        uint32_t *row_bot = &lfb[py_bot * DIMON64_LFB_WIDTH];
+
+        for (int tx = 0; tx < cols; tx++) {
+            int px = tx * DIMON64_LFB_WIDTH / cols;
+            if (px >= DIMON64_LFB_WIDTH) px = DIMON64_LFB_WIDTH - 1;
+
+            uint32_t c_top = row_top[px];
+            uint32_t c_bot = row_bot[px];
+
+            int fr = (c_top >> 16) & 0xFF;
+            int fg = (c_top >> 8) & 0xFF;
+            int fb = c_top & 0xFF;
+
+            int br = (c_bot >> 16) & 0xFF;
+            int bg = (c_bot >> 8) & 0xFF;
+            int bb = c_bot & 0xFF;
+
+            if (fr != last_fr || fg != last_fg || fb != last_fb ||
+                br != last_br || bg != last_bg || bb != last_bb) {
+                pos += snprintf(outbuf + pos, sizeof(outbuf) - pos,
+                                "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm",
+                                fr, fg, fb, br, bg, bb);
+                last_fr = fr; last_fg = fg; last_fb = fb;
+                last_br = br; last_bg = bg; last_bb = bb;
             }
 
-            const char *u = cp437_to_utf8(ch);
-            int ulen = (int)strlen(u);
-            if (pos + ulen < (int)sizeof(outbuf) - 64) {
-                memcpy(outbuf + pos, u, ulen);
-                pos += ulen;
+            /* UTF-8 for ▀ is \xE2\x96\x80 */
+            if (pos + 4 < (int)sizeof(outbuf)) {
+                outbuf[pos++] = (char)0xE2;
+                outbuf[pos++] = (char)0x96;
+                outbuf[pos++] = (char)0x80;
             }
         }
-        if (y < VRAM_ROWS - 1) {
-            pos += snprintf(outbuf + pos, sizeof(outbuf) - pos, "\r\n");
+        if (ty < rows - 1 && pos + 4 < (int)sizeof(outbuf)) {
+            outbuf[pos++] = '\r';
+            outbuf[pos++] = '\n';
         }
     }
-    ssize_t written = write(STDOUT_FILENO, outbuf, pos);
+    ssize_t written = write(STDOUT_FILENO, outbuf, (size_t)pos);
     (void)written;
 }
 
@@ -269,12 +241,18 @@ static void tui_poll_events(VM *vm) {
                         if (sscanf((char *)buf + i + 3, "%d;%d;%d%c%n", &btn, &x, &y, &type_ch, &consumed) >= 4) {
                             int cx = x - 1;
                             int cy = y - 1;
-                            if (cx >= 0 && cx < VRAM_COLS && cy >= 0 && cy < VRAM_ROWS) {
+                            int term_cols = g_app.tui_cols > 0 ? g_app.tui_cols : 80;
+                            int term_rows = g_app.tui_rows > 0 ? g_app.tui_rows : 25;
+                            int lfb_x = cx * DIMON64_LFB_WIDTH / term_cols;
+                            int lfb_y = cy * DIMON64_LFB_HEIGHT / term_rows;
+                            if (lfb_x >= 0 && lfb_x < DIMON64_LFB_WIDTH && lfb_y >= 0 && lfb_y < DIMON64_LFB_HEIGHT) {
                                 if (type_ch == 'M') {
                                     if (btn == 0) {
-                                        vm_event_push(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy);
+                                        vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)lfb_x, (uint16_t)lfb_y, 1);
+                                    } else if (btn == 2) {
+                                        vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)lfb_x, (uint16_t)lfb_y, 2);
                                     } else if (btn == 35 || btn == 32) {
-                                        vm_event_push(vm, EVT_MOUSE_MOVE, (uint16_t)cx, (uint16_t)cy);
+                                        vm_event_push_ext(vm, EVT_MOUSE_MOVE, (uint16_t)lfb_x, (uint16_t)lfb_y, (btn == 32) ? 1 : 0);
                                     }
                                 }
                             }
@@ -345,11 +323,13 @@ static int x11_init(void) {
     int scr_h = DisplayHeight(g_app.dpy, screen);
 
     if (g_app.scale <= 0) {
-        g_app.scale = (scr_h >= 850) ? 2 : 1;
+        g_app.scale = (scr_h >= 1200) ? 2 : 1;
     }
 
-    g_app.win_w = VRAM_COLS * 8 * g_app.scale;
-    g_app.win_h = VRAM_ROWS * 16 * g_app.scale;
+    g_app.win_w = DIMON64_LFB_WIDTH * g_app.scale;
+    g_app.win_h = DIMON64_LFB_HEIGHT * g_app.scale;
+    g_app.mouse_x = DIMON64_LFB_WIDTH / 2;
+    g_app.mouse_y = DIMON64_LFB_HEIGHT / 2;
 
     g_app.pixels = (uint32_t *)calloc(g_app.win_w * g_app.win_h, sizeof(uint32_t));
     if (!g_app.pixels) {
@@ -365,7 +345,7 @@ static int x11_init(void) {
         BlackPixel(g_app.dpy, screen)
     );
 
-    XStoreName(g_app.dpy, g_app.win, "DimonOS v2.0 GUI");
+    XStoreName(g_app.dpy, g_app.win, "DimonOS-64 Modern TrueColor GUI");
 
     /* Prevent window resize */
     XSizeHints *hints = XAllocSizeHints();
@@ -425,48 +405,69 @@ static void x11_cleanup(void) {
 }
 
 static void x11_flush_screen(VM *vm) {
-    if (!g_app.dpy || !g_app.pixels || !vm) return;
+    if (!g_app.dpy || !g_app.pixels || !vm || !vm->mem) return;
 
     int scale = g_app.scale;
     int win_w = g_app.win_w;
+    int win_h = g_app.win_h;
+    uint32_t *lfb = (uint32_t *)(vm->mem + DIMON64_VRAM_BASE);
 
-    for (int cy = 0; cy < VRAM_ROWS; cy++) {
-        for (int cx = 0; cx < VRAM_COLS; cx++) {
-            uint16_t addr = (uint16_t)(VRAM_ADDR + (cy * VRAM_COLS + cx) * 2);
-            uint8_t ch = vm->mem[addr];
-            uint8_t attr = vm->mem[addr + 1];
-            uint32_t fg = vga_palette[attr & 0x0F];
-            uint32_t bg = vga_palette[(attr >> 4) & 0x0F];
-
-            for (int r = 0; r < 16; r++) {
-                uint8_t bits = font8x16[ch][r];
-                for (int c = 0; c < 8; c++) {
-                    uint32_t col = (bits & (0x80 >> c)) ? fg : bg;
-                    for (int sy = 0; sy < scale; sy++) {
-                        int py = (cy * 16 + r) * scale + sy;
-                        uint32_t *line = &g_app.pixels[py * win_w];
-                        for (int sx = 0; sx < scale; sx++) {
-                            int px = (cx * 8 + c) * scale + sx;
-                            line[px] = col;
-                        }
+    if (scale == 1) {
+        memcpy(g_app.pixels, lfb, (size_t)DIMON64_LFB_WIDTH * DIMON64_LFB_HEIGHT * sizeof(uint32_t));
+    } else {
+        for (int y = 0; y < DIMON64_LFB_HEIGHT; y++) {
+            uint32_t *src_row = &lfb[y * DIMON64_LFB_WIDTH];
+            for (int sy = 0; sy < scale; sy++) {
+                uint32_t *dst_row = &g_app.pixels[(y * scale + sy) * win_w];
+                for (int x = 0; x < DIMON64_LFB_WIDTH; x++) {
+                    uint32_t c = src_row[x];
+                    for (int sx = 0; sx < scale; sx++) {
+                        dst_row[x * scale + sx] = c;
                     }
                 }
             }
         }
     }
 
-    XPutImage(g_app.dpy, g_app.win, g_app.gc, g_app.ximage, 0, 0, 0, 0, g_app.win_w, g_app.win_h);
+    /* Composite hardware/32-bit mouse pointer cursor arrow */
+    int mx = g_app.mouse_x * scale;
+    int my = g_app.mouse_y * scale;
+    for (int cy = 0; cy < 19 * scale; cy++) {
+        int py = my + cy;
+        if (py < 0 || py >= win_h) continue;
+        int row = cy / scale;
+        for (int cx = 0; cx < 12 * scale; cx++) {
+            int px = mx + cx;
+            if (px < 0 || px >= win_w) continue;
+            int col = cx / scale;
+            char ch = cursor_arrow[row][col];
+            if (ch == 'X') {
+                g_app.pixels[py * win_w + px] = 0xFF000000;
+            } else if (ch == '.') {
+                g_app.pixels[py * win_w + px] = 0xFFFFFFFF;
+            }
+        }
+    }
+
+    XPutImage(g_app.dpy, g_app.win, g_app.gc, g_app.ximage, 0, 0, 0, 0, win_w, win_h);
     XFlush(g_app.dpy);
 }
+
+static int s_last_motion_x = -1;
+static int s_last_motion_y = -1;
+static uint8_t s_last_motion_btn = 0xFF;
+static uint32_t s_last_motion_time = 0;
 
 static void x11_poll_events(VM *vm) {
     if (!g_app.dpy) return;
 
-    int events_handled = 0;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t now = (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+
     while (XPending(g_app.dpy) > 0) {
         XEvent ev;
         XNextEvent(g_app.dpy, &ev);
-        events_handled++;
 
         if (ev.type == ClientMessage) {
             if ((Atom)ev.xclient.data.l[0] == g_app.wm_delete_window) {
@@ -474,16 +475,49 @@ static void x11_poll_events(VM *vm) {
                 return;
             }
         } else if (ev.type == ButtonPress) {
-            int cx = ev.xbutton.x / (8 * g_app.scale);
-            int cy = ev.xbutton.y / (16 * g_app.scale);
-            if (cx >= 0 && cx < VRAM_COLS && cy >= 0 && cy < VRAM_ROWS) {
-                vm_event_push(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy);
+            int cx = ev.xbutton.x / g_app.scale;
+            int cy = ev.xbutton.y / g_app.scale;
+            if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT) {
+                g_app.mouse_x = cx;
+                g_app.mouse_y = cy;
+                uint8_t btn = (ev.xbutton.button == Button3) ? 2 : 1;
+                s_last_motion_x = cx;
+                s_last_motion_y = cy;
+                s_last_motion_btn = btn;
+                s_last_motion_time = now;
+                vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy, btn);
             }
+        } else if (ev.type == ButtonRelease) {
+            s_last_motion_btn = 0;
         } else if (ev.type == MotionNotify) {
-            int cx = ev.xmotion.x / (8 * g_app.scale);
-            int cy = ev.xmotion.y / (16 * g_app.scale);
-            if (cx >= 0 && cx < VRAM_COLS && cy >= 0 && cy < VRAM_ROWS) {
-                vm_event_push(vm, EVT_MOUSE_MOVE, (uint16_t)cx, (uint16_t)cy);
+            int cx = ev.xmotion.x / g_app.scale;
+            int cy = ev.xmotion.y / g_app.scale;
+            if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT) {
+                g_app.mouse_x = cx;
+                g_app.mouse_y = cy;
+                uint8_t btn = 0;
+                if (ev.xmotion.state & Button1Mask) btn = 1;
+                else if (ev.xmotion.state & Button3Mask) btn = 2;
+
+                /* Throttle redundant motion coordinates */
+                if (cx == s_last_motion_x && cy == s_last_motion_y && btn == s_last_motion_btn) {
+                    continue;
+                }
+
+                /* If no button pressed, throttle idle pointer movement (~30 FPS or >= 2px move) */
+                if (btn == 0) {
+                    int dx = cx - s_last_motion_x;
+                    int dy = cy - s_last_motion_y;
+                    if ((dx * dx + dy * dy < 4) && (now - s_last_motion_time < 33)) {
+                        continue;
+                    }
+                }
+
+                s_last_motion_x = cx;
+                s_last_motion_y = cy;
+                s_last_motion_btn = btn;
+                s_last_motion_time = now;
+                vm_event_push_ext(vm, EVT_MOUSE_MOVE, (uint16_t)cx, (uint16_t)cy, btn);
             }
         } else if (ev.type == KeyPress) {
             KeySym ks;
@@ -524,27 +558,29 @@ static void x11_poll_events(VM *vm) {
         }
     }
 
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint32_t now = (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
-
     if (now - g_app.last_timer_ms >= 50) {
         g_app.last_timer_ms = now;
         vm_event_push(vm, EVT_TIMER, 0, 0);
     }
+}
 
-    static uint32_t last_x11_sleep_ms = 0;
-    if (!events_handled) {
-        if (now - last_x11_sleep_ms >= 10) {
-            last_x11_sleep_ms = now;
-            usleep(1000);
-        }
+static void headless_poll_events(VM *vm) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t now = (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    if (now - g_app.last_timer_ms >= 50) {
+        g_app.last_timer_ms = now;
+        vm_event_push(vm, EVT_TIMER, 0, 0);
     }
 }
 
 /* Ensure display backend is initialized immediately on first GUI access */
 static void ensure_gui_init(GuiApp *app) {
     if (app->mode == 0) {
+        if (app->req_mode == 3) {
+            app->mode = 3;
+            return;
+        }
         if (app->req_mode == 1 || (app->req_mode == -1 && getenv("DISPLAY"))) {
             if (x11_init() == 0) {
                 app->mode = 1;
@@ -573,6 +609,8 @@ static void on_gui_poll(void *userdata) {
         x11_poll_events(app->vm);
     } else if (app->mode == 2) {
         tui_poll_events(app->vm);
+    } else if (app->mode == 3) {
+        headless_poll_events(app->vm);
     }
 }
 
@@ -584,6 +622,8 @@ static void on_gui_flush(void *userdata) {
         x11_flush_screen(app->vm);
     } else if (app->mode == 2) {
         tui_flush_screen(app->vm);
+    } else if (app->mode == 3) {
+        (void)0; /* headless: VRAM stays in memory, no display output */
     }
 }
 
@@ -594,8 +634,12 @@ static void usage(const char *p) {
         "  %s --iso image.iso [options]         Boot from ISO/disk image (sector 0)\n"
         "  %s program.bin --iso image.iso       Program + attached disk\n"
         "Options:\n"
-        "  -g, --gui             Force X11 graphical window\n"
-        "  -tui, --tui           Force ANSI terminal console mode (TUI)\n"
+        "  -g, --gui             Force X11 graphical window (also: 'gui' positional)\n"
+        "  -tui, --tui           Force ANSI terminal console mode (TUI) (also: 'tui' positional)\n"
+        "  -H, --headless        Memory-only GUI (no display output, for automated tests)\n"
+        "  --dump-vram FILE      Write 80x25 VRAM bytes (4000 B) to FILE on exit\n"
+        "  --inject-keys SPEC    Push scripted key events at startup (tests)\n"
+        "  --inject-click X,Y[;...] Push scripted mouse clicks (tests)\n"
         "  --scale N             X11 window scale factor (1 or 2, default auto-fit)\n"
         "  -s ADDR               Start execution address (default 0, e.g. 0x100)\n"
         "  -l ADDR               Load address (default 0)\n"
@@ -606,22 +650,22 @@ static void usage(const char *p) {
         "  -t                    Trace execution: print each instruction\n"
         "  -r                    Dump registers on exit\n"
         "  -m N                  Step limit (infinite loop protection)\n"
-        "Syscalls: INT 0-5 I/O, INT 6-8 Disk, INT 10-15 GUI\n",
+        "Syscalls (a7): 0-5 console, 6-8 disk, 10-15 GUI, 16-24 multitasking/timer\n",
         p, p, p, DISK_MAX_SECTORS);
 }
 
-static int parse_u16(const char *s) {
-    return (int)strtol(s, NULL, 0);
+static uint64_t parse_u64(const char *s) {
+    return (uint64_t)strtoull(s, NULL, 0);
 }
 
-static void hexdump(VM *vm, uint16_t addr, int n) {
+static void hexdump(VM *vm, uint64_t addr, int n) {
     for (int i = 0; i < n; i += 16) {
-        printf("%04X: ", (unsigned)(addr + i));
+        printf("%08" PRIX64 ": ", (uint64_t)(addr + (uint64_t)i));
         for (int j = 0; j < 16 && i + j < n; j++)
-            printf("%02X ", vm->mem[(uint16_t)(addr + i + j)]);
+            printf("%02X ", vm->mem[addr + (uint64_t)i + (uint64_t)j]);
         printf(" | ");
         for (int j = 0; j < 16 && i + j < n; j++) {
-            uint8_t c = vm->mem[(uint16_t)(addr + i + j)];
+            uint8_t c = vm->mem[addr + (uint64_t)i + (uint64_t)j];
             putchar(c >= 32 && c < 127 ? c : '.');
         }
         putchar('\n');
@@ -629,27 +673,26 @@ static void hexdump(VM *vm, uint16_t addr, int n) {
 }
 
 #define MAX_BP 16
-static uint16_t bps[MAX_BP];
+static uint64_t bps[MAX_BP];
 static int nbp = 0;
 
-static int at_bp(uint16_t pc) {
+static int at_bp(uint64_t pc) {
     for (int i = 0; i < nbp; i++) if (bps[i] == pc) return 1;
     return 0;
 }
 
 static void debugger(VM *vm) {
     char line[256];
-    printf("=== Dimon-16 debugger ===\n"
+    printf("=== DimonVirtualCPU-64 debugger ===\n"
            "Commands: s=step  c=continue  r=regs  m ADDR [N]=dump  "
            "u ADDR [N]=disasm  b ADDR=break  q=quit  h=help\n");
     for (;;) {
-        char dasm[96];
-        vm_disasm(vm, vm->PC, dasm, sizeof(dasm));
-        printf("[%04X] %-20s > ", vm->PC, dasm);
+        char dasm[128];
+        dimon64_disasm(vm, vm->pc, dasm, sizeof(dasm));
+        printf("[%08" PRIX64 "] %-28s > ", vm->pc, dasm);
         fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) break;
         char cmd = 0;
-        unsigned a = 0;
         if (sscanf(line, " %c", &cmd) != 1) continue;
         if (cmd == 'q') break;
         else if (cmd == 'h') {
@@ -667,8 +710,8 @@ static void debugger(VM *vm) {
             sscanf(line + 1, "%d", &n);
             if (n < 1) n = 1;
             for (int i = 0; i < n; i++) {
-                vm_disasm(vm, vm->PC, dasm, sizeof(dasm));
-                printf("  %04X: %s\n", vm->PC, dasm);
+                dimon64_disasm(vm, vm->pc, dasm, sizeof(dasm));
+                printf("  %08" PRIX64 ": %s\n", vm->pc, dasm);
                 int rc = vm_step(vm);
                 if (rc == 1) { printf("[HLT]\n"); vm_dump_regs(vm, stdout); return; }
                 if (rc != 0) { printf("[ERROR %d]\n", rc); return; }
@@ -676,7 +719,7 @@ static void debugger(VM *vm) {
             vm_dump_regs(vm, stdout);
         } else if (cmd == 'c') {
             for (;;) {
-                if (at_bp(vm->PC)) { printf("[BREAK @ %04X]\n", vm->PC); break; }
+                if (at_bp(vm->pc)) { printf("[BREAK @ %08" PRIX64 "]\n", vm->pc); break; }
                 int rc = vm_step(vm);
                 if (rc == 1) { printf("[HLT]\n"); vm_dump_regs(vm, stdout); return; }
                 if (rc != 0) { printf("[ERROR %d]\n", rc); return; }
@@ -687,26 +730,27 @@ static void debugger(VM *vm) {
             vm_dump_regs(vm, stdout);
         } else if (cmd == 'm') {
             int n = 64;
-            if (sscanf(line + 1, "%x %d", &a, &n) < 1) continue;
-            hexdump(vm, (uint16_t)a, n);
+            unsigned long long aa64 = 0;
+            if (sscanf(line + 1, "%llx %d", &aa64, &n) < 1) continue;
+            hexdump(vm, (uint64_t)aa64, n);
         } else if (cmd == 'u') {
-            uint16_t p = vm->PC;
+            uint64_t p = vm->pc;
             int n = 8;
             char *rest = line + 1;
             while (*rest == ' ' || *rest == '\t') rest++;
             if (*rest && *rest != '\n') {
-                unsigned aa; int nn;
-                if (sscanf(rest, "%x %d", &aa, &nn) == 2) { p = (uint16_t)aa; n = nn; }
-                else if (sscanf(rest, "%x", &aa) == 1) {
-                    p = (uint16_t)aa; n = 8;
+                unsigned long long aa; int nn;
+                if (sscanf(rest, "%llx %d", &aa, &nn) == 2) { p = (uint64_t)aa; n = nn; }
+                else if (sscanf(rest, "%llx", &aa) == 1) {
+                    p = (uint64_t)aa; n = 8;
                 }
             }
             for (int i = 0; i < n; i++) {
-                int len = vm_disasm(vm, p, dasm, sizeof(dasm));
-                printf("  %04X: %-20s |", p, dasm);
-                for (int k = 0; k < len; k++) printf(" %02X", vm->mem[(uint16_t)(p + k)]);
+                int len = dimon64_disasm(vm, p, dasm, sizeof(dasm));
+                printf("  %08" PRIX64 ": %-28s |", p, dasm);
+                for (int k = 0; k < len; k++) printf(" %02X", vm->mem[p + (uint64_t)k]);
                 printf("\n");
-                p = (uint16_t)(p + len);
+                p += (uint64_t)len;
             }
         } else if (cmd == 'b') {
             char *rest = line + 1;
@@ -714,12 +758,12 @@ static void debugger(VM *vm) {
             if (*rest == 'c') { nbp = 0; printf("Cleared breakpoints\n"); }
             else if (!*rest || *rest == '\n') {
                 printf("Breakpoints (%d):\n", nbp);
-                for (int i = 0; i < nbp; i++) printf("  #%d @ %04X\n", i, bps[i]);
+                for (int i = 0; i < nbp; i++) printf("  #%d @ %08" PRIX64 "\n", i, bps[i]);
             } else {
-                unsigned aa;
-                if (sscanf(rest, "%x", &aa) == 1 && nbp < MAX_BP) {
-                    bps[nbp++] = (uint16_t)aa;
-                    printf("Added break @ %04X\n", aa & 0xFFFF);
+                unsigned long long aa;
+                if (sscanf(rest, "%llx", &aa) == 1 && nbp < MAX_BP) {
+                    bps[nbp++] = (uint64_t)aa;
+                    printf("Added break @ %08llX\n", aa & 0xFFFFFFFFULL);
                 }
             }
         } else {
@@ -732,8 +776,8 @@ int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *path = NULL;
     const char *iso_path = NULL;
-    uint16_t start = 0, load = 0;
-    int debug = 0, trace = 0, dumpregs = 0, writable = 0;
+    uint64_t start = 0, load = 0;
+    int debug = 0, trace = 0, dumpregs = 0, writable = 1;
     int have_start = 0;
     uint64_t maxsteps = 0; /* 0 = unlimited */
 
@@ -747,15 +791,40 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-r")) dumpregs = 1;
         else if (!strcmp(argv[i], "-g") || !strcmp(argv[i], "--gui")) g_app.req_mode = 1;
         else if (!strcmp(argv[i], "-tui") || !strcmp(argv[i], "--tui")) g_app.req_mode = 2;
+        else if (!strcmp(argv[i], "-H") || !strcmp(argv[i], "--headless")) g_app.req_mode = 3;
+        else if (!strcmp(argv[i], "--dump-vram") && i + 1 < argc) g_dump_vram_path = argv[++i];
+        else if (!strcmp(argv[i], "--inject-keys") && i + 1 < argc) g_inject_keys = argv[++i];
+        else if (!strcmp(argv[i], "--inject-click") && i + 1 < argc) {
+            const char *spec = argv[++i];
+            int x = 0, y = 0;
+            while (*spec) {
+                while (*spec == ' ' || *spec == ';' || *spec == ',') {
+                    if (*spec == ',') break;
+                    spec++;
+                }
+                if (sscanf(spec, "%d,%d", &x, &y) == 2) {
+                    if (x >= 0 && x < DIMON64_LFB_WIDTH && y >= 0 && y < DIMON64_LFB_HEIGHT && g_click_count < 64) {
+                        g_click_x[g_click_count] = x;
+                        g_click_y[g_click_count] = y;
+                        g_click_count++;
+                    }
+                    while (*spec && *spec != ';') spec++;
+                } else break;
+            }
+        }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) g_app.scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--disk-writable")) writable = 1;
+        else if (!strcmp(argv[i], "--disk-readonly")) writable = 0;
         else if ((!strcmp(argv[i], "-i") || !strcmp(argv[i], "--iso") ||
                   !strcmp(argv[i], "--disk")) && i + 1 < argc) iso_path = argv[++i];
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) { start = (uint16_t)parse_u16(argv[++i]); have_start = 1; }
-        else if (!strcmp(argv[i], "-l") && i + 1 < argc) load = (uint16_t)parse_u16(argv[++i]);
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) { start = parse_u64(argv[++i]); have_start = 1; }
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) load = parse_u64(argv[++i]);
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) maxsteps = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
+        else if (!strcmp(argv[i], "tui")) { if (g_app.req_mode == -1) g_app.req_mode = 2; else { usage(argv[0]); return 1; } }
+        else if (!strcmp(argv[i], "gui")) { if (g_app.req_mode == -1) g_app.req_mode = 1; else { usage(argv[0]); return 1; } }
+        else if (!strcmp(argv[i], "headless")) { if (g_app.req_mode == -1) g_app.req_mode = 3; else { usage(argv[0]); return 1; } }
         else if (!path) path = argv[i];
         else { usage(argv[0]); return 1; }
     }
@@ -801,6 +870,9 @@ int main(int argc, char **argv) {
     }
     vm_reset(&vm, start);
     vm.max_steps = maxsteps;
+    if (g_inject_keys) inject_keys(&vm, g_inject_keys);
+    for (int ci = 0; ci < g_click_count; ci++)
+        vm_event_push(&vm, EVT_MOUSE_CLICK, (uint16_t)g_click_x[ci], (uint16_t)g_click_y[ci]);
 
     if (debug) {
         debugger(&vm);
@@ -809,10 +881,10 @@ int main(int argc, char **argv) {
     }
 
     if (trace) {
-        char dasm[96];
+        char dasm[128];
         while (!vm.halted) {
-            vm_disasm(&vm, vm.PC, dasm, sizeof(dasm));
-            printf("[%04X] %s\n", vm.PC, dasm);
+            dimon64_disasm(&vm, vm.pc, dasm, sizeof(dasm));
+            printf("[%08" PRIX64 "] %s\n", (uint64_t)vm.pc, dasm);
             rc = vm_step(&vm);
             if (rc == 1) break;
             if (rc != 0) { fprintf(stderr, "Execution error: %d\n", rc); vm_free(&vm); return 1; }
@@ -834,6 +906,17 @@ int main(int argc, char **argv) {
         x11_cleanup();
     } else if (g_app.mode == 2) {
         tui_cleanup();
+    }
+
+    if (g_dump_vram_path) {
+        FILE *df = fopen(g_dump_vram_path, "wb");
+        if (!df) {
+            perror("fopen --dump-vram");
+        } else {
+            size_t wn = fwrite(vm.mem + DIMON64_VRAM_BASE, 1, (size_t)DIMON64_VRAM_SIZE, df);
+            if (wn != (size_t)DIMON64_VRAM_SIZE) perror("fwrite --dump-vram");
+            fclose(df);
+        }
     }
 
     if (dumpregs) vm_dump_regs(&vm, stderr);

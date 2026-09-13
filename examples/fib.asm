@@ -1,21 +1,23 @@
-; fib.asm — 10 terms of Fibonacci sequence
-    MOV R3, 0       ; a
-    MOV R4, 1       ; b
-    MOV R5, 0       ; i
-    MOV R6, 10      ; n
+; fib.asm - first 10 Fibonacci numbers on DimonVirtualCPU-64
+.org 0x0
+    LI s0, 0             ; a = 0
+    LI s1, 1             ; b = 1
+    LI s2, 0             ; i = 0
+    LI s3, 10            ; n = 10
 loop:
-    CMP R5, R6
-    JNC done
-    MOV R0, R3
-    INT 3
-    MOV R0, 32      ; space
-    INT 0
-    MOV R2, R3
-    ADD R2, R4
-    MOV R3, R4
-    MOV R4, R2
-    INC R5
-    JMP loop
+    BGE s2, s3, done
+    MV a0, s0
+    LI a7, 3
+    ECALL
+    LI a0, 32            ; space
+    LI a7, 0
+    ECALL
+    ADD t0, s0, s1
+    MV s0, s1
+    MV s1, t0
+    ADDI s2, s2, 1
+    J loop
 done:
-    INT 5
-    HLT
+    LI a7, 5
+    ECALL
+    EBREAK

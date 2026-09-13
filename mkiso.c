@@ -1,4 +1,4 @@
-/* Dimon-16 mkiso: builds disk / ISO images (512B sectors).
+/* DimonVirtualCPU-64 mkiso: builds disk / ISO images (512B sectors).
  *
  * Image layout (DIMON-ISO):
  *   sector 0 : bootloader (boot.bin, <=510 B, padded with zeroes)
@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include "dimon16.h"
+#include "dimon64.h"
 
 #define CAT_ENTRY_SIZE 24
 
@@ -150,22 +150,28 @@ int main(int argc, char **argv) {
             }
         }
     }
-    if (!boot) { usage(argv[0]); return 1; }
-
     size_t boot_len = 0;
-    uint8_t *boot_data = read_file(boot, &boot_len);
-    if (!boot_data) { perror("boot fopen"); return 1; }
-    {
-        FILE *f = fopen(boot, "rb");
-        fseek(f, 0, SEEK_END);
-        long real = ftell(f);
-        fclose(f);
-        boot_len = (size_t)(real < 0 ? 0 : real);
-        if (real == 0) { fprintf(stderr, "Empty bootloader: %s\n", boot); free(boot_data); return 1; }
-    }
-    if (boot_len > 510) {
-        fprintf(stderr, "Bootloader too large (%zu B, max 510)\n", boot_len);
-        free(boot_data); return 1;
+    uint8_t *boot_data = NULL;
+    if (boot) {
+        boot_data = read_file(boot, &boot_len);
+        if (!boot_data) { perror("boot fopen"); return 1; }
+        {
+            FILE *f = fopen(boot, "rb");
+            fseek(f, 0, SEEK_END);
+            long real = ftell(f);
+            fclose(f);
+            boot_len = (size_t)(real < 0 ? 0 : real);
+            if (real == 0) { fprintf(stderr, "Empty bootloader: %s\n", boot); free(boot_data); return 1; }
+        }
+        if (boot_len > 510) {
+            fprintf(stderr, "Bootloader too large (%zu B, max 510)\n", boot_len);
+            free(boot_data); return 1;
+        }
+    } else {
+        boot_len = 510;
+        boot_data = calloc(1, 512);
+        if (!boot_data) { perror("calloc"); return 1; }
+        boot_data[0] = 0xEB; boot_data[1] = 0x3C; boot_data[2] = 0x90; /* JMP short */
     }
 
     /* Load file data */
@@ -192,6 +198,7 @@ int main(int argc, char **argv) {
 
     uint32_t total = 2; /* boot + catalog */
     for (int i = 0; i < ninputs; i++) total += fsec[i];
+    if (total < 256) total = 256; /* Ensure room for SimpleFS (sectors 16..150) */
     if (total > DISK_MAX_SECTORS) {
         fprintf(stderr, "Image too large (%u sectors, max %d)\n", total, DISK_MAX_SECTORS);
         for (int k = 0; k < ninputs; k++) free(fdata[k]);
@@ -221,6 +228,52 @@ int main(int argc, char **argv) {
         printf("  %-12.12s <- %s (%zu B, LBA %u, %u sec)\n",
                names[i], inputs[i], flen[i], lba, fsec[i]);
         lba += fsec[i];
+    }
+
+    /* Initialize SimpleFS at Sector 16 */
+    uint8_t *sfs = img + 16 * DISK_SECTOR_SIZE;
+    const char *init_files[3] = { "notes.txt", "readme.txt", "todo.txt" };
+    const char *init_texts[3] = {
+        "Welcome to DimonOS-64 Notepad with SimpleFS!\n"
+        "Press Save (F9) to write changes to disk.\n"
+        "Press Open (F10) to reload text from disk.\n",
+        "DimonOS-64 Modern TrueColor Linear Framebuffer (LFB)\n"
+        "Resolution: 800x600 @ 32bpp TrueColor ARGB\n",
+        "1. Paint TrueColor artwork\n2. Test SimpleFS Notepad\n3. Enjoy Snake\n"
+    };
+
+    for (int i = 0; i < 16; i++) {
+        uint8_t *entry = sfs + i * 32;
+        uint32_t sec_offset = 18 + i * 8;
+        uint32_t byte_len = 0;
+        uint32_t flags = 0;
+
+        if (i < 3) {
+            strncpy((char *)entry, init_files[i], 16);
+            byte_len = (uint32_t)strlen(init_texts[i]);
+            flags = 1; /* In use */
+            memcpy(img + sec_offset * DISK_SECTOR_SIZE, init_texts[i], byte_len);
+        } else {
+            snprintf((char *)entry, 16, "file%d.txt", i);
+        }
+
+        /* SectorOffset (uint32 LE) */
+        entry[16] = (uint8_t)(sec_offset & 0xFF);
+        entry[17] = (uint8_t)((sec_offset >> 8) & 0xFF);
+        entry[18] = (uint8_t)((sec_offset >> 16) & 0xFF);
+        entry[19] = (uint8_t)((sec_offset >> 24) & 0xFF);
+
+        /* ByteLength (uint32 LE) */
+        entry[20] = (uint8_t)(byte_len & 0xFF);
+        entry[21] = (uint8_t)((byte_len >> 8) & 0xFF);
+        entry[22] = (uint8_t)((byte_len >> 16) & 0xFF);
+        entry[23] = (uint8_t)((byte_len >> 24) & 0xFF);
+
+        /* Flags (uint32 LE) */
+        entry[24] = (uint8_t)(flags & 0xFF);
+        entry[25] = (uint8_t)((flags >> 8) & 0xFF);
+        entry[26] = (uint8_t)((flags >> 16) & 0xFF);
+        entry[27] = (uint8_t)((flags >> 24) & 0xFF);
     }
 
     FILE *o = fopen(out, "wb");
