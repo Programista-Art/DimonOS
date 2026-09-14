@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -109,6 +110,181 @@ static GuiApp g_app;
 /* Forward declarations */
 static void x11_flush_screen(VM *vm);
 static void tui_flush_screen(VM *vm);
+
+/* --- PSG Tone Synthesizer & Audio Backend --- */
+typedef struct {
+    uint32_t freq;
+    uint32_t duration_ms;
+    uint8_t  wave;
+    uint8_t  vol;
+} AudioCommand;
+
+#define AUDIO_QUEUE_SIZE 32
+static AudioCommand g_audio_queue[AUDIO_QUEUE_SIZE];
+static int g_audio_q_head = 0;
+static int g_audio_q_tail = 0;
+static pthread_mutex_t g_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_audio_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_audio_th;
+static int g_audio_running = 0;
+static FILE *g_aplay_pipe = NULL;
+
+static void synth_waveform(uint8_t *buf, size_t n_samples, uint32_t freq, uint8_t wave, uint8_t vol) {
+    if (!buf || n_samples == 0) return;
+    int amp = (int)vol / 2;
+    if (amp > 127) amp = 127;
+    if (amp <= 0) {
+        memset(buf, 128, n_samples);
+        return;
+    }
+
+    const uint32_t rate = 22050;
+
+    switch (wave) {
+        case DIMON64_PSG_WAVE_SQUARE: {
+            if (freq == 0) {
+                memset(buf, 128, n_samples);
+                return;
+            }
+            for (size_t i = 0; i < n_samples; i++) {
+                uint32_t phase = (uint32_t)(((uint64_t)i * freq) % rate);
+                buf[i] = (phase < rate / 2) ? (uint8_t)(128 + amp) : (uint8_t)(128 - amp);
+            }
+            break;
+        }
+        case DIMON64_PSG_WAVE_TRIANGLE: {
+            if (freq == 0) {
+                memset(buf, 128, n_samples);
+                return;
+            }
+            uint32_t half = rate / 2;
+            for (size_t i = 0; i < n_samples; i++) {
+                uint32_t phase = (uint32_t)(((uint64_t)i * freq) % rate);
+                if (phase < half) {
+                    int delta = (int)((2LL * amp * phase) / half);
+                    buf[i] = (uint8_t)(128 - amp + delta);
+                } else {
+                    int delta = (int)((2LL * amp * (phase - half)) / half);
+                    buf[i] = (uint8_t)(128 + amp - delta);
+                }
+            }
+            break;
+        }
+        case DIMON64_PSG_WAVE_NOISE: {
+            uint32_t step = (freq > 0) ? (rate / freq) : 1;
+            if (step < 1) step = 1;
+            int cur_noise = 0;
+            for (size_t i = 0; i < n_samples; i++) {
+                if (i % step == 0) {
+                    cur_noise = (rand() % (2 * amp + 1)) - amp;
+                }
+                buf[i] = (uint8_t)(128 + cur_noise);
+            }
+            break;
+        }
+        default:
+            memset(buf, 128, n_samples);
+            return;
+    }
+
+    /* Envelope: linear fade-in and fade-out (first/last 2 ms) to prevent speaker pop */
+    size_t fade = 44;
+    if (fade > n_samples / 2) fade = n_samples / 2;
+    for (size_t i = 0; i < fade; i++) {
+        int diff_in = (int)buf[i] - 128;
+        buf[i] = (uint8_t)(128 + (diff_in * (int)i) / (int)fade);
+
+        size_t j = n_samples - 1 - i;
+        int diff_out = (int)buf[j] - 128;
+        buf[j] = (uint8_t)(128 + (diff_out * (int)i) / (int)fade);
+    }
+}
+
+static void *audio_worker_thread(void *arg) {
+    (void)arg;
+    signal(SIGPIPE, SIG_IGN);
+    while (1) {
+        AudioCommand cmd;
+        pthread_mutex_lock(&g_audio_mutex);
+        while (g_audio_q_head == g_audio_q_tail && g_audio_running) {
+            pthread_cond_wait(&g_audio_cond, &g_audio_mutex);
+        }
+        if (!g_audio_running && g_audio_q_head == g_audio_q_tail) {
+            pthread_mutex_unlock(&g_audio_mutex);
+            break;
+        }
+        cmd = g_audio_queue[g_audio_q_head];
+        g_audio_q_head = (g_audio_q_head + 1) % AUDIO_QUEUE_SIZE;
+        pthread_mutex_unlock(&g_audio_mutex);
+
+        if (cmd.duration_ms > 5000) cmd.duration_ms = 5000;
+        const size_t rate = 22050;
+        size_t n_samples = (size_t)((uint64_t)rate * cmd.duration_ms / 1000ULL);
+        if (n_samples == 0) continue;
+
+        uint8_t *buf = (uint8_t *)malloc(n_samples);
+        if (!buf) continue;
+        synth_waveform(buf, n_samples, cmd.freq, cmd.wave, cmd.vol);
+
+        int played = 0;
+        if (!g_aplay_pipe) {
+            g_aplay_pipe = popen("aplay -q -t raw -f U8 -r 22050 -c 1 2>/dev/null", "w");
+        }
+        if (g_aplay_pipe) {
+            size_t written = fwrite(buf, 1, n_samples, g_aplay_pipe);
+            fflush(g_aplay_pipe);
+            if (written == n_samples) {
+                played = 1;
+            } else {
+                pclose(g_aplay_pipe);
+                g_aplay_pipe = NULL;
+            }
+        }
+        if (!played && g_app.mode == 1 && g_app.dpy) {
+            XBell(g_app.dpy, 0);
+            XFlush(g_app.dpy);
+        }
+        free(buf);
+    }
+    return NULL;
+}
+
+static void audio_cleanup(void) {
+    if (g_audio_running) {
+        pthread_mutex_lock(&g_audio_mutex);
+        g_audio_running = 0;
+        pthread_cond_signal(&g_audio_cond);
+        pthread_mutex_unlock(&g_audio_mutex);
+    }
+    if (g_aplay_pipe) {
+        pclose(g_aplay_pipe);
+        g_aplay_pipe = NULL;
+    }
+}
+
+static void on_psg_play(void *userdata, uint32_t freq, uint32_t duration_ms, uint8_t wave, uint8_t vol) {
+    (void)userdata;
+    /* Headless mode: update state silently without audio output or delays */
+    if (g_app.req_mode == 3 || g_app.mode == 3) return;
+    if (duration_ms == 0 || vol == 0) return;
+    if (freq == 0 && wave != DIMON64_PSG_WAVE_NOISE) return;
+
+    pthread_mutex_lock(&g_audio_mutex);
+    if (!g_audio_running) {
+        g_audio_running = 1;
+        pthread_create(&g_audio_th, NULL, audio_worker_thread, NULL);
+    }
+    int next_tail = (g_audio_q_tail + 1) % AUDIO_QUEUE_SIZE;
+    if (next_tail != g_audio_q_head) {
+        g_audio_queue[g_audio_q_tail].freq = freq;
+        g_audio_queue[g_audio_q_tail].duration_ms = duration_ms;
+        g_audio_queue[g_audio_q_tail].wave = wave;
+        g_audio_queue[g_audio_q_tail].vol = vol;
+        g_audio_q_tail = next_tail;
+        pthread_cond_signal(&g_audio_cond);
+    }
+    pthread_mutex_unlock(&g_audio_mutex);
+}
 
 /* --- TUI Backend --- */
 static void tui_cleanup(void) {
@@ -838,6 +1014,9 @@ int main(int argc, char **argv) {
     vm.gui_init_cb = on_gui_init;
     vm.gui_poll_cb = on_gui_poll;
     vm.gui_flush_cb = on_gui_flush;
+    vm.psg_userdata = &g_app;
+    vm.psg_play_cb = on_psg_play;
+    atexit(audio_cleanup);
 
     int rc = 0;
 

@@ -29,8 +29,8 @@ boot:
     LI a7, 17
     ECALL                    ; SYS_SPAWN
 
-    ; Initialize SimpleFS on virtual disk if available
-    CALL simplefs_init
+    ; Initialize FAT16 on virtual disk if available
+    CALL fat16_init
 
     ; Initialize apps
     CALL paint_init
@@ -880,6 +880,13 @@ ev_click:
     MV s1, a2                ; Y
     MV s2, a3                ; button
 
+    ; UI click tone (freq=800, dur=20, wave=0, vol=160)
+    LI a0, 800
+    LI a1, 20
+    LI a2, 0
+    LI a3, 160
+    CALL sound_play_tone
+
     ; 1. Check Taskbar click (Y >= 568)
     LI t0, 568
     BLT s1, t0, chk_sm_click
@@ -1189,6 +1196,12 @@ wo_store:
 
 wo_done:
     CALL flag_redraw
+    ; Window open tone (freq=1000, dur=30, wave=0, vol=140)
+    LI a0, 1000
+    LI a1, 30
+    LI a2, 0
+    LI a3, 140
+    CALL sound_play_tone
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -1207,6 +1220,12 @@ window_close:
     LA t0, cur_win_h
     SW zero, 0(t0)
     CALL flag_redraw
+    ; Window close tone (freq=600, dur=30, wave=0, vol=140)
+    LI a0, 600
+    LI a1, 30
+    LI a2, 0
+    LI a3, 140
+    CALL sound_play_tone
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -1654,110 +1673,622 @@ calc_click_ret:
     RET
 
 ; ==============================================================================
-; SimpleFS & Notepad (Application 2)
-; Persistent File System starting at Sector 16 on dimon.iso
+; FAT16 Filesystem Subsystem & Applications (Notepad & File Explorer)
 ; ==============================================================================
-simplefs_init:
+
+; --- Helper: String Case-Insensitive Compare ---
+; a0 = str1, a1 = str2 -> returns a0 = 0 if equal, 1 if not
+str_case_cmp:
+scc_loop:
+    LBU t0, 0(a0)
+    LBU t1, 0(a1)
+    LI t2, 65
+    BLT t0, t2, scc_t0_ok
+    LI t2, 90
+    BGT t0, t2, scc_t0_ok
+    ADDI t0, t0, 32
+scc_t0_ok:
+    LI t2, 65
+    BLT t1, t2, scc_t1_ok
+    LI t2, 90
+    BGT t1, t2, scc_t1_ok
+    ADDI t1, t1, 32
+scc_t1_ok:
+    BNE t0, t1, scc_diff
+    BEQ t0, zero, scc_eq
+    ADDI a0, a0, 1
+    ADDI a1, a1, 1
+    J scc_loop
+scc_diff:
+    LI a0, 1
+    RET
+scc_eq:
+    LI a0, 0
+    RET
+
+; --- Helper: Copy a2 bytes from a0 to a1 ---
+memcpy_bytes:
+mcb_loop:
+    BEQ a2, zero, mcb_done
+    LBU a3, 0(a0)
+    SB a3, 0(a1)
+    ADDI a0, a0, 1
+    ADDI a1, a1, 1
+    ADDI a2, a2, -1
+    J mcb_loop
+mcb_done:
+    RET
+
+; --- Helper: Format 8.3 Directory Entry Name ---
+; a0 = entry ptr (32 bytes), a1 = dst buffer (at least 16 bytes)
+fat16_format_name:
+    MV t0, a0
+    MV t1, a1
+
+    LI t2, 8
+fn_len_l:
+    BEQ t2, zero, fn_copy_n
+    ADDI t3, t2, -1
+    ADD t3, t0, t3
+    LBU t3, 0(t3)
+    LI t4, 32
+    BNE t3, t4, fn_copy_n
+    ADDI t2, t2, -1
+    J fn_len_l
+
+fn_copy_n:
+    LI t3, 0
+fn_cn_l:
+    BGE t3, t2, fn_chk_e
+    ADD t4, t0, t3
+    LBU t4, 0(t4)
+    LI t5, 65
+    BLT t4, t5, fn_cn_p
+    LI t5, 90
+    BGT t4, t5, fn_cn_p
+    ADDI t4, t4, 32
+fn_cn_p:
+    SB t4, 0(t1)
+    ADDI t1, t1, 1
+    ADDI t3, t3, 1
+    J fn_cn_l
+
+fn_chk_e:
+    LBU t3, 8(t0)
+    LI t4, 32
+    BEQ t3, t4, fn_fin
+
+    LI t4, 46
+    SB t4, 0(t1)
+    ADDI t1, t1, 1
+
+    LI t3, 8
+fn_ext_l:
+    LI t4, 11
+    BGE t3, t4, fn_fin
+    ADD t4, t0, t3
+    LBU t4, 0(t4)
+    LI t5, 32
+    BEQ t4, t5, fn_fin
+    LI t5, 65
+    BLT t4, t5, fn_ext_p
+    LI t5, 90
+    BGT t4, t5, fn_ext_p
+    ADDI t4, t4, 32
+fn_ext_p:
+    SB t4, 0(t1)
+    ADDI t1, t1, 1
+    ADDI t3, t3, 1
+    J fn_ext_l
+
+fn_fin:
+    SB zero, 0(t1)
+    RET
+
+; ==============================================================================
+; fat16_init: Mount FAT16 volume by reading BPB and calculating offsets
+; ==============================================================================
+fat16_init:
     ADDI sp, sp, -16
     SD ra, 8(sp)
 
-    ; Attempt to read Sector 16 (Directory)
-    LI a0, 16                ; LBA 16
-    LA a1, simplefs_dir_buf  ; RAM buffer
-    LI a2, 1                 ; 1 sector
+    ; Read Sector 0 (BPB)
+    LI a0, 0
+    LA a1, fat16_sec_buf
+    LI a2, 1
     LI a7, 6
     ECALL                    ; SYS_DISK_READ
-    BNE a0, zero, sfs_init_done ; no disk attached
+    BNE a0, zero, f16_init_err
 
-    ; Check if Sector 16 has valid entries (flags > 0)
-    LA t0, simplefs_dir_buf
-    LW t1, 24(t0)            ; entry 0 flags
-    BNE t1, zero, sfs_init_done
+    ; Check boot signature (0x55, 0xAA)
+    LA t0, fat16_sec_buf
+    LBU t1, 510(t0)
+    LI t2, 0x55
+    BNE t1, t2, f16_init_err
+    LBU t1, 511(t0)
+    LI t2, 0xAA
+    BNE t1, t2, f16_init_err
 
-    ; If empty, format Sector 16 with initial files
-    CALL simplefs_format
+    ; Bytes per sector == 512
+    LHU t1, 11(t0)
+    LI t2, 512
+    BNE t1, t2, f16_init_err
 
-sfs_init_done:
+    ; Sectors per cluster
+    LBU t1, 13(t0)
+    BEQ t1, zero, f16_init_err
+    LA t2, fat16_sec_per_clus
+    SW t1, 0(t2)
+
+    ; Reserved sectors
+    LHU t3, 14(t0)
+    LA t2, fat16_fat_start
+    SW t3, 0(t2)
+
+    ; Number of FATs
+    LBU t4, 16(t0)
+
+    ; Root entries
+    LHU t5, 17(t0)
+
+    ; Sectors per FAT
+    LHU t6, 22(t0)
+    LA t2, fat16_sec_per_fat
+    SW t6, 0(t2)
+
+    ; Root Directory Start = reserved_sectors + (num_fats * sec_per_fat)
+    MUL t1, t4, t6
+    ADD t1, t3, t1
+    LA t2, fat16_root_start
+    SW t1, 0(t2)
+
+    ; Root Directory Sectors = (root_entries * 32 + 511) / 512
+    SLLI t2, t5, 5
+    ADDI t2, t2, 511
+    SRLI t2, t2, 9
+    LA a3, fat16_root_secs
+    SW t2, 0(a3)
+
+    ; Data Start = root_start + root_secs
+    ADD t2, t1, t2
+    LA a3, fat16_data_start
+    SW t2, 0(a3)
+
+    ; Mounted flag = 1
+    LA t0, fat16_mounted
+    LI t1, 1
+    SW t1, 0(t0)
+
+    ; Read initial root directory
+    CALL fat16_read_dir
+
+    LI a0, 0
+    J f16_init_done
+
+f16_init_err:
+    LA t0, fat16_mounted
+    SW zero, 0(t0)
+    LI a0, -1
+
+f16_init_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
 
-simplefs_format:
+; ==============================================================================
+; fat16_read_dir: Read root directory sectors & count valid files
+; ==============================================================================
+fat16_read_dir:
     ADDI sp, sp, -16
     SD ra, 8(sp)
 
-    ; Clear directory buffer
-    LA t0, simplefs_dir_buf
-    LI t1, 512
-fmt_clr:
-    BEQ t1, zero, fmt_entries
-    SB zero, 0(t0)
+    LA t0, fat16_mounted
+    LW t0, 0(t0)
+    BEQ t0, zero, f16_rd_err
+
+    ; Read first 2 sectors of Root Directory into fat16_dir_buf
+    LA t0, fat16_root_start
+    LW a0, 0(t0)
+    LA a1, fat16_dir_buf
+    LI a2, 2
+    LI a7, 6
+    ECALL
+    BNE a0, zero, f16_rd_err
+
+    ; Scan entries
+    LI t0, 0
+    LI t1, 0
+    LA t2, fat16_dir_buf
+
+f16_cnt_loop:
+    LI t3, 32
+    BGE t0, t3, f16_cnt_done
+    SLLI t3, t0, 5
+    ADD t3, t2, t3
+    LBU t4, 0(t3)
+    BEQ t4, zero, f16_cnt_done
+    LI t5, 0xE5
+    BEQ t4, t5, f16_cnt_next
+    LBU t4, 11(t3)
+    LI t5, 0x0F
+    BEQ t4, t5, f16_cnt_next
+    ANDI t5, t4, 0x08
+    BNE t5, zero, f16_cnt_next
+
+    ADDI t1, t1, 1
+
+f16_cnt_next:
     ADDI t0, t0, 1
-    ADDI t1, t1, -1
-    J fmt_clr
+    J f16_cnt_loop
 
-fmt_entries:
-    ; Entry 0: "notes.txt", Sector 18, 45 bytes, Flags 1
-    LA t0, simplefs_dir_buf
-    LA a0, str_sfs_f0
-    CALL str_copy_16
-    LA t0, simplefs_dir_buf
-    LI t1, 18
-    SW t1, 16(t0)            ; SectorOffset
-    LI t1, 45
-    SW t1, 20(t0)            ; ByteLength
-    LI t1, 1
-    SW t1, 24(t0)            ; Flags
+f16_cnt_done:
+    LA t0, fat16_file_count
+    SW t1, 0(t0)
+    MV a0, t1
+    J f16_rd_done
 
-    ; Write initial notes.txt text to sector 18
-    LA a0, note_buf
-    LA a1, str_init_notes
-    CALL str_copy
-    LI a0, 18
-    LA a1, note_buf
-    LI a2, 8
-    LI a7, 8
-    ECALL                    ; SYS_DISK_WRITE
+f16_rd_err:
+    LI a0, -1
 
-    ; Entry 1: "readme.txt", Sector 26, 60 bytes, Flags 1
-    LA t0, simplefs_dir_buf
-    ADDI t0, t0, 32
-    LA a0, str_sfs_f1
-    CALL str_copy_16
-    LA t0, simplefs_dir_buf
-    ADDI t0, t0, 32
-    LI t1, 26
-    SW t1, 16(t0)
-    LI t1, 60
-    SW t1, 20(t0)
-    LI t1, 1
-    SW t1, 24(t0)
-
-    ; Write directory to Sector 16
-    LI a0, 16
-    LA a1, simplefs_dir_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL                    ; SYS_DISK_WRITE
-
+f16_rd_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
 
-str_copy_16:
-    LI t1, 16
-sc16_l:
-    BEQ t1, zero, sc16_d
-    LBU t2, 0(a0)
-    SB t2, 0(t0)
-    BEQ t2, zero, sc16_d
-    ADDI a0, a0, 1
-    ADDI t0, t0, 1
-    ADDI t1, t1, -1
-    J sc16_l
-sc16_d:
+; ==============================================================================
+; fat16_find_file: Find directory entry by filename
+; a0 = pointer to filename string -> returns a0 = pointer to entry or 0
+; ==============================================================================
+fat16_find_file:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+
+    MV s0, a0
+    LI s1, 0
+
+f16_ff_loop:
+    LI t0, 32
+    BGE s1, t0, f16_ff_fail
+
+    SLLI t0, s1, 5
+    LA t1, fat16_dir_buf
+    ADD t1, t1, t0
+
+    LBU t2, 0(t1)
+    BEQ t2, zero, f16_ff_fail
+    LI t3, 0xE5
+    BEQ t2, t3, f16_ff_nxt
+    LBU t2, 11(t1)
+    LI t3, 0x0F
+    BEQ t2, t3, f16_ff_nxt
+    ANDI t3, t2, 0x08
+    BNE t3, zero, f16_ff_nxt
+
+    MV a0, t1
+    LA a1, fm_name_buf
+    CALL fat16_format_name
+
+    LA a0, fm_name_buf
+    MV a1, s0
+    CALL str_case_cmp
+    BEQ a0, zero, f16_ff_match
+
+f16_ff_nxt:
+    ADDI s1, s1, 1
+    J f16_ff_loop
+
+f16_ff_match:
+    SLLI t0, s1, 5
+    LA t1, fat16_dir_buf
+    ADD a0, t1, t0
+    J f16_ff_ret
+
+f16_ff_fail:
+    LI a0, 0
+
+f16_ff_ret:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
     RET
 
+; ==============================================================================
+; fat16_read_file: Traverse FAT cluster chain to load file contents into RAM
+; a0 = start cluster, a1 = RAM dst, a2 = max bytes, a3 = file size
+; returns a0 = total bytes read
+; ==============================================================================
+fat16_read_file:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    SD s3, 8(sp)
+    SD s4, 0(sp)
+
+    MV s0, a0
+    MV s1, a1
+    MV s2, a2
+    MV s4, a3
+    LI s3, 0
+
+    LI t0, 2
+    BLT s0, t0, f16_rf_done
+    LI t0, 0xFFF8
+    BGE s0, t0, f16_rf_done
+
+f16_rf_loop:
+    BGE s3, s4, f16_rf_done
+    BGE s3, s2, f16_rf_done
+
+    ; LBA = fat16_data_start + (cur_cluster - 2) * fat16_sec_per_clus
+    LA t0, fat16_data_start
+    LW t1, 0(t0)
+    ADDI t2, s0, -2
+    LA t0, fat16_sec_per_clus
+    LW t3, 0(t0)
+    MUL t2, t2, t3
+    ADD a0, t1, t2
+
+    SUB t0, s4, s3
+    SUB t1, s2, s3
+    BLE t0, t1, f16_rf_lim
+    MV t0, t1
+f16_rf_lim:
+    LI t1, 512
+    BLT t0, t1, f16_rf_part
+
+    ADD a1, s1, s3
+    LI a2, 1
+    LI a7, 6
+    ECALL
+    BNE a0, zero, f16_rf_done
+    ADDI s3, s3, 512
+    J f16_rf_next_c
+
+f16_rf_part:
+    BEQ t0, zero, f16_rf_done
+    LA a1, fat16_sec_buf
+    LI a2, 1
+    LI a7, 6
+    ECALL
+    BNE a0, zero, f16_rf_done
+
+    LA a0, fat16_sec_buf
+    ADD a1, s1, s3
+    ADD s3, s3, t0
+    MV a2, t0
+    CALL memcpy_bytes
+    J f16_rf_done
+
+f16_rf_next_c:
+    SLLI t0, s0, 1
+    SRLI t1, t0, 9
+    ANDI t2, t0, 511
+
+    LA t3, fat16_fat_start
+    LW a0, 0(t3)
+    ADD a0, a0, t1
+    LA a1, fat16_fat_buf
+    LI a2, 1
+    LI a7, 6
+    ECALL
+    BNE a0, zero, f16_rf_done
+
+    LA t0, fat16_fat_buf
+    ADD t0, t0, t2
+    LHU s0, 0(t0)
+
+    LI t0, 2
+    BLT s0, t0, f16_rf_done
+    LI t0, 0xFFF8
+    BGE s0, t0, f16_rf_done
+
+    J f16_rf_loop
+
+f16_rf_done:
+    MV a0, s3
+    LD s4, 0(sp)
+    LD s3, 8(sp)
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; ==============================================================================
+; fat16_write_file: Write buffer to file clusters & update root dir entry
+; a0 = entry ptr, a1 = src buffer, a2 = byte length
+; returns a0 = 0 on success, -1 on failure
+; ==============================================================================
+fat16_write_file:
+    ADDI sp, sp, -64
+    SD ra, 56(sp)
+    SD s0, 48(sp)
+    SD s1, 40(sp)
+    SD s2, 32(sp)
+    SD s3, 24(sp)
+    SD s4, 16(sp)
+    SD s5, 8(sp)
+
+    MV s0, a0
+    MV s1, a1
+    MV s2, a2
+    LI s4, 0
+
+    LA t0, fat16_mounted
+    LW t0, 0(t0)
+    BEQ t0, zero, f16_wf_fail
+
+    ; Read FAT Sector 0 into fat16_fat_buf
+    LA t0, fat16_fat_start
+    LW a0, 0(t0)
+    LA a1, fat16_fat_buf
+    LI a2, 1
+    LI a7, 6
+    ECALL
+    BNE a0, zero, f16_wf_fail
+
+    ; Get cluster from entry
+    LHU s3, 26(s0)
+    LI t0, 2
+    BGE s3, t0, f16_wf_alloc_ok
+
+    ; Allocate free cluster in fat16_fat_buf
+    LI t0, 2
+f16_wf_find_free:
+    LI t1, 256
+    BGE t0, t1, f16_wf_fail
+    SLLI t1, t0, 1
+    LA t2, fat16_fat_buf
+    ADD t2, t2, t1
+    LHU t3, 0(t2)
+    BEQ t3, zero, f16_wf_got_free
+    ADDI t0, t0, 1
+    J f16_wf_find_free
+
+f16_wf_got_free:
+    MV s3, t0
+    SH s3, 26(s0)
+
+f16_wf_alloc_ok:
+f16_wf_write_loop:
+    LA t0, fat16_data_start
+    LW t1, 0(t0)
+    ADDI t2, s3, -2
+    LA t0, fat16_sec_per_clus
+    LW t3, 0(t0)
+    MUL t2, t2, t3
+    ADD s5, t1, t2
+
+    SUB t0, s2, s4
+    LI t1, 512
+    BLT t0, t1, f16_wf_part_sec
+
+    MV a0, s5
+    ADD a1, s1, s4
+    LI a2, 1
+    LI a7, 8
+    ECALL
+    ADDI s4, s4, 512
+    J f16_wf_check_done
+
+f16_wf_part_sec:
+    LA t1, fat16_sec_buf
+    LI t2, 512
+f16_wf_clr_l:
+    BEQ t2, zero, f16_wf_clr_d
+    SB zero, 0(t1)
+    ADDI t1, t1, 1
+    ADDI t2, t2, -1
+    J f16_wf_clr_l
+f16_wf_clr_d:
+    ADD a0, s1, s4
+    LA a1, fat16_sec_buf
+    ADD s4, s4, t0
+    MV a2, t0
+    CALL memcpy_bytes
+
+    MV a0, s5
+    LA a1, fat16_sec_buf
+    LI a2, 1
+    LI a7, 8
+    ECALL
+
+f16_wf_check_done:
+    BGE s4, s2, f16_wf_end_chain
+
+    SLLI t0, s3, 1
+    LA t1, fat16_fat_buf
+    ADD t1, t1, t0
+    LHU t2, 0(t1)
+    LI t3, 2
+    BLT t2, t3, f16_wf_alloc_next
+    LI t3, 0xFFF8
+    BLT t2, t3, f16_wf_reuse_next
+
+f16_wf_alloc_next:
+    LI t0, 2
+f16_wf_alloc_l:
+    LI t1, 256
+    BGE t0, t1, f16_wf_fail
+    SLLI t1, t0, 1
+    LA t2, fat16_fat_buf
+    ADD t2, t2, t1
+    LHU t3, 0(t2)
+    BEQ t3, zero, f16_wf_alloc_found
+    ADDI t0, t0, 1
+    J f16_wf_alloc_l
+
+f16_wf_alloc_found:
+    SLLI t1, s3, 1
+    LA t2, fat16_fat_buf
+    ADD t2, t2, t1
+    SH t0, 0(t2)
+    MV s3, t0
+    J f16_wf_write_loop
+
+f16_wf_reuse_next:
+    MV s3, t2
+    J f16_wf_write_loop
+
+f16_wf_end_chain:
+    SLLI t0, s3, 1
+    LA t1, fat16_fat_buf
+    ADD t1, t1, t0
+    LI t2, 0xFFFF
+    SH t2, 0(t1)
+
+    LA t0, fat16_fat_start
+    LW a0, 0(t0)
+    LA a1, fat16_fat_buf
+    LI a2, 1
+    LI a7, 8
+    ECALL
+
+    LA t0, fat16_fat_start
+    LW a0, 0(t0)
+    LA t1, fat16_sec_per_fat
+    LW t1, 0(t1)
+    ADD a0, a0, t1
+    LA a1, fat16_fat_buf
+    LI a2, 1
+    LI a7, 8
+    ECALL
+
+    SW s2, 28(s0)
+
+    LA t0, fat16_root_start
+    LW a0, 0(t0)
+    LA a1, fat16_dir_buf
+    LI a2, 1
+    LI a7, 8
+    ECALL
+
+    LI a0, 0
+    J f16_wf_ret
+
+f16_wf_fail:
+    LI a0, -1
+
+f16_wf_ret:
+    LD s5, 8(sp)
+    LD s4, 16(sp)
+    LD s3, 24(sp)
+    LD s2, 32(sp)
+    LD s1, 40(sp)
+    LD s0, 48(sp)
+    LD ra, 56(sp)
+    ADDI sp, sp, 64
+    RET
+
+; ==============================================================================
+; Application 2: Notepad (FAT16 Text Editor)
+; ==============================================================================
 notepad_init:
     ADDI sp, sp, -16
     SD ra, 8(sp)
@@ -1767,6 +2298,9 @@ notepad_init:
     SW zero, 0(t0)
     LA t0, note_file_idx
     SW zero, 0(t0)
+    LA a0, note_cur_filename
+    LA a1, str_sfs_f0
+    CALL str_copy
     CALL notepad_open_file
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -1843,8 +2377,17 @@ notepad_draw:
     LI a7, 15
     ECALL
 
-    ; Status text
+    ; Filename text
     LI a0, 380
+    LI a1, 88
+    LA a2, note_cur_filename
+    LI a3, 0xFF38BDF8
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+
+    ; Status text
+    LI a0, 480
     LI a1, 88
     LA a2, note_status_str
     LI a3, 0xFF94A3B8
@@ -1864,56 +2407,54 @@ notepad_draw:
     ; Render Text Buffer
     LA s0, note_buf
     LA t0, note_len
-    LW s1, 0(t0)             ; length
-    LI t0, 105               ; cur X
-    LI t1, 135               ; cur Y
+    LW s1, 0(t0)
+    LI t0, 105
+    LI t1, 135
     LA t2, note_cur_col
     SW t0, 0(t2)
     LA t2, note_cur_row
     SW t1, 0(t2)
 
-    LI t2, 0                 ; index
+    LI t2, 0
 np_txt_loop:
     BGE t2, s1, np_draw_cursor
     ADD t3, s0, t2
-    LBU t3, 0(t3)            ; char
+    LBU t3, 0(t3)
 
-    LI t4, 10                ; '\n'
+    LI t4, 10
     BEQ t3, t4, np_newline
 
-    ; Blit single char at (t0, t1)
     LA t4, one_char_buf
     SB t3, 0(t4)
     SB zero, 1(t4)
     MV a0, t0
     MV a1, t1
     LA a2, one_char_buf
-    LI a3, 0xFFF1F5F9        ; Light white/gray
+    LI a3, 0xFFF1F5F9
     LI a4, 0x00000000
     LI a7, 15
     ECALL
 
-    ADDI t0, t0, 8           ; next col
+    ADDI t0, t0, 8
     LI t4, 680
     BLT t0, t4, np_next_char
 
 np_newline:
     LI t0, 105
-    ADDI t1, t1, 18          ; next row
+    ADDI t1, t1, 18
     LI t4, 510
-    BGE t1, t4, np_draw_cursor ; past bottom
+    BGE t1, t4, np_draw_cursor
 
 np_next_char:
     ADDI t2, t2, 1
     J np_txt_loop
 
 np_draw_cursor:
-    ; Draw cursor line at (t0, t1)
     MV a0, t0
     MV a1, t1
     LI a2, 2
     LI a3, 16
-    LI a4, 0xFF38BDF8        ; Cyan cursor
+    LI a4, 0xFF38BDF8
     LI a7, 14
     ECALL
 
@@ -1927,7 +2468,6 @@ notepad_on_key:
     ADDI sp, sp, -16
     SD ra, 8(sp)
 
-    ; a1 = key
     LI t0, 268               ; F9 (Save)
     BEQ a1, t0, np_do_save
     LI t0, 269               ; F10 (Open)
@@ -1940,24 +2480,22 @@ notepad_on_key:
     LI t0, 10
     BEQ a1, t0, np_do_enter
 
-    ; Printable character 32..126
     LI t0, 32
     BLT a1, t0, np_key_ret
     LI t0, 126
     BGT a1, t0, np_key_ret
 
-    ; Insert char
     LA t0, note_len
     LW t1, 0(t0)
     LI t2, 4000
-    BGE t1, t2, np_key_ret   ; buffer full
+    BGE t1, t2, np_key_ret
     LA t2, note_buf
     ADD t2, t2, t1
     SB a1, 0(t2)
     ADDI t1, t1, 1
     SW t1, 0(t0)
     ADDI t2, t2, 1
-    SB zero, 0(t2)           ; null terminate
+    SB zero, 0(t2)
     CALL flag_redraw
     J np_key_ret
 
@@ -2008,25 +2546,21 @@ notepad_on_click:
     ADDI sp, sp, -16
     SD ra, 8(sp)
 
-    ; a0=X, a1=Y
     LI t0, 82
     BLT a1, t0, np_click_ret
     LI t0, 110
     BGT a1, t0, np_click_ret
 
-    ; New button: X in 95..155
     LI t0, 95
     BLT a0, t0, np_click_ret
     LI t0, 155
     BLE a0, t0, np_click_new
 
-    ; Open button: X in 165..260
     LI t0, 165
     BLT a0, t0, np_click_ret
     LI t0, 260
     BLE a0, t0, np_do_open_c
 
-    ; Save button: X in 270..365
     LI t0, 270
     BLT a0, t0, np_click_ret
     LI t0, 365
@@ -2060,97 +2594,80 @@ np_click_ret:
     RET
 
 notepad_save_file:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
 
-    ; Read directory at sector 16
-    LI a0, 16
-    LA a1, simplefs_dir_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
+    CALL fat16_read_dir
 
-    ; Update entry 0
-    LA t0, simplefs_dir_buf
-    LA a0, str_sfs_f0
-    CALL str_copy_16
+    LA a0, note_cur_filename
+    CALL fat16_find_file
+    BNE a0, zero, nps_has_ent
 
-    LA t0, simplefs_dir_buf
-    LI t1, 18
-    SW t1, 16(t0)            ; sector offset 18
-    LA t2, note_len
-    LW t2, 0(t2)
-    SW t2, 20(t0)            ; byte length
-    LI t1, 1
-    SW t1, 24(t0)            ; flags = 1 (active)
+    LA a0, fat16_dir_buf
 
-    ; Write updated directory to sector 16
-    LI a0, 16
-    LA a1, simplefs_dir_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL                    ; SYS_DISK_WRITE
-
-    ; Write note buffer (8 sectors = 4096 B) to sector 18
-    LI a0, 18
+nps_has_ent:
+    MV s0, a0
     LA a1, note_buf
-    LI a2, 8
-    LI a7, 8
-    ECALL                    ; SYS_DISK_WRITE
+    LA t0, note_len
+    LW a2, 0(t0)
+    CALL fat16_write_file
 
     LA a0, note_status_str
     LA a1, str_status_saved
     CALL str_copy
 
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
     RET
 
 notepad_open_file:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
 
-    ; Read directory sector 16
-    LI a0, 16
-    LA a1, simplefs_dir_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
+    CALL fat16_read_dir
 
-    ; Read file 0 length
-    LA t0, simplefs_dir_buf
-    LW t1, 20(t0)            ; byte length
-    LI t2, 4000
-    BLE t1, t2, npo_len_ok
-    LI t1, 4000
-npo_len_ok:
-    LA t2, note_len
-    SW t1, 0(t2)
+    LA a0, note_cur_filename
+    CALL fat16_find_file
+    BNE a0, zero, npo_has_ent
 
-    ; Read file sectors (sector 18, 8 sectors)
-    LI a0, 18
+    LA a0, fat16_dir_buf
+
+npo_has_ent:
+    MV s0, a0
+    MV a0, s0
+    LA a1, note_cur_filename
+    CALL fat16_format_name
+
+    LHU a0, 26(s0)
+    LW a3, 28(s0)
+    LI t0, 4000
+    BLE a3, t0, npo_sz_ok
+    MV a3, t0
+npo_sz_ok:
     LA a1, note_buf
-    LI a2, 8
-    LI a7, 6
-    ECALL
+    LI a2, 4000
+    CALL fat16_read_file
+    LA t0, note_len
+    SW a0, 0(t0)
 
-    ; Null terminate
-    LA t0, note_buf
-    LA t1, note_len
-    LW t1, 0(t1)
-    ADD t0, t0, t1
-    SB zero, 0(t0)
+    LA t1, note_buf
+    ADD t1, t1, a0
+    SB zero, 0(t1)
 
     LA a0, note_status_str
     LA a1, str_status_opened
     CALL str_copy
 
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
     RET
 
 ; ==============================================================================
-; Application 3: File Explorer (SimpleFS Directory Viewer)
+; Application 3: File Explorer (FAT16 Directory Viewer)
 ; ==============================================================================
 fileman_draw:
     ADDI sp, sp, -32
@@ -2158,7 +2675,6 @@ fileman_draw:
     SD s0, 16(sp)
     SD s1, 8(sp)
 
-    ; Window frame (X=100, Y=60, W=600, H=460)
     LI a0, 100
     LI a1, 60
     LI a2, 600
@@ -2166,7 +2682,6 @@ fileman_draw:
     LA a4, str_file_title
     CALL draw_window_frame
 
-    ; Table Header
     LI a0, 120
     LI a1, 104
     LA a2, str_fm_hdr
@@ -2175,7 +2690,6 @@ fileman_draw:
     LI a7, 15
     ECALL
 
-    ; Separator
     LI a0, 120
     LI a1, 124
     LI a2, 560
@@ -2184,32 +2698,45 @@ fileman_draw:
     LI a7, 14
     ECALL
 
-    ; Read sector 16 directory
-    LI a0, 16
-    LA a1, simplefs_dir_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
+    CALL fat16_read_dir
 
-    ; List entries (up to 8 visible rows)
-    LI s0, 0                 ; row index
-    LI s1, 134               ; Y coordinate
+    LA t0, fat16_mounted
+    LW t0, 0(t0)
+    BNE t0, zero, fm_mounted_ok
+
+    LI a0, 120
+    LI a1, 140
+    LA a2, str_fm_nomount
+    LI a3, 0xFFEF4444
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    J fm_draw_done
+
+fm_mounted_ok:
+    LI s0, 0
+    LI s1, 134
 fm_row_loop:
     LI t0, 8
     BGE s0, t0, fm_draw_done
 
-    SLLI t0, s0, 5           ; s0 * 32
-    LA t1, simplefs_dir_buf
-    ADD t1, t1, t0           ; entry ptr
+    SLLI t0, s0, 5
+    LA t1, fat16_dir_buf
+    ADD t1, t1, t0
 
-    ; Check flags
-    LW t2, 24(t1)
+    LBU t2, 0(t1)
     BEQ t2, zero, fm_free_entry
+    LI t3, 0xE5
+    BEQ t2, t3, fm_free_entry
+    LBU t3, 11(t1)
+    LI t4, 0x0F
+    BEQ t3, t4, fm_free_entry
+    ANDI t4, t3, 0x08
+    BNE t4, zero, fm_free_entry
 
-    ; Active entry: show Name, LBA, Size, "[Open]"
     MV a0, t1
     LA a1, fm_name_buf
-    CALL str_copy_16
+    CALL fat16_format_name
 
     LI a0, 120
     MV a1, s1
@@ -2219,11 +2746,21 @@ fm_row_loop:
     LI a7, 15
     ECALL
 
-    ; Size in bytes
-    LW a0, 20(t1)
+    LHU a0, 26(t1)
     LA a1, num_tmp
     CALL num_to_dec
-    LI a0, 320
+    LI a0, 280
+    MV a1, s1
+    LA a2, num_tmp
+    LI a3, 0xFF38BDF8
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+
+    LW a0, 28(t1)
+    LA a1, num_tmp
+    CALL num_to_dec
+    LI a0, 360
     MV a1, s1
     LA a2, num_tmp
     LI a3, 0xFF34C759
@@ -2231,7 +2768,6 @@ fm_row_loop:
     LI a7, 15
     ECALL
 
-    ; Button [ Open in Notepad ]
     LI a0, 480
     MV a1, s1
     ADDI a1, a1, -2
@@ -2273,11 +2809,12 @@ fm_draw_done:
 fileman_on_key:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    LI t0, 13                ; Enter opens into Notepad
+    LI t0, 13
     BEQ a1, t0, fm_k_open
     J fm_k_ret
 fm_k_open:
-    CALL fm_open_notepad
+    LI a0, 0
+    CALL fm_open_row_notepad
 fm_k_ret:
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -2286,7 +2823,6 @@ fm_k_ret:
 fileman_on_click:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    ; Clicking [Open in Notepad] row opens Notepad
     LI t0, 480
     BLT a0, t0, fm_click_ret
     LI t0, 620
@@ -2295,22 +2831,45 @@ fileman_on_click:
     BLT a1, t0, fm_click_ret
     LI t0, 420
     BGT a1, t0, fm_click_ret
-    CALL fm_open_notepad
+
+    ADDI a1, a1, -130
+    LI t0, 36
+    DIVU a0, a1, t0
+    CALL fm_open_row_notepad
+
 fm_click_ret:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
 
-fm_open_notepad:
+fm_open_row_notepad:
     ADDI sp, sp, -16
     SD ra, 8(sp)
+    LI t0, 8
+    BGE a0, t0, fmor_done
+
+    SLLI t0, a0, 5
+    LA t1, fat16_dir_buf
+    ADD t1, t1, t0
+    LBU t2, 0(t1)
+    BEQ t2, zero, fmor_done
+    LI t3, 0xE5
+    BEQ t2, t3, fmor_done
+
+    MV a0, t1
+    LA a1, note_cur_filename
+    CALL fat16_format_name
+
     LI a0, 2
     CALL window_open
     CALL notepad_open_file
     CALL flag_redraw
+
+fmor_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
+
 
 ; ==============================================================================
 ; Application 4: Modern Pixel Paint (TrueColor Canvas & Smooth Brushes)
@@ -3274,6 +3833,13 @@ snk_os_sh_done:
     ADDI t4, t4, 10
     SW t4, 0(t3)
 
+    ; Food eating chirp (freq=1200, dur=60, wave=0, vol=200)
+    LI a0, 1200
+    LI a1, 60
+    LI a2, 0
+    LI a3, 200
+    CALL sound_play_tone
+
     LA t3, snake_len
     LW t4, 0(t3)
     LI t5, 120
@@ -3308,6 +3874,12 @@ snk_os_die:
     LA t0, snake_gameover
     LI t1, 1
     SW t1, 0(t0)
+    ; Collision / game over buzz (freq=150, dur=250, wave=2, vol=220)
+    LI a0, 150
+    LI a1, 250
+    LI a2, 2
+    LI a3, 220
+    CALL sound_play_tone
     LI a7, 12
     ECALL                    ; SYS_GUI_FLUSH
 
@@ -3693,6 +4265,24 @@ n2d_fin:
     RET
 
 ; ==============================================================================
+; Sound Driver: Play Tone via MMIO PSG Synthesizer (0x03FFE000)
+; Inputs:
+;   a0 = frequency / pitch in Hz (u32)
+;   a1 = duration in milliseconds (u32)
+;   a2 = waveform (0=Square, 1=Triangle, 2=Noise) (u8)
+;   a3 = volume (0..255) (u8)
+; ==============================================================================
+sound_play_tone:
+    LI t0, 0x03FFE000
+    SW a0, 0(t0)        ; 0x03FFE000: Frequency
+    SB a2, 4(t0)        ; 0x03FFE004: Waveform
+    SB a3, 5(t0)        ; 0x03FFE005: Volume
+    SW a1, 8(t0)        ; 0x03FFE008: Duration
+    LI t1, 1
+    SB t1, 12(t0)       ; 0x03FFE00C: Trigger playback
+    RET
+
+; ==============================================================================
 ; Data Segment
 ; ==============================================================================
 str_top_title:
@@ -3792,7 +4382,7 @@ str_btn_c:
     .string "C"
 
 str_note_title:
-    .string "Notepad - SimpleFS [notes.txt]"
+    .string "Notepad - FAT16 Text Editor"
 str_btn_new:
     .string "[ New ]"
 str_btn_open:
@@ -3800,26 +4390,30 @@ str_btn_open:
 str_btn_save:
     .string "[ Save ]"
 str_status_saved:
-    .string "SimpleFS: Saved to Disk!"
+    .string "FAT16: Saved to Disk!"
 str_status_opened:
-    .string "SimpleFS: Loaded from Disk!"
+    .string "FAT16: Loaded from Disk!"
 str_status_new:
-    .string "SimpleFS: New document"
+    .string "FAT16: New document"
 str_sfs_f0:
     .string "notes.txt"
 str_sfs_f1:
     .string "readme.txt"
+str_sfs_f2:
+    .string "todo.txt"
 str_init_notes:
-    .string "Welcome to DimonOS-64 Notepad with SimpleFS!\nPress Save (F9) to write changes to disk.\nPress Open (F10) to reload text from disk.\n"
+    .string "Welcome to DimonOS-64 Notepad with FAT16!\nPress Save (F9) to write changes to disk.\nPress Open (F10) to reload text from disk.\n"
 
 str_file_title:
-    .string "File Explorer - SimpleFS Directory"
+    .string "File Explorer - FAT16 Root Directory"
 str_fm_hdr:
-    .string "FILENAME         LBA      SIZE     ACTION"
+    .string "FILENAME         CLUSTER  SIZE     ACTION"
 str_fm_open_btn:
     .string "[Open in Notepad]"
 str_fm_empty:
-    .string "(free sector)"
+    .string "(empty entry)"
+str_fm_nomount:
+    .string "(No FAT16 volume detected)"
 
 str_paint_title:
     .string "Paint - TrueColor Studio 800x600"
@@ -3843,7 +4437,7 @@ str_info_ram:
 str_info_gpu:
     .string "Display: 800x600 TrueColor LFB @ 0x02000000"
 str_info_fs:
-    .string "Filesystem: SimpleFS (Sector 16)"
+    .string "Filesystem: Standard FAT16 (800x600 LFB)"
 str_info_ticks:
     .string "Interrupt Ticks: "
 str_info_worker:
@@ -3997,10 +4591,35 @@ snake_x:
 snake_y:
     .space 128
 
-; Sector 16 Directory Buffer (512 bytes)
+; FAT16 State & Variables
     .align 4
-simplefs_dir_buf:
+fat16_mounted:
+    .word 0
+fat16_fat_start:
+    .word 4
+fat16_sec_per_fat:
+    .word 16
+fat16_root_start:
+    .word 36
+fat16_root_secs:
+    .word 32
+fat16_data_start:
+    .word 68
+fat16_sec_per_clus:
+    .word 1
+fat16_file_count:
+    .word 0
+note_cur_filename:
+    .space 32
+
+; FAT16 Buffers
+    .align 4
+fat16_sec_buf:
     .space 512
+fat16_fat_buf:
+    .space 512
+fat16_dir_buf:
+    .space 1024
 
 ; Notepad text buffer (4 KB = 4096 bytes)
     .align 4

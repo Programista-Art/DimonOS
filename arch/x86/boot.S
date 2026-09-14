@@ -1,15 +1,29 @@
 # Multiboot 1 header constants
-.set MB_ALIGN,    1 << 0
-.set MB_MEMINFO,  1 << 1
-.set MB_FLAGS,    MB_ALIGN | MB_MEMINFO
-.set MB_MAGIC,    0x1BADB002
-.set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
+.set MB_ALIGN,     1 << 0
+.set MB_MEMINFO,   1 << 1
+.set MB_VIDEOMODE, 1 << 2
+.set MB_FLAGS,     MB_ALIGN | MB_MEMINFO | MB_VIDEOMODE
+.set MB_MAGIC,     0x1BADB002
+.set MB_CHECKSUM,  -(MB_MAGIC + MB_FLAGS)
 
 .section .multiboot, "a"
 .align 4
 .long MB_MAGIC
 .long MB_FLAGS
 .long MB_CHECKSUM
+
+# A.OUT kludge fields (offsets 12..28, unused for ELF, set to 0)
+.long 0   # header_addr
+.long 0   # load_addr
+.long 0   # load_end_addr
+.long 0   # bss_end_addr
+.long 0   # entry_addr
+
+# Video mode preference fields (offsets 32..44, valid because bit 2 is set)
+.long 0   # mode_type: 0 = linear framebuffer
+.long 800 # width
+.long 600 # height
+.long 32  # depth (bpp)
 
 # Global Descriptor Table (GDT)
 .section .data
@@ -42,6 +56,10 @@ stack_top:
 .type _start, @function
 _start:
     cli
+    # Preserve Multiboot magic (EAX) and info pointer (EBX)
+    mov %eax, %edi
+    mov %ebx, %esi
+
     # Load known GDT and reload segments
     lgdt gdt_descriptor
     ljmp $0x08, $1f
@@ -54,8 +72,9 @@ _start:
     mov %cx, %ss
     mov $stack_top, %esp
 
-    push %ebx           # Multiboot info pointer
-    push %eax           # Multiboot magic
+    # Call kernel_main(uint32_t magic, uint32_t mb_info)
+    push %esi           # Multiboot info pointer
+    push %edi           # Multiboot magic
     call kernel_main
 
     cli

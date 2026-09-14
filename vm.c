@@ -4,13 +4,22 @@
 #include "dimon64.h"
 #include "font8x16.h"
 
-#include <inttypes.h>
 #ifndef BAREMETAL
+#include <inttypes.h>
 #include <time.h>
 #include <sys/time.h>
 #else
 extern uint32_t kernel_get_ticks_ms(void);
 extern void baremetal_putchar(char c);
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+#ifndef PRIX64
+#define PRIX64 "llX"
+#endif
+#ifndef PRId64
+#define PRId64 "lld"
+#endif
 #endif
 
 static uint64_t host_time_ms(void) {
@@ -188,10 +197,13 @@ void vm_init(VM *vm) {
     if (!vm) return;
     memset(vm, 0, sizeof(*vm));
     vm->memsize = DIMON64_MEM_SIZE;
+#ifndef BAREMETAL
     vm->mem = (uint8_t *)calloc(1, (size_t)vm->memsize);
+#endif
     vm->timer_period = 500;
     vm->timer_ticks = 0;
     vm->timer_vector = 0;
+    vm->psg_vol = 255;
     vm->flags = DIMON64_FLAG_IE;
     vm->cur_proc = 0;
     vm->next_pid = 1;
@@ -339,6 +351,11 @@ void vm_reset(VM *vm, uint64_t start_pc) {
     vm->timer_ticks = 0;
     vm->timer_vector = 0;
     if (vm->timer_period < 10 || vm->timer_period > 1000000) vm->timer_period = 500;
+    vm->psg_freq = 0;
+    vm->psg_wave = 0;
+    vm->psg_vol = 255;
+    vm->psg_duration_ms = 0;
+    vm->psg_end_time_ms = 0;
     memset(vm->regs, 0, sizeof(vm->regs));
     vm->flags = DIMON64_FLAG_IE;
     vm->epc = 0;
@@ -437,6 +454,42 @@ static int read_u8(VM *vm, uint64_t addr, uint8_t *out) {
         *out = (uint8_t)((vm->timer_vector >> sh) & 0xFFu);
         return 0;
     }
+    /* Programmable Sound Generator (PSG) */
+    if (addr >= DIMON64_MMIO_PSG_FREQ && addr < DIMON64_MMIO_PSG_FREQ + 4) {
+        unsigned sh = (unsigned)(addr - DIMON64_MMIO_PSG_FREQ) * 8u;
+        *out = (uint8_t)((vm->psg_freq >> sh) & 0xFFu);
+        return 0;
+    }
+    if (addr == DIMON64_MMIO_PSG_WAVE) {
+        *out = vm->psg_wave;
+        return 0;
+    }
+    if (addr == DIMON64_MMIO_PSG_VOL) {
+        *out = vm->psg_vol;
+        return 0;
+    }
+    if (addr >= DIMON64_MMIO_PSG_DUR && addr < DIMON64_MMIO_PSG_DUR + 4) {
+        unsigned sh = (unsigned)(addr - DIMON64_MMIO_PSG_DUR) * 8u;
+        *out = (uint8_t)((vm->psg_duration_ms >> sh) & 0xFFu);
+        return 0;
+    }
+    if (addr >= DIMON64_MMIO_PSG_STATUS && addr < DIMON64_MMIO_PSG_STATUS + 4) {
+        if (addr == DIMON64_MMIO_PSG_STATUS) {
+            uint8_t busy = 0;
+            if (vm->psg_end_time_ms != 0) {
+                uint64_t now = host_time_ms();
+                if (now < vm->psg_end_time_ms) {
+                    busy = 1;
+                } else {
+                    vm->psg_end_time_ms = 0;
+                }
+            }
+            *out = busy;
+        } else {
+            *out = 0;
+        }
+        return 0;
+    }
     if (addr >= vm->memsize) return -1;
     *out = vm->mem[addr];
     return 0;
@@ -470,6 +523,49 @@ static int write_u8(VM *vm, uint64_t addr, uint8_t v) {
         unsigned sh = (unsigned)(addr - DIMON64_MMIO_TIMER_VECTOR) * 8u;
         uint64_t mask = ~(0xFFULL << sh);
         vm->timer_vector = (vm->timer_vector & mask) | ((uint64_t)v << sh);
+        if (addr < vm->memsize) vm->mem[addr] = v;
+        return 0;
+    }
+    /* Programmable Sound Generator (PSG) */
+    if (addr >= DIMON64_MMIO_PSG_FREQ && addr < DIMON64_MMIO_PSG_FREQ + 4) {
+        unsigned sh = (unsigned)(addr - DIMON64_MMIO_PSG_FREQ) * 8u;
+        uint32_t mask = ~(0xFFu << sh);
+        vm->psg_freq = (vm->psg_freq & mask) | ((uint32_t)v << sh);
+        if (addr < vm->memsize) vm->mem[addr] = v;
+        return 0;
+    }
+    if (addr == DIMON64_MMIO_PSG_WAVE) {
+        vm->psg_wave = v;
+        if (addr < vm->memsize) vm->mem[addr] = v;
+        return 0;
+    }
+    if (addr == DIMON64_MMIO_PSG_VOL) {
+        vm->psg_vol = v;
+        if (addr < vm->memsize) vm->mem[addr] = v;
+        return 0;
+    }
+    if (addr >= DIMON64_MMIO_PSG_DUR && addr < DIMON64_MMIO_PSG_DUR + 4) {
+        unsigned sh = (unsigned)(addr - DIMON64_MMIO_PSG_DUR) * 8u;
+        uint32_t mask = ~(0xFFu << sh);
+        vm->psg_duration_ms = (vm->psg_duration_ms & mask) | ((uint32_t)v << sh);
+        if (addr < vm->memsize) vm->mem[addr] = v;
+        return 0;
+    }
+    if (addr >= DIMON64_MMIO_PSG_STATUS && addr < DIMON64_MMIO_PSG_STATUS + 4) {
+        if (addr == DIMON64_MMIO_PSG_STATUS) {
+            if (v & 1) {
+                if (vm->psg_duration_ms > 0) {
+                    vm->psg_end_time_ms = host_time_ms() + vm->psg_duration_ms;
+                } else {
+                    vm->psg_end_time_ms = 0;
+                }
+                if (vm->psg_play_cb) {
+                    vm->psg_play_cb(vm->psg_userdata, vm->psg_freq, vm->psg_duration_ms, vm->psg_wave, vm->psg_vol);
+                }
+            } else {
+                vm->psg_end_time_ms = 0;
+            }
+        }
         if (addr < vm->memsize) vm->mem[addr] = v;
         return 0;
     }
@@ -520,8 +616,7 @@ static void flags_add(VM *vm, uint64_t a, uint64_t b, uint64_t res) {
     vm->flags &= ~(DIMON64_FLAG_Z | DIMON64_FLAG_N | DIMON64_FLAG_C | DIMON64_FLAG_O);
     if (res == 0) vm->flags |= DIMON64_FLAG_Z;
     if (res >> 63) vm->flags |= DIMON64_FLAG_N;
-    __uint128_t full = (__uint128_t)a + (__uint128_t)b;
-    if ((full >> 64) != 0) vm->flags |= DIMON64_FLAG_C;
+    if (res < a) vm->flags |= DIMON64_FLAG_C;
     if (((~(a ^ b)) & (a ^ res)) >> 63) vm->flags |= DIMON64_FLAG_O;
     vm->flags |= ie;
 }

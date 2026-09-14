@@ -13,6 +13,8 @@ void *memset(void *s, int c, size_t n);
 void *memcpy(void *dest, const void *src, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
 size_t strlen(const char *s);
+int snprintf(char *str, size_t size, const char *format, ...);
+static inline int abs(int v) { return v < 0 ? -v : v; }
 #endif
 
 /* ============ Memory model ============ */
@@ -41,6 +43,21 @@ size_t strlen(const char *s);
 #define DIMON64_MMIO_TIMER_PERIOD 0x03FFF008ULL /* u64 rw: cycles per tick */
 #define DIMON64_MMIO_TIMER_VECTOR 0x03FFF010ULL /* u64 rw: ISR address (0=none) */
 #define DIMON64_MMIO_SERIAL_DATA  0x03FFFF00ULL /* u8 rw: console port */
+
+/* Programmable Sound Generator (PSG / Tone Synthesizer) */
+#define DIMON64_MMIO_PSG_FREQ     0x03FFE000ULL /* u32 rw: Ch0 frequency in Hz */
+#define DIMON64_MMIO_PSG_WAVE     0x03FFE004ULL /* u8 rw: Ch0 waveform (0=Square, 1=Triangle, 2=Noise) */
+#define DIMON64_MMIO_PSG_VOL      0x03FFE005ULL /* u8 rw: Ch0 volume (0..255) */
+#define DIMON64_MMIO_PSG_DUR      0x03FFE008ULL /* u32 rw: Ch0 duration in ms */
+#define DIMON64_MMIO_PSG_STATUS   0x03FFE00CULL /* u8 rw: trigger/status (1=busy/play) */
+
+#define DIMON64_PSG_WAVE_SQUARE   0
+#define DIMON64_PSG_WAVE_TRIANGLE 1
+#define DIMON64_PSG_WAVE_NOISE    2
+
+#define PSG_WAVE_SQUARE           DIMON64_PSG_WAVE_SQUARE
+#define PSG_WAVE_TRIANGLE         DIMON64_PSG_WAVE_TRIANGLE
+#define PSG_WAVE_NOISE            DIMON64_PSG_WAVE_NOISE
 
 /* Legacy aliases */
 #define VRAM_ADDR DIMON64_VRAM_BASE
@@ -310,6 +327,15 @@ typedef struct {
     void    (*gui_flush_cb)(void *userdata);
     void    (*gui_poll_cb)(void *userdata);
     void     *gui_userdata;
+
+    /* Sound generator (PSG) */
+    uint32_t psg_freq;
+    uint8_t  psg_wave;
+    uint8_t  psg_vol;
+    uint32_t psg_duration_ms;
+    uint64_t psg_end_time_ms;
+    void   (*psg_play_cb)(void *userdata, uint32_t freq, uint32_t duration_ms, uint8_t wave, uint8_t vol);
+    void    *psg_userdata;
 } VM;
 
 /* GUI helpers */
