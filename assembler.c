@@ -15,6 +15,7 @@
 #define MAX_LINES 32768
 #define MAX_LABELS 8192
 #define MAX_LINE_LEN 2048
+#define MAX_RELOCS 32768
 
 typedef struct { char name[96]; uint64_t addr; } Label;
 static Label labels[MAX_LABELS];
@@ -25,6 +26,10 @@ static Line lines[MAX_LINES];
 static int nlines = 0;
 
 static int errors = 0;
+static uint32_t relocations[MAX_RELOCS];
+static uint32_t nrelocations = 0;
+static int emit_dexe = 0;
+static const char *dexe_name = NULL;
 
 static void err(int lineno, const char *msg) {
     fprintf(stderr, "ASM error [line %d]: %s\n", lineno, msg);
@@ -1003,6 +1008,10 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         int64_t ev = 0;
         if (resolve_expr(ops[1], pc, &ev, lineno)) {
             /* label address: force 2-word LUI+ADDI */
+            if (emit_dexe) {
+                if (nrelocations >= MAX_RELOCS) { err(lineno, "too many DEXE relocations"); return; }
+                relocations[nrelocations++] = (uint32_t)cur;
+            }
             int32_t hi = (int32_t)(((ev + 0x800) >> 12) & 0xFFFFF);
             int32_t lo = (int32_t)(ev - ((int64_t)hi << 12));
             emit32le(dimon64_encode_u((uint8_t)rd, hi, DIMON64_OPCODE_LUI));
@@ -1018,6 +1027,10 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         if (!parse_reg(ops[0], &rd)) { err(lineno, "LA: invalid register"); return; }
         int64_t ev = 0;
         if (!resolve_expr(ops[1], pc, &ev, lineno)) return;
+        if (emit_dexe) {
+            if (nrelocations >= MAX_RELOCS) { err(lineno, "too many DEXE relocations"); return; }
+            relocations[nrelocations++] = (uint32_t)cur;
+        }
         int32_t hi = (int32_t)(((ev + 0x800) >> 12) & 0xFFFFF);
         int32_t lo = (int32_t)(ev - ((int64_t)hi << 12));
         emit32le(dimon64_encode_u((uint8_t)rd, hi, DIMON64_OPCODE_LUI));
@@ -1249,13 +1262,14 @@ static int load_source(const char *path, int depth) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s input.asm [-o output.bin]\n", argv[0]);
+        fprintf(stderr, "Usage: %s input.asm [-o output.bin] [--dexe NAME]\n", argv[0]);
         return 1;
     }
     const char *inpath = argv[1];
     const char *outpath = "a.bin";
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) outpath = argv[++i];
+        else if (!strcmp(argv[i], "--dexe") && i + 1 < argc) { emit_dexe = 1; dexe_name = argv[++i]; }
         else if (argv[i][0] != '-') outpath = argv[i];
     }
     if (load_source(inpath, 0) != 0) return 1;
@@ -1372,9 +1386,25 @@ int main(int argc, char **argv) {
     FILE *o = fopen(outpath, "wb");
     if (!o) { perror("fopen out"); free(img); return 1; }
     if (himark == 0) himark = 4;
-    if (fwrite(img, 1, (size_t)himark, o) != (size_t)himark) { perror("fwrite"); fclose(o); free(img); return 1; }
+    if (emit_dexe) {
+        Dimon64ExecHeader h;
+        memset(&h, 0, sizeof(h)); memcpy(h.magic, DIMON64_EXEC_MAGIC, 8);
+        h.version = DIMON64_EXEC_VERSION; h.header_size = (uint32_t)sizeof(h);
+        h.image_size = (uint32_t)himark; h.bss_size = 0;
+        h.entry_offset = 0; h.memory_size = DIMON64_APP_SLOT_SIZE;
+        h.relocation_count = nrelocations;
+        snprintf(h.name, sizeof(h.name), "%s", dexe_name ? dexe_name : "app");
+        if (fwrite(&h, 1, sizeof(h), o) != sizeof(h) ||
+            fwrite(img, 1, (size_t)himark, o) != (size_t)himark ||
+            (nrelocations && fwrite(relocations, sizeof(uint32_t), nrelocations, o) != nrelocations)) {
+            perror("fwrite"); fclose(o); free(img); return 1;
+        }
+    } else if (fwrite(img, 1, (size_t)himark, o) != (size_t)himark) {
+        perror("fwrite"); fclose(o); free(img); return 1;
+    }
     fclose(o);
-    printf("OK: %s -> %s (%" PRIu64 " bytes)\n", inpath, outpath, himark);
+    printf("OK: %s -> %s (%" PRIu64 " image bytes%s)\n", inpath, outpath, himark,
+           emit_dexe ? ", DEXE64" : "");
     if (nlabels) {
         printf("Labels (%d):\n", nlabels);
         for (int i = 0; i < nlabels; i++)

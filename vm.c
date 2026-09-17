@@ -3,6 +3,7 @@
  */
 #include "dimon64.h"
 #include "font8x16.h"
+#include "dimonfs.h"
 
 #ifndef BAREMETAL
 #include <inttypes.h>
@@ -32,6 +33,11 @@ static uint64_t host_time_ms(void) {
 #endif
 }
 
+static uint32_t load_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 /* ---------- register names ---------- */
 static const char *abi_names[32] = {
     "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
@@ -54,7 +60,8 @@ const char *reg_name(int r) {
 }
 
 /* ---------- events / GUI ---------- */
-void vm_event_push_ext(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button) {
+void vm_event_push_mod(VM *vm, uint8_t type, uint16_t code, uint16_t data,
+                       uint8_t button, uint8_t modifiers) {
     if (!vm) return;
     int next = (vm->event_tail + 1) % VM_EVENT_QUEUE_SIZE;
     if (next != vm->event_head) {
@@ -62,8 +69,13 @@ void vm_event_push_ext(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8
         vm->event_queue[vm->event_tail].button = button;
         vm->event_queue[vm->event_tail].code = code;
         vm->event_queue[vm->event_tail].data = data;
+        vm->event_queue[vm->event_tail].modifiers = modifiers;
         vm->event_tail = next;
     }
+}
+
+void vm_event_push_ext(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button) {
+    vm_event_push_mod(vm, type, code, data, button, 0);
 }
 
 void vm_event_push(VM *vm, uint8_t type, uint16_t code, uint16_t data) {
@@ -84,6 +96,7 @@ int vm_event_pop_ext(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data, uint
     vm->event_queue[vm->event_head].code = 0;
     vm->event_queue[vm->event_head].data = 0;
     vm->event_queue[vm->event_head].button = 0;
+    vm->event_queue[vm->event_head].modifiers = 0;
     vm->event_head = (vm->event_head + 1) % VM_EVENT_QUEUE_SIZE;
     return 1;
 }
@@ -94,6 +107,11 @@ int vm_event_pop(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data) {
 
 void vm_gui_draw_pixel(VM *vm, int x, int y, uint32_t color32) {
     if (!vm || !vm->mem) return;
+    if (vm->draw_context_active) {
+        x += vm->draw_offset_x; y += vm->draw_offset_y;
+        if (x < vm->draw_clip_x || y < vm->draw_clip_y ||
+            x >= vm->draw_clip_x + vm->draw_clip_w || y >= vm->draw_clip_y + vm->draw_clip_h) return;
+    }
     if (x < 0 || x >= DIMON64_LFB_WIDTH || y < 0 || y >= DIMON64_LFB_HEIGHT) return;
     uint64_t addr = DIMON64_VRAM_BASE + (uint64_t)(y * DIMON64_LFB_WIDTH + x) * 4ULL;
     if (addr + 4 > vm->memsize) return;
@@ -103,12 +121,19 @@ void vm_gui_draw_pixel(VM *vm, int x, int y, uint32_t color32) {
 
 void vm_gui_fill_rect(VM *vm, int x, int y, int w, int h, uint32_t color32) {
     if (!vm || !vm->mem || w <= 0 || h <= 0) return;
+    if (vm->draw_context_active) { x += vm->draw_offset_x; y += vm->draw_offset_y; }
     int x0 = x < 0 ? 0 : x;
     int y0 = y < 0 ? 0 : y;
     int x1 = x + w;
     int y1 = y + h;
     if (x1 > DIMON64_LFB_WIDTH) x1 = DIMON64_LFB_WIDTH;
     if (y1 > DIMON64_LFB_HEIGHT) y1 = DIMON64_LFB_HEIGHT;
+    if (vm->draw_context_active) {
+        if (x0 < vm->draw_clip_x) x0 = vm->draw_clip_x;
+        if (y0 < vm->draw_clip_y) y0 = vm->draw_clip_y;
+        if (x1 > vm->draw_clip_x + vm->draw_clip_w) x1 = vm->draw_clip_x + vm->draw_clip_w;
+        if (y1 > vm->draw_clip_y + vm->draw_clip_h) y1 = vm->draw_clip_y + vm->draw_clip_h;
+    }
     if (x0 >= x1 || y0 >= y1) return;
 
     for (int cy = y0; cy < y1; cy++) {
@@ -138,19 +163,41 @@ void vm_gui_draw_line(VM *vm, int x0, int y0, int x1, int y1, uint32_t color32) 
 
 void vm_gui_draw_string(VM *vm, int x, int y, const char *text, uint32_t fg, uint32_t bg) {
     if (!vm || !vm->mem || !text) return;
+    if (vm->draw_context_active) { x += vm->draw_offset_x; y += vm->draw_offset_y; }
     int cur_x = x;
     int draw_bg = ((bg & 0xFF000000) != 0);
 
     while (*text) {
-        uint8_t ch = (uint8_t)*text;
+        uint32_t cp = (uint8_t)*text++;
+        if ((cp & 0xe0u) == 0xc0u && ((uint8_t)*text & 0xc0u) == 0x80u) {
+            cp = ((cp & 0x1fu) << 6) | ((uint8_t)*text++ & 0x3fu);
+        } else if ((cp & 0xf0u) == 0xe0u && ((uint8_t)text[0] & 0xc0u) == 0x80u &&
+                   ((uint8_t)text[1] & 0xc0u) == 0x80u) {
+            uint8_t continuation1 = (uint8_t)text[0];
+            uint8_t continuation2 = (uint8_t)text[1];
+            text += 2;
+            cp = ((cp & 0x0fu) << 12) | ((continuation1 & 0x3fu) << 6) |
+                 (continuation2 & 0x3fu);
+        }
+        static const uint16_t polish_cp[18] = {
+            0x0104,0x0105,0x0106,0x0107,0x0118,0x0119,0x0141,0x0142,0x0143,
+            0x0144,0x00d3,0x00f3,0x015a,0x015b,0x0179,0x017a,0x017b,0x017c
+        };
+        const uint8_t *glyph = NULL;
+        for (int gi = 0; gi < 18; gi++) if (cp == polish_cp[gi]) { glyph = font8x16_polish[gi]; break; }
+        if (!glyph) glyph = font8x16[cp <= 255u ? cp : (uint32_t)'?'];
         if (cur_x + 8 > 0 && cur_x < DIMON64_LFB_WIDTH && y + 16 > 0 && y < DIMON64_LFB_HEIGHT) {
             for (int r = 0; r < 16; r++) {
                 int py = y + r;
                 if (py < 0 || py >= DIMON64_LFB_HEIGHT) continue;
-                uint8_t bits = font8x16[ch][r];
+                uint8_t bits = glyph[r];
                 for (int c = 0; c < 8; c++) {
                     int px = cur_x + c;
                     if (px < 0 || px >= DIMON64_LFB_WIDTH) continue;
+                    if (vm->draw_context_active &&
+                        (px < vm->draw_clip_x || py < vm->draw_clip_y ||
+                         px >= vm->draw_clip_x + vm->draw_clip_w ||
+                         py >= vm->draw_clip_y + vm->draw_clip_h)) continue;
                     if (bits & (0x80 >> c)) {
                         uint64_t addr = DIMON64_VRAM_BASE + (uint64_t)(py * DIMON64_LFB_WIDTH + px) * 4ULL;
                         if (addr + 4 <= vm->memsize) *(uint32_t *)(vm->mem + addr) = fg;
@@ -163,9 +210,65 @@ void vm_gui_draw_string(VM *vm, int x, int y, const char *text, uint32_t fg, uin
         }
         cur_x += 8;
         if (cur_x >= DIMON64_LFB_WIDTH) break;
-        text++;
     }
     vm->gui_dirty = 1;
+}
+
+static size_t utf8_sequence_length(const unsigned char *s) {
+    if (!s[0]) return 0;
+    if (s[0] < 0x80) return 1;
+    if ((s[0] & 0xe0) == 0xc0 && (s[1] & 0xc0) == 0x80) return 2;
+    if ((s[0] & 0xf0) == 0xe0 && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80) return 3;
+    if ((s[0] & 0xf8) == 0xf0 && (s[1] & 0xc0) == 0x80 &&
+        (s[2] & 0xc0) == 0x80 && (s[3] & 0xc0) == 0x80) return 4;
+    return 1;
+}
+
+static int utf8_text_width(const char *s) {
+    int glyphs = 0;
+    while (s && *s) { size_t n = utf8_sequence_length((const unsigned char *)s); s += n; glyphs++; }
+    return glyphs * 8;
+}
+
+static void vm_gui_draw_string_fit(VM *vm, int x, int y, const char *text,
+                                   uint32_t fg, uint32_t bg, int max_width) {
+    if (!text || max_width <= 0) return;
+    int max_glyphs = max_width / 8;
+    if (max_glyphs <= 0) return;
+    char fitted[256]; size_t used = 0;
+    if (utf8_text_width(text) <= max_width) {
+        while (text[used] && used + 1 < sizeof(fitted)) { fitted[used] = text[used]; used++; }
+    } else {
+        int keep = max_glyphs > 3 ? max_glyphs - 3 : max_glyphs;
+        const unsigned char *p = (const unsigned char *)text;
+        for (int glyph = 0; glyph < keep && *p; glyph++) {
+            size_t n = utf8_sequence_length(p);
+            if (used + n >= sizeof(fitted)) break;
+            memcpy(fitted + used, p, n); used += n; p += n;
+        }
+        if (max_glyphs > 3 && used + 3 < sizeof(fitted)) {
+            fitted[used++] = '.'; fitted[used++] = '.'; fitted[used++] = '.';
+        }
+    }
+    fitted[used] = 0;
+    int old_active = vm->draw_context_active;
+    int old_x = vm->draw_clip_x, old_y = vm->draw_clip_y;
+    int old_w = vm->draw_clip_w, old_h = vm->draw_clip_h;
+    int screen_x = x + (old_active ? vm->draw_offset_x : 0);
+    int screen_y = y + (old_active ? vm->draw_offset_y : 0);
+    int nx0 = screen_x, ny0 = screen_y, nx1 = screen_x + max_width, ny1 = screen_y + 16;
+    if (old_active) {
+        if (nx0 < old_x) nx0 = old_x;
+        if (ny0 < old_y) ny0 = old_y;
+        if (nx1 > old_x + old_w) nx1 = old_x + old_w;
+        if (ny1 > old_y + old_h) ny1 = old_y + old_h;
+    }
+    vm->draw_clip_x = nx0; vm->draw_clip_y = ny0;
+    vm->draw_clip_w = nx1 > nx0 ? nx1 - nx0 : 0;
+    vm->draw_clip_h = ny1 > ny0 ? ny1 - ny0 : 0; vm->draw_context_active = 1;
+    vm_gui_draw_string(vm, x, y, fitted, fg, bg);
+    vm->draw_context_active = (uint8_t)old_active;
+    vm->draw_clip_x = old_x; vm->draw_clip_y = old_y; vm->draw_clip_w = old_w; vm->draw_clip_h = old_h;
 }
 
 void vm_gui_draw_rect(VM *vm, int x, int y, int w, int h, uint8_t ch, uint8_t attr) {
@@ -208,7 +311,7 @@ void vm_init(VM *vm) {
     vm->cur_proc = 0;
     vm->next_pid = 1;
     for (int i = 0; i < DIMON64_MAX_PROCS; i++) {
-        vm->procs[i].used = 0;
+        memset(&vm->procs[i], 0, sizeof(vm->procs[i]));
         vm->procs[i].state = DIMON64_PROC_FREE;
     }
     vm->procs[0].used = 1;
@@ -307,12 +410,11 @@ int vm_disk_write(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count) {
 #ifndef BAREMETAL
     if (vm->disk_path[0]) {
         FILE *f = fopen(vm->disk_path, "r+b");
-        if (f) {
-            fseek(f, (long)(lba * DISK_SECTOR_SIZE), SEEK_SET);
-            size_t w = fwrite(vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE, 1, (size_t)bytes, f);
-            (void)w;
-            fclose(f);
-        }
+        if (!f) return DISK_ERR_IO;
+        if (fseek(f, (long)(lba * DISK_SECTOR_SIZE), SEEK_SET) != 0 ||
+            fwrite(vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE, 1, (size_t)bytes, f) != (size_t)bytes ||
+            fflush(f) != 0) { fclose(f); return DISK_ERR_IO; }
+        if (fclose(f) != 0) return DISK_ERR_IO;
     }
 #endif
     return DISK_ERR_NONE;
@@ -362,6 +464,7 @@ void vm_reset(VM *vm, uint64_t start_pc) {
     vm->eflags = 0;
     vm->event_head = 0;
     vm->event_tail = 0;
+    vm->event_owner_pid = 0;
     /* process 0 owns the boot context */
     for (int i = 0; i < DIMON64_MAX_PROCS; i++) {
         vm->procs[i].used = 0;
@@ -378,6 +481,9 @@ void vm_reset(VM *vm, uint64_t start_pc) {
     vm->procs[0].stack_base = DIMON64_STACK_BASE;
     vm->procs[0].stack_size = DIMON64_STACK_SIZE;
     vm->procs[0].sleep_until = 0;
+    vm->procs[0].memory_base = 0;
+    vm->procs[0].memory_size = DIMON64_MEM_SIZE;
+    vm->procs[0].essential = 1;
     snprintf(vm->procs[0].name, sizeof(vm->procs[0].name), "init");
     uint64_t top = DIMON64_STACK_BASE + DIMON64_STACK_SIZE;
     top &= ~15ULL;
@@ -427,8 +533,19 @@ int vm_mem_write(VM *vm, uint64_t addr, const void *in, size_t len) {
     return 0;
 }
 
+static int guest_range_ok(VM *vm, uint64_t addr, uint64_t len) {
+    if (!vm || addr + len < addr || addr + len > vm->memsize) return 0;
+    if (vm->cur_proc < 0 || vm->cur_proc >= DIMON64_MAX_PROCS) return 0;
+    Dimon64Proc *p = &vm->procs[vm->cur_proc];
+    if (!p->used || !p->isolated) return 1;
+    if (addr >= p->memory_base && addr + len <= p->memory_base + p->memory_size) return 1;
+    if (addr >= p->stack_base && addr + len <= p->stack_base + p->stack_size) return 1;
+    return 0;
+}
+
 /* ---------- low-level memory with MMIO ---------- */
 static int read_u8(VM *vm, uint64_t addr, uint8_t *out) {
+    if (!guest_range_ok(vm, addr, 1)) return -1;
     if (addr == DIMON64_MMIO_SERIAL_DATA) {
 #ifdef BAREMETAL
         *out = 0;
@@ -496,6 +613,7 @@ static int read_u8(VM *vm, uint64_t addr, uint8_t *out) {
 }
 
 static int write_u8(VM *vm, uint64_t addr, uint8_t v) {
+    if (!guest_range_ok(vm, addr, 1)) return -1;
     if (addr == DIMON64_MMIO_SERIAL_DATA) {
 #ifdef BAREMETAL
         baremetal_putchar((char)v);
@@ -595,6 +713,7 @@ static int mem_store(VM *vm, uint64_t addr, unsigned size, uint64_t v) {
 static int fetch32(VM *vm, uint64_t addr, uint32_t *out) {
     if ((addr % 4u) != 0) return -2;
     if (addr + 4 > vm->memsize) return -3;
+    if (!guest_range_ok(vm, addr, 4)) return -4;
     *out = (uint32_t)vm->mem[addr] |
            ((uint32_t)vm->mem[addr + 1] << 8) |
            ((uint32_t)vm->mem[addr + 2] << 16) |
@@ -688,7 +807,104 @@ static int proc_schedule(VM *vm) {
     vm->regs[0] = 0;
     vm->regs[4] = np->pid; /* tp points to current PID */
     vm->switches++;
+    np->context_switches++;
     return 1;
+}
+
+static int proc_find_pid(VM *vm, uint64_t pid) {
+    for (int i = 0; i < DIMON64_MAX_PROCS; i++)
+        if (vm->procs[i].used && vm->procs[i].pid == pid) return i;
+    return -1;
+}
+
+static void proc_release(VM *vm, int slot, int32_t fault) {
+    if (slot < 0 || slot >= DIMON64_MAX_PROCS) return;
+    Dimon64Proc *p = &vm->procs[slot];
+    if (vm->event_owner_pid == p->pid) vm->event_owner_pid = 0;
+    if (p->isolated && p->memory_size && p->memory_base + p->memory_size <= vm->memsize)
+        memset(vm->mem + p->memory_base, 0, (size_t)p->memory_size);
+    p->last_fault = fault; p->state = DIMON64_PROC_TERMINATED; p->used = 0;
+}
+
+static int proc_resume_any(VM *vm) {
+    for (int k = 0; k < DIMON64_MAX_PROCS; k++) {
+        int i = (vm->cur_proc + 1 + k) % DIMON64_MAX_PROCS;
+        Dimon64Proc *p = &vm->procs[i];
+        if (!p->used || (p->state != DIMON64_PROC_READY && p->state != DIMON64_PROC_RUNNING)) continue;
+        p->state = DIMON64_PROC_RUNNING; vm->cur_proc = i; vm->pc = p->pc; vm->flags = p->flags;
+        memcpy(vm->regs, p->regs, sizeof(vm->regs)); vm->regs[0] = 0; vm->regs[4] = p->pid;
+        vm->switches++; p->context_switches++; return 0;
+    }
+    vm->halted = 1; return -1;
+}
+
+static int guest_cstring(VM *vm, uint64_t addr, char *out, size_t cap) {
+    if (!out || cap < 2 || !guest_range_ok(vm, addr, 1)) return -1;
+    for (size_t i = 0; i < cap; i++) {
+        if (!guest_range_ok(vm, addr + i, 1)) return -1;
+        out[i] = (char)vm->mem[addr + i];
+        if (!out[i]) return 0;
+    }
+    out[cap - 1] = 0; return -1;
+}
+
+static void syscall_status(VM *vm, int rc) {
+    vm->regs[10] = (uint64_t)(int64_t)rc;
+    if (rc < 0) vm->flags |= DIMON64_FLAG_C; else vm->flags &= ~DIMON64_FLAG_C;
+}
+
+static int load_dexe(VM *vm, const char *path, const char *argument) {
+    Dimon64DirEnt st; int rc = dimonfs_stat(vm, path, &st); if (rc) return rc;
+    if (st.attributes & 0x10u) return DFS_ERR_IS_DIR;
+    if (st.size < sizeof(Dimon64ExecHeader) || st.size > 0x00800000u) return DFS_ERR_INVALID;
+    const uint64_t stage = 0x03000000u;
+    if (stage + st.size > vm->memsize) return DFS_ERR_TOO_LARGE;
+    uint32_t size = 0; rc = dimonfs_read(vm, path, 0, vm->mem + stage, st.size, &size);
+    if (rc < 0 || size != st.size || (uint32_t)rc != st.size) return rc < 0 ? rc : DFS_ERR_IO;
+    Dimon64ExecHeader h; memcpy(&h, vm->mem + stage, sizeof(h));
+    if (memcmp(h.magic, DIMON64_EXEC_MAGIC, 8) || h.version != DIMON64_EXEC_VERSION ||
+        h.header_size != sizeof(h) || h.image_size > DIMON64_APP_SLOT_SIZE ||
+        h.memory_size > DIMON64_APP_SLOT_SIZE || h.memory_size < h.image_size + h.bss_size ||
+        h.entry_offset >= h.image_size || (h.entry_offset & 3u) ||
+        (uint64_t)h.header_size + h.image_size + (uint64_t)h.relocation_count * 4u > size)
+        return DFS_ERR_INVALID;
+    int slot = -1;
+    for (int i = 1; i < DIMON64_MAX_PROCS; i++) if (!vm->procs[i].used) { slot = i; break; }
+    if (slot < 0) return -13;
+    uint64_t base = DIMON64_APP_BASE + (uint64_t)(slot - 1) * DIMON64_APP_SLOT_SIZE;
+    memset(vm->mem + base, 0, DIMON64_APP_SLOT_SIZE);
+    memcpy(vm->mem + base, vm->mem + stage + h.header_size, h.image_size);
+    const uint8_t *rel = vm->mem + stage + h.header_size + h.image_size;
+    for (uint32_t i = 0; i < h.relocation_count; i++) {
+        uint32_t off = load_le32(rel + (uint64_t)i * 4u);
+        if (off + 8u > h.image_size || (off & 3u)) { memset(vm->mem + base, 0, DIMON64_APP_SLOT_SIZE); return DFS_ERR_INVALID; }
+        uint32_t w1 = load_le32(vm->mem + base + off), w2 = load_le32(vm->mem + base + off + 4u);
+        if ((w1 & 0x7fu) != DIMON64_OPCODE_LUI || (w2 & 0x7fu) != DIMON64_OPCODE_OP_IMM ||
+            ((w2 >> 12) & 7u) != DIMON64_F3_ADDI || ((w1 >> 7) & 31u) != ((w2 >> 7) & 31u) ||
+            ((w1 >> 7) & 31u) != ((w2 >> 15) & 31u)) return DFS_ERR_INVALID;
+        int64_t old = (int64_t)(int32_t)(w1 & 0xfffff000u) +
+                      (int64_t)((int32_t)w2 >> 20);
+        int64_t value = old + (int64_t)base;
+        int32_t hi = (int32_t)(((value + 0x800) >> 12) & 0xfffff);
+        int32_t lo = (int32_t)(value - ((int64_t)hi << 12));
+        w1 = (w1 & 0xfffu) | ((uint32_t)hi << 12);
+        w2 = (w2 & 0x000fffffu) | ((uint32_t)(lo & 0xfff) << 20);
+        memcpy(vm->mem + base + off, &w1, 4); memcpy(vm->mem + base + off + 4u, &w2, 4);
+    }
+    Dimon64Proc *p = &vm->procs[slot]; memset(p, 0, sizeof(*p));
+    p->used = 1; p->state = DIMON64_PROC_READY; p->pid = vm->next_pid++;
+    p->pc = base + h.entry_offset; p->flags = DIMON64_FLAG_IE;
+    p->stack_base = DIMON64_STACK_BASE + (uint64_t)slot * DIMON64_STACK_SIZE;
+    p->stack_size = DIMON64_STACK_SIZE; p->regs[2] = (p->stack_base + p->stack_size) & ~15ULL;
+    p->regs[4] = p->pid; p->memory_base = base; p->memory_size = h.memory_size;
+    p->isolated = 1; snprintf(p->name, sizeof(p->name), "%s", h.name[0] ? h.name : st.name);
+    vm->event_owner_pid = p->pid;
+    if (argument && *argument) {
+        size_t n = strlen(argument); if (n > 255) n = 255;
+        uint64_t argp = base + h.memory_size - 256u; memcpy(vm->mem + argp, argument, n); vm->mem[argp + n] = 0;
+        p->regs[10] = argp;
+    }
+    return (int)p->pid;
 }
 
 static void proc_wake_sleepers(VM *vm) {
@@ -722,6 +938,10 @@ static void timer_tick(VM *vm) {
     if (proc_count_ready(vm) > 1) {
         (void)proc_schedule(vm);
     }
+    /* The desktop ISR lives in PID 0 memory. Isolated apps are already
+       preempted by the native scheduler and must never execute that vector. */
+    if (vm->cur_proc >= 0 && vm->cur_proc < DIMON64_MAX_PROCS &&
+        vm->procs[vm->cur_proc].isolated) return;
     if (vm->timer_vector != 0) {
         /* Hardware interrupt delivery: save trap registers and jump to ISR */
         if ((vm->timer_vector % 4u) != 0) return;
@@ -848,7 +1068,8 @@ static void do_syscall(VM *vm, uint64_t id) {
             break;
         case DIMON64_SYS_DISK_READ: {
             uint32_t lba = (uint32_t)a0;
-            int rc = vm_disk_read(vm, lba, a1, a2);
+            int rc = guest_range_ok(vm, a1, a2 * DISK_SECTOR_SIZE) ?
+                vm_disk_read(vm, lba, a1, a2) : DISK_ERR_RAM;
             vm->regs[10] = (uint64_t)rc;
             if (rc == DISK_ERR_NONE) vm->flags &= ~DIMON64_FLAG_C;
             else vm->flags |= DIMON64_FLAG_C;
@@ -877,7 +1098,8 @@ static void do_syscall(VM *vm, uint64_t id) {
         }
         case DIMON64_SYS_DISK_WRITE: {
             uint32_t lba = (uint32_t)a0;
-            int rc = vm_disk_write(vm, lba, a1, a2);
+            int rc = guest_range_ok(vm, a1, a2 * DISK_SECTOR_SIZE) ?
+                vm_disk_write(vm, lba, a1, a2) : DISK_ERR_RAM;
             vm->regs[10] = (uint64_t)rc;
             if (rc == DISK_ERR_NONE) vm->flags &= ~DIMON64_FLAG_C;
             else vm->flags |= DIMON64_FLAG_C;
@@ -885,6 +1107,8 @@ static void do_syscall(VM *vm, uint64_t id) {
         }
         case DIMON64_SYS_GUI_INIT: {
             vm->gui_active = 1;
+            vm->draw_context_active = 0;
+            vm->draw_offset_x = vm->draw_offset_y = 0;
             vm->regs[10] = DIMON64_VRAM_COLS;
             vm->regs[11] = DIMON64_VRAM_ROWS;
             vm->regs[12] = DIMON64_VRAM_BASE;
@@ -894,17 +1118,27 @@ static void do_syscall(VM *vm, uint64_t id) {
         }
         case DIMON64_SYS_GUI_POLL_EVENT: {
             if (vm->gui_poll_cb) vm->gui_poll_cb(vm->gui_userdata);
+            Dimon64Proc *caller = &vm->procs[vm->cur_proc];
+            if ((vm->event_owner_pid && caller->pid != vm->event_owner_pid) ||
+                (!vm->event_owner_pid && caller->isolated)) {
+                vm->regs[10] = vm->regs[11] = vm->regs[12] = vm->regs[13] = vm->regs[14] = 0;
+                break;
+            }
             uint8_t t = 0, b = 0; uint16_t c = 0, d = 0;
+            uint8_t modifiers = (vm->event_head != vm->event_tail) ?
+                vm->event_queue[vm->event_head].modifiers : 0;
             if (vm_event_pop_ext(vm, &t, &c, &d, &b)) {
                 vm->regs[10] = (uint64_t)t;
                 vm->regs[11] = (uint64_t)c;
                 vm->regs[12] = (uint64_t)d;
                 vm->regs[13] = (uint64_t)b;
+                vm->regs[14] = (uint64_t)modifiers;
             } else {
                 vm->regs[10] = 0;
                 vm->regs[11] = 0;
                 vm->regs[12] = 0;
                 vm->regs[13] = 0;
+                vm->regs[14] = 0;
             }
             break;
         }
@@ -995,15 +1229,26 @@ static void do_syscall(VM *vm, uint64_t id) {
             int w = (int)a2;
             int h = (int)a3;
             uint64_t src = a4;
-            if (w > 0 && h > 0 && dx >= 0 && dy >= 0 && dx + w <= DIMON64_LFB_WIDTH && dy + h <= DIMON64_LFB_HEIGHT) {
-                uint32_t *vram = (uint32_t *)(vm->mem + DIMON64_VRAM_BASE);
-                for (int y = 0; y < h; y++) {
-                    uint64_t srow = src + (uint64_t)y * (uint64_t)w * 4;
-                    if (srow + (uint64_t)w * 4 <= vm->memsize) {
-                        memcpy(&vram[(dy + y) * DIMON64_LFB_WIDTH + dx], vm->mem + srow, (size_t)w * 4);
-                    }
+            uint64_t bytes = (w > 0 && h > 0) ? (uint64_t)w * (uint64_t)h * 4u : 0;
+            if (w > 0 && h > 0 && guest_range_ok(vm, src, bytes)) {
+                if (vm->draw_context_active) { dx += vm->draw_offset_x; dy += vm->draw_offset_y; }
+                int x0 = dx < 0 ? 0 : dx, y0 = dy < 0 ? 0 : dy;
+                int x1 = dx + w, y1 = dy + h;
+                if (x1 > DIMON64_LFB_WIDTH) x1 = DIMON64_LFB_WIDTH;
+                if (y1 > DIMON64_LFB_HEIGHT) y1 = DIMON64_LFB_HEIGHT;
+                if (vm->draw_context_active) {
+                    if (x0 < vm->draw_clip_x) x0 = vm->draw_clip_x;
+                    if (y0 < vm->draw_clip_y) y0 = vm->draw_clip_y;
+                    if (x1 > vm->draw_clip_x + vm->draw_clip_w) x1 = vm->draw_clip_x + vm->draw_clip_w;
+                    if (y1 > vm->draw_clip_y + vm->draw_clip_h) y1 = vm->draw_clip_y + vm->draw_clip_h;
                 }
-                vm->gui_dirty = 1;
+                uint32_t *vram = (uint32_t *)(vm->mem + DIMON64_VRAM_BASE);
+                for (int sy = y0; sy < y1; sy++) {
+                    int source_y = sy - dy, source_x = x0 - dx;
+                    uint64_t srow = src + ((uint64_t)source_y * (uint64_t)w + (uint64_t)source_x) * 4u;
+                    if (x1 > x0) memcpy(&vram[sy * DIMON64_LFB_WIDTH + x0], vm->mem + srow, (size_t)(x1 - x0) * 4u);
+                }
+                if (x1 > x0 && y1 > y0) vm->gui_dirty = 1;
             }
             break;
         }
@@ -1011,7 +1256,7 @@ static void do_syscall(VM *vm, uint64_t id) {
             uint64_t dst = a0;
             uint32_t val = (uint32_t)a1;
             uint64_t cnt = a2;
-            if (dst + cnt * 4 <= vm->memsize) {
+            if (cnt <= UINT64_MAX / 4u && guest_range_ok(vm, dst, cnt * 4u)) {
                 uint32_t *p = (uint32_t *)(vm->mem + dst);
                 for (uint64_t i = 0; i < cnt; i++) p[i] = val;
             }
@@ -1029,6 +1274,7 @@ static void do_syscall(VM *vm, uint64_t id) {
         }
         case DIMON64_SYS_SPAWN: {
             uint64_t entry = a0, arg = a1, name_ptr = a2;
+            if (vm->procs[vm->cur_proc].isolated) { syscall_status(vm, -1); break; }
             int slot = -1;
             for (int i = 0; i < DIMON64_MAX_PROCS; i++) {
                 if (!vm->procs[i].used) { slot = i; break; }
@@ -1072,9 +1318,7 @@ static void do_syscall(VM *vm, uint64_t id) {
             break;
         }
         case DIMON64_SYS_EXIT: {
-            Dimon64Proc *cur = &vm->procs[vm->cur_proc];
-            cur->state = DIMON64_PROC_FREE;
-            cur->used = 0;
+            proc_release(vm, vm->cur_proc, 0);
             /* find next READY */
             int next = -1;
             for (int k = 0; k < DIMON64_MAX_PROCS; k++) {
@@ -1199,6 +1443,7 @@ static void do_syscall(VM *vm, uint64_t id) {
             break;
         }
         case DIMON64_SYS_SET_TIMER_HANDLER: {
+            if (vm->procs[vm->cur_proc].isolated) { syscall_status(vm, -1); break; }
             if (a0 != 0 && ((a0 % 4u) != 0 || a0 + 4 > vm->memsize)) {
                 vm->regs[10] = (uint64_t)(int64_t)-1;
             } else {
@@ -1208,6 +1453,7 @@ static void do_syscall(VM *vm, uint64_t id) {
             break;
         }
         case DIMON64_SYS_SET_TIMER_PERIOD: {
+            if (vm->procs[vm->cur_proc].isolated) { syscall_status(vm, -1); break; }
             uint64_t p = a0;
             if (p < 10) p = 10;
             if (p > 1000000) p = 1000000;
@@ -1230,6 +1476,101 @@ static void do_syscall(VM *vm, uint64_t id) {
             vm->regs[10] = vm->timer_ticks;
             break;
         }
+        case DIMON64_SYS_RTC_GET: {
+#ifdef BAREMETAL
+            vm->regs[10] = 0; vm->flags |= DIMON64_FLAG_C;
+#else
+            time_t now = time(NULL);
+            if (now == (time_t)-1) { vm->regs[10] = 0; vm->flags |= DIMON64_FLAG_C; }
+            else { vm->regs[10] = (uint64_t)now; vm->flags &= ~DIMON64_FLAG_C; }
+#endif
+            break;
+        }
+        case DIMON64_SYS_GUI_SET_CONTEXT: {
+            if ((int64_t)a4 <= 0 || (int64_t)a5 <= 0) {
+                vm->draw_context_active = 0; vm->draw_offset_x = vm->draw_offset_y = 0;
+            } else {
+                int x = (int)a2, y = (int)a3, w = (int)a4, h = (int)a5;
+                if (x < 0) { w += x; x = 0; }
+                if (y < 0) { h += y; y = 0; }
+                if (x + w > DIMON64_LFB_WIDTH) w = DIMON64_LFB_WIDTH - x;
+                if (y + h > DIMON64_LFB_HEIGHT) h = DIMON64_LFB_HEIGHT - y;
+                vm->draw_offset_x = (int32_t)a0; vm->draw_offset_y = (int32_t)a1;
+                vm->draw_clip_x = x; vm->draw_clip_y = y;
+                vm->draw_clip_w = w > 0 ? w : 0; vm->draw_clip_h = h > 0 ? h : 0;
+                vm->draw_context_active = 1;
+            }
+            vm->regs[10] = 0; break;
+        }
+        case DIMON64_SYS_GUI_TEXT_MEASURE:
+        case DIMON64_SYS_GUI_TEXT_FIT: {
+            uint64_t addr = id == DIMON64_SYS_GUI_TEXT_MEASURE ? a0 : a2;
+            char s[256] = {0}; int i = 0;
+            while (i < 255) { uint8_t c = 0; if (read_u8(vm, addr + (uint64_t)i, &c)) break; s[i++] = (char)c; if (!c) break; }
+            s[255] = 0; if (i == 255) s[254] = 0;
+            if (id == DIMON64_SYS_GUI_TEXT_MEASURE) vm->regs[10] = (uint64_t)utf8_text_width(s);
+            else vm_gui_draw_string_fit(vm, (int)a0, (int)a1, s, (uint32_t)a3, (uint32_t)a4, (int)a5);
+            break;
+        }
+        case DIMON64_SYS_PROC_INFO: {
+            if (a0 >= DIMON64_MAX_PROCS || !guest_range_ok(vm, a1, sizeof(Dimon64ProcInfo))) {
+                syscall_status(vm, -1); break;
+            }
+            Dimon64Proc *p = &vm->procs[a0];
+            if (!p->used) { syscall_status(vm, DFS_ERR_NOT_FOUND); break; }
+            Dimon64ProcInfo info; memset(&info, 0, sizeof(info));
+            info.pid = p->pid; info.state = p->state; info.memory_base = p->memory_base;
+            info.memory_size = p->memory_size + p->stack_size; info.cpu_steps = p->cpu_steps;
+            info.context_switches = p->context_switches; memcpy(info.name, p->name, sizeof(info.name));
+            info.essential = p->essential; info.isolated = p->isolated;
+            memcpy(vm->mem + a1, &info, sizeof(info)); syscall_status(vm, 0); break;
+        }
+        case DIMON64_SYS_PROC_KILL: {
+            int slot = proc_find_pid(vm, a0);
+            if (slot < 0) { syscall_status(vm, DFS_ERR_NOT_FOUND); break; }
+            if (vm->procs[slot].essential || vm->procs[slot].pid == 0) { syscall_status(vm, -14); break; }
+            int current = slot == vm->cur_proc; proc_release(vm, slot, 0);
+            if (current) (void)proc_resume_any(vm); else syscall_status(vm, 0);
+            break;
+        }
+        case DIMON64_SYS_FS_STAT:
+        case DIMON64_SYS_FS_LIST:
+        case DIMON64_SYS_FS_READ:
+        case DIMON64_SYS_FS_WRITE:
+        case DIMON64_SYS_FS_MKDIR:
+        case DIMON64_SYS_FS_REMOVE:
+        case DIMON64_SYS_FS_RENAME:
+        case DIMON64_SYS_FS_COPY:
+        case DIMON64_SYS_APP_EXEC: {
+            char path[260], path2[260];
+            if (guest_cstring(vm, a0, path, sizeof(path))) { syscall_status(vm, DFS_ERR_INVALID); break; }
+            int rc = DFS_ERR_INVALID;
+            if (id == DIMON64_SYS_FS_STAT) {
+                if (!guest_range_ok(vm, a1, sizeof(Dimon64DirEnt))) { syscall_status(vm, DFS_ERR_INVALID); break; }
+                Dimon64DirEnt ent; rc = dimonfs_stat(vm, path, &ent);
+                if (!rc) memcpy(vm->mem + a1, &ent, sizeof(ent));
+            } else if (id == DIMON64_SYS_FS_LIST) {
+                if (!guest_range_ok(vm, a2, sizeof(Dimon64DirEnt))) { syscall_status(vm, DFS_ERR_INVALID); break; }
+                Dimon64DirEnt ent; rc = dimonfs_list(vm, path, (uint32_t)a1, &ent);
+                if (!rc) memcpy(vm->mem + a2, &ent, sizeof(ent));
+            } else if (id == DIMON64_SYS_FS_READ) {
+                if (a3 > UINT32_MAX || !guest_range_ok(vm, a2, a3)) { syscall_status(vm, DFS_ERR_INVALID); break; }
+                uint32_t size = 0; rc = dimonfs_read(vm, path, (uint32_t)a1, vm->mem + a2, (uint32_t)a3, &size);
+                vm->regs[11] = size;
+            } else if (id == DIMON64_SYS_FS_WRITE) {
+                if (a2 > UINT32_MAX || !guest_range_ok(vm, a1, a2)) { syscall_status(vm, DFS_ERR_INVALID); break; }
+                rc = dimonfs_write(vm, path, vm->mem + a1, (uint32_t)a2, (a3 & 1u) != 0, (a3 & 2u) != 0);
+            } else if (id == DIMON64_SYS_FS_MKDIR) rc = dimonfs_mkdir(vm, path);
+            else if (id == DIMON64_SYS_FS_REMOVE) rc = dimonfs_remove(vm, path);
+            else {
+                if (id == DIMON64_SYS_APP_EXEC && a1 == 0) path2[0] = 0;
+                else if (guest_cstring(vm, a1, path2, sizeof(path2))) { syscall_status(vm, DFS_ERR_INVALID); break; }
+                if (id == DIMON64_SYS_FS_RENAME) rc = dimonfs_rename(vm, path, path2);
+                else if (id == DIMON64_SYS_FS_COPY) rc = dimonfs_copy(vm, path, path2);
+                else rc = load_dexe(vm, path, path2);
+            }
+            syscall_status(vm, rc); break;
+        }
         default:
             break;
     }
@@ -1244,6 +1585,20 @@ static int64_t sign_extend(uint64_t v, unsigned bits) {
     return (int64_t)v;
 }
 
+static int handle_process_fault(VM *vm, int error) {
+    if (vm->cur_proc < 0 || vm->cur_proc >= DIMON64_MAX_PROCS ||
+        !vm->procs[vm->cur_proc].used || !vm->procs[vm->cur_proc].isolated)
+        return error;
+    int slot = vm->cur_proc;
+#ifndef BAREMETAL
+    fprintf(stderr, "Dimon64: process %s (pid=%" PRIu64 ") fault %d at 0x%" PRIX64 "\n",
+            vm->procs[slot].name, vm->procs[slot].pid, error, vm->pc);
+#endif
+    proc_release(vm, slot, error);
+    (void)proc_resume_any(vm);
+    return vm->halted ? error : 0;
+}
+
 /* ---------- step ---------- */
 int vm_step(VM *vm) {
     if (!vm || !vm->mem) return -1;
@@ -1252,7 +1607,7 @@ int vm_step(VM *vm) {
 
     uint32_t w = 0;
     int frc = fetch32(vm, vm->pc, &w);
-    if (frc != 0) return frc;
+    if (frc != 0) return handle_process_fault(vm, frc);
 
     uint8_t opcode = (uint8_t)(w & 0x7Fu);
     uint8_t rd = (uint8_t)((w >> 7) & 0x1Fu);
@@ -1571,7 +1926,10 @@ int vm_step(VM *vm) {
                 /* proc mirror already handled inside syscalls */
             } else if (imm == DIMON64_SYS_EBREAK) {
                 vm->pc = next_pc;
-                vm->halted = 1;
+                if (vm->procs[vm->cur_proc].isolated) {
+                    int slot = vm->cur_proc; proc_release(vm, slot, 0); (void)proc_resume_any(vm);
+                    vm->steps++; vm->regs[0] = 0; return vm->halted ? 1 : 0;
+                } else vm->halted = 1;
                 vm->steps++;
                 vm->regs[0] = 0;
                 return 1;
@@ -1601,9 +1959,11 @@ int vm_step(VM *vm) {
             break;
     }
 
-    if (err != 0) return err;
+    if (err != 0) return handle_process_fault(vm, err);
     vm->regs[0] = 0;
     vm->steps++;
+    if (vm->cur_proc >= 0 && vm->cur_proc < DIMON64_MAX_PROCS && vm->procs[vm->cur_proc].used)
+        vm->procs[vm->cur_proc].cpu_steps++;
     vm->cycle_counter++;
 
     /* timer */

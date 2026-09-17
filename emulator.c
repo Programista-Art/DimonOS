@@ -13,6 +13,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <locale.h>
 
 #include "dimon64.h"
 #include <inttypes.h>
@@ -42,10 +43,96 @@ static const char *cursor_arrow[19] = {
 };
 
 static const char *g_dump_vram_path = NULL;
+static const char *g_dump_state_path = NULL;
+static const char *g_input_log_path = NULL;
+static FILE *g_input_log = NULL;
+static int g_stop_when_idle = 0;
+static int g_idle_completed = 0;
 static const char *g_inject_keys = NULL;
 static int g_click_x[64];
 static int g_click_y[64];
 static int g_click_count = 0;
+
+typedef struct {
+    uint8_t type;
+    uint8_t button;
+    uint8_t modifiers;
+    uint16_t code;
+    uint16_t data;
+} InjectEvent;
+
+static InjectEvent g_inject_events[128];
+static int g_inject_event_count = 0;
+
+static void input_log(const char *backend, const char *action,
+                      int x, int y, unsigned button) {
+    if (!g_input_log) return;
+    fprintf(g_input_log, "%s %s x=%d y=%d button=%u\n",
+            backend, action, x, y, button);
+    fflush(g_input_log);
+}
+
+/* Ordered input used by behavioral tests. Tokens are separated by ';':
+ *   k:CODE[,MODS]  p:X,Y[,BUTTON]  m:X,Y[,BUTTON]  r:X,Y[,BUTTON]
+ * All events enter the normal VM queue and desktop dispatch path. */
+static int parse_inject_events(const char *spec) {
+    while (spec && *spec) {
+        while (*spec == ' ' || *spec == ';') spec++;
+        if (!*spec) break;
+        if (g_inject_event_count >= (int)(sizeof(g_inject_events) / sizeof(g_inject_events[0])))
+            return -1;
+
+        char kind = *spec++;
+        if (*spec++ != ':') return -1;
+
+        InjectEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        char *end = NULL;
+        unsigned long first = strtoul(spec, &end, 0);
+        if (end == spec) return -1;
+        spec = end;
+
+        if (kind == 'k') {
+            if (first > UINT16_MAX) return -1;
+            ev.type = EVT_KEY;
+            ev.code = (uint16_t)first;
+            if (*spec == ',') {
+                unsigned long mods = strtoul(spec + 1, &end, 0);
+                if (end == spec + 1 || mods > UINT8_MAX) return -1;
+                ev.modifiers = (uint8_t)mods;
+                spec = end;
+            }
+        } else if (kind == 'p' || kind == 'm' || kind == 'r') {
+            if (first >= DIMON64_LFB_WIDTH || *spec != ',') return -1;
+            unsigned long second = strtoul(spec + 1, &end, 0);
+            if (end == spec + 1 || second >= DIMON64_LFB_HEIGHT) return -1;
+            spec = end;
+            ev.type = kind == 'p' ? EVT_MOUSE_CLICK :
+                      kind == 'm' ? EVT_MOUSE_MOVE : EVT_MOUSE_RELEASE;
+            ev.code = (uint16_t)first;
+            ev.data = (uint16_t)second;
+            ev.button = 1;
+            if (*spec == ',') {
+                unsigned long button = strtoul(spec + 1, &end, 0);
+                if (end == spec + 1 || button > UINT8_MAX) return -1;
+                ev.button = (uint8_t)button;
+                spec = end;
+            }
+        } else {
+            return -1;
+        }
+        if (*spec && *spec != ';') return -1;
+        g_inject_events[g_inject_event_count++] = ev;
+    }
+    return 0;
+}
+
+static void inject_events(VM *vm) {
+    for (int i = 0; i < g_inject_event_count; i++) {
+        const InjectEvent *ev = &g_inject_events[i];
+        vm_event_push_mod(vm, ev->type, ev->code, ev->data, ev->button, ev->modifiers);
+    }
+}
 
 /* Push scripted key events (automated GUI tests).
  * Plain chars map to keycodes; backslash escapes: \n=Enter, \e=ESC,
@@ -422,7 +509,10 @@ static void tui_poll_events(VM *vm) {
                             int lfb_x = cx * DIMON64_LFB_WIDTH / term_cols;
                             int lfb_y = cy * DIMON64_LFB_HEIGHT / term_rows;
                             if (lfb_x >= 0 && lfb_x < DIMON64_LFB_WIDTH && lfb_y >= 0 && lfb_y < DIMON64_LFB_HEIGHT) {
-                                if (type_ch == 'M') {
+                                if (type_ch == 'm') {
+                                    vm_event_push_ext(vm, EVT_MOUSE_RELEASE, (uint16_t)lfb_x, (uint16_t)lfb_y,
+                                                      btn == 2 ? 2 : 1);
+                                } else if (type_ch == 'M') {
                                     if (btn == 0) {
                                         vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)lfb_x, (uint16_t)lfb_y, 1);
                                     } else if (btn == 2) {
@@ -661,10 +751,16 @@ static void x11_poll_events(VM *vm) {
                 s_last_motion_y = cy;
                 s_last_motion_btn = btn;
                 s_last_motion_time = now;
+                input_log("x11", "press", cx, cy, btn);
                 vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy, btn);
             }
         } else if (ev.type == ButtonRelease) {
             s_last_motion_btn = 0;
+            int cx = ev.xbutton.x / g_app.scale, cy = ev.xbutton.y / g_app.scale;
+            uint8_t btn = (ev.xbutton.button == Button3) ? 2 : 1;
+            input_log("x11", "release", cx, cy, btn);
+            if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT)
+                vm_event_push_ext(vm, EVT_MOUSE_RELEASE, (uint16_t)cx, (uint16_t)cy, btn);
         } else if (ev.type == MotionNotify) {
             int cx = ev.xmotion.x / g_app.scale;
             int cy = ev.xmotion.y / g_app.scale;
@@ -693,6 +789,7 @@ static void x11_poll_events(VM *vm) {
                 s_last_motion_y = cy;
                 s_last_motion_btn = btn;
                 s_last_motion_time = now;
+                input_log("x11", "move", cx, cy, btn);
                 vm_event_push_ext(vm, EVT_MOUSE_MOVE, (uint16_t)cx, (uint16_t)cy, btn);
             }
         } else if (ev.type == KeyPress) {
@@ -700,6 +797,11 @@ static void x11_poll_events(VM *vm) {
             char str[32];
             int n = XLookupString(&ev.xkey, str, sizeof(str) - 1, &ks, NULL);
             uint16_t code = 0;
+            uint8_t modifiers = 0;
+            if (ev.xkey.state & ShiftMask) modifiers |= KEYMOD_SHIFT;
+            if (ev.xkey.state & ControlMask) modifiers |= KEYMOD_CTRL;
+            if (ev.xkey.state & Mod1Mask) modifiers |= KEYMOD_ALT;
+            if (ev.xkey.state & Mod4Mask) modifiers |= KEYMOD_META;
             switch (ks) {
                 case XK_Up:        code = KEY_UP; break;
                 case XK_Down:      code = KEY_DOWN; break;
@@ -715,19 +817,27 @@ static void x11_poll_events(VM *vm) {
                 case XK_F8:        code = KEY_F8; break;
                 case XK_F9:        code = KEY_F9; break;
                 case XK_F10:       code = KEY_F10; break;
+                case XK_Home:      code = KEY_HOME; break;
+                case XK_End:       code = KEY_END; break;
+                case XK_Delete:    code = KEY_DELETE; break;
+                case XK_Page_Up:   code = KEY_PGUP; break;
+                case XK_Page_Down: code = KEY_PGDN; break;
                 case XK_Return:
                 case XK_KP_Enter:  code = 13; break;
                 case XK_BackSpace: code = 8; break;
                 case XK_Tab:       code = 9; break;
                 case XK_Escape:    code = 27; break;
                 default:
-                    if (n == 1) {
-                        code = (uint8_t)str[0];
-                    }
+                    if (n == 1) code = (uint8_t)str[0];
                     break;
             }
             if (code > 0) {
-                vm_event_push(vm, EVT_KEY, code, 0);
+                vm_event_push_mod(vm, EVT_KEY, code, 0, 0, modifiers);
+            } else if (n > 0) {
+                /* XLookupString returns bytes in the active locale. Deliver a
+                   UTF-8 sequence byte-for-byte; editors retain valid UTF-8. */
+                for (int i = 0; i < n; i++)
+                    vm_event_push_mod(vm, EVT_KEY, (uint8_t)str[i], 0, 0, modifiers);
             }
         } else if (ev.type == Expose) {
             x11_flush_screen(g_app.vm);
@@ -801,6 +911,13 @@ static void on_gui_flush(void *userdata) {
     } else if (app->mode == 3) {
         (void)0; /* headless: VRAM stays in memory, no display output */
     }
+    if (g_stop_when_idle && g_inject_event_count > 0 &&
+        app->vm->event_head == app->vm->event_tail) {
+        /* Stop immediately after this complete frame, never halfway through
+           composition. vm_step will hit -100 at the next instruction. */
+        g_idle_completed = 1;
+        app->vm->max_steps = app->vm->steps + 1;
+    }
 }
 
 /* --- Debugger and hexdump --- */
@@ -813,9 +930,13 @@ static void usage(const char *p) {
         "  -g, --gui             Force X11 graphical window (also: 'gui' positional)\n"
         "  -tui, --tui           Force ANSI terminal console mode (TUI) (also: 'tui' positional)\n"
         "  -H, --headless        Memory-only GUI (no display output, for automated tests)\n"
-        "  --dump-vram FILE      Write 80x25 VRAM bytes (4000 B) to FILE on exit\n"
+        "  --dump-vram FILE      Write 800x600x4 ARGB VRAM to FILE on exit\n"
+        "  --dump-state FILE     Write bounded-run VM/event state as JSON\n"
+        "  --input-log FILE      Log bounded backend input conversion diagnostics\n"
+        "  --stop-when-idle      Stop after injected input drains and a frame flushes\n"
         "  --inject-keys SPEC    Push scripted key events at startup (tests)\n"
         "  --inject-click X,Y[;...] Push scripted mouse clicks (tests)\n"
+        "  --inject-events SPEC  Ordered k:/p:/m:/r: events through normal input\n"
         "  --scale N             X11 window scale factor (1 or 2, default auto-fit)\n"
         "  -s ADDR               Start execution address (default 0, e.g. 0x100)\n"
         "  -l ADDR               Load address (default 0)\n"
@@ -949,6 +1070,7 @@ static void debugger(VM *vm) {
 }
 
 int main(int argc, char **argv) {
+    (void)setlocale(LC_CTYPE, "");
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *path = NULL;
     const char *iso_path = NULL;
@@ -969,7 +1091,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-tui") || !strcmp(argv[i], "--tui")) g_app.req_mode = 2;
         else if (!strcmp(argv[i], "-H") || !strcmp(argv[i], "--headless")) g_app.req_mode = 3;
         else if (!strcmp(argv[i], "--dump-vram") && i + 1 < argc) g_dump_vram_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-state") && i + 1 < argc) g_dump_state_path = argv[++i];
+        else if (!strcmp(argv[i], "--input-log") && i + 1 < argc) g_input_log_path = argv[++i];
+        else if (!strcmp(argv[i], "--stop-when-idle")) g_stop_when_idle = 1;
         else if (!strcmp(argv[i], "--inject-keys") && i + 1 < argc) g_inject_keys = argv[++i];
+        else if (!strcmp(argv[i], "--inject-events") && i + 1 < argc) {
+            if (parse_inject_events(argv[++i]) != 0) {
+                fprintf(stderr, "Invalid --inject-events specification\n");
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--inject-click") && i + 1 < argc) {
             const char *spec = argv[++i];
             int x = 0, y = 0;
@@ -1049,9 +1180,18 @@ int main(int argc, char **argv) {
     }
     vm_reset(&vm, start);
     vm.max_steps = maxsteps;
+    if (g_input_log_path) {
+        g_input_log = fopen(g_input_log_path, "w");
+        if (!g_input_log) {
+            perror("fopen --input-log");
+            vm_free(&vm);
+            return 1;
+        }
+    }
     if (g_inject_keys) inject_keys(&vm, g_inject_keys);
     for (int ci = 0; ci < g_click_count; ci++)
         vm_event_push(&vm, EVT_MOUSE_CLICK, (uint16_t)g_click_x[ci], (uint16_t)g_click_y[ci]);
+    inject_events(&vm);
 
     if (debug) {
         debugger(&vm);
@@ -1098,7 +1238,28 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (g_dump_state_path) {
+        FILE *sf = fopen(g_dump_state_path, "w");
+        if (!sf) {
+            perror("fopen --dump-state");
+        } else {
+            int pending = vm.event_tail - vm.event_head;
+            if (pending < 0) pending += VM_EVENT_QUEUE_SIZE;
+            fprintf(sf,
+                    "{\"halted\":%u,\"steps\":%llu,\"pc\":%llu,"
+                    "\"pending_events\":%d,\"run_result\":%d,"
+                    "\"idle_completed\":%d}\n",
+                    (unsigned)vm.halted, (unsigned long long)vm.steps,
+                    (unsigned long long)vm.pc, pending, rc, g_idle_completed);
+            fclose(sf);
+        }
+    }
+
     if (dumpregs) vm_dump_regs(&vm, stderr);
+    if (g_input_log) {
+        fclose(g_input_log);
+        g_input_log = NULL;
+    }
     vm_free(&vm);
     return 0;
 }

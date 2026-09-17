@@ -471,13 +471,20 @@ void irq0_c_handler(void) {
 /* --- PS/2 Keyboard Driver (Set 1 Scancodes) --- */
 #define KBD_QUEUE_SIZE 128
 static uint16_t g_kbd_queue[KBD_QUEUE_SIZE];
+static uint8_t g_kbd_mod_queue[KBD_QUEUE_SIZE];
 static volatile int g_kbd_head = 0;
 static volatile int g_kbd_tail = 0;
+
+static int g_shift_down = 0;
+static int g_ctrl_down = 0;
+static int g_alt_down = 0;
 
 static void kbd_push(uint16_t key) {
     int next = (g_kbd_tail + 1) % KBD_QUEUE_SIZE;
     if (next != g_kbd_head) {
         g_kbd_queue[g_kbd_tail] = key;
+        g_kbd_mod_queue[g_kbd_tail] = (g_shift_down ? KEYMOD_SHIFT : 0) |
+            (g_ctrl_down ? KEYMOD_CTRL : 0) | (g_alt_down ? KEYMOD_ALT : 0);
         g_kbd_tail = next;
     }
 }
@@ -504,7 +511,6 @@ static const uint8_t kbd_map_shift[128] = {
     0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
 };
 
-static int g_shift_down = 0;
 static int g_extended_prefix = 0;
 
 void irq1_c_handler(void) {
@@ -518,11 +524,18 @@ void irq1_c_handler(void) {
 
     if (g_extended_prefix) {
         g_extended_prefix = 0;
-        if ((sc & 0x80) == 0) {
+        if ((sc & 0x7f) == 0x38) g_alt_down = (sc & 0x80) == 0;
+        else if ((sc & 0x7f) == 0x1d) g_ctrl_down = (sc & 0x80) == 0;
+        else if ((sc & 0x80) == 0) {
             if (sc == 0x48)      kbd_push(KEY_UP);
             else if (sc == 0x50) kbd_push(KEY_DOWN);
             else if (sc == 0x4B) kbd_push(KEY_LEFT);
             else if (sc == 0x4D) kbd_push(KEY_RIGHT);
+            else if (sc == 0x47) kbd_push(KEY_HOME);
+            else if (sc == 0x4F) kbd_push(KEY_END);
+            else if (sc == 0x53) kbd_push(KEY_DELETE);
+            else if (sc == 0x49) kbd_push(KEY_PGUP);
+            else if (sc == 0x51) kbd_push(KEY_PGDN);
             else if (sc == 0x1C) kbd_push(13);  /* Keypad Enter */
             else if (sc == 0x35) kbd_push('/'); /* Keypad Slash */
         }
@@ -534,6 +547,10 @@ void irq1_c_handler(void) {
         g_shift_down = 1;
     } else if (sc == 0xAA || sc == 0xB6) {
         g_shift_down = 0;
+    } else if ((sc & 0x7f) == 0x1D) {
+        g_ctrl_down = (sc & 0x80) == 0;
+    } else if ((sc & 0x7f) == 0x38) {
+        g_alt_down = (sc & 0x80) == 0;
     } else if ((sc & 0x80) == 0) {
         /* Key press */
         if (sc >= 0x3B && sc <= 0x44) {
@@ -679,6 +696,10 @@ void irq12_c_handler(void) {
                 } else if (right_down && !(g_mouse_last_btn & 0x02)) {
                     mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
                 }
+                if (!left_down && (g_mouse_last_btn & 0x01))
+                    mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 1);
+                if (!right_down && (g_mouse_last_btn & 0x02))
+                    mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
                 g_mouse_last_btn = cur_btn;
             }
             break;
@@ -800,8 +821,9 @@ static void on_baremetal_gui_poll(void *userdata) {
     /* Transfer keyboard events */
     while (g_kbd_head != g_kbd_tail) {
         uint16_t key = g_kbd_queue[g_kbd_head];
+        uint8_t modifiers = g_kbd_mod_queue[g_kbd_head];
         g_kbd_head = (g_kbd_head + 1) % KBD_QUEUE_SIZE;
-        vm_event_push(vm, EVT_KEY, key, 0);
+        vm_event_push_mod(vm, EVT_KEY, key, 0, 0, modifiers);
     }
 
     /* Host timer tick at 20 Hz (every 50 ms) */
@@ -897,9 +919,21 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     on_baremetal_gui_flush(&vm);
 
     serial_puts("[DimonOS] Starting DimonOS-64 TrueColor Desktop GUI execution loop...\n");
-    vm_run(&vm);
+    int vm_rc = vm_run(&vm);
 
-    serial_puts("[DimonOS] VM execution halted.\n");
+    if (vm_rc == 1) {
+        /* The guest has already drawn and flushed its terminal shutdown frame.
+           QEMU's PIIX4 ACPI PM control register accepts S5 at 0x604. If this
+           backend does not implement it, execution falls through to the
+           explicit halted state below. */
+        on_baremetal_gui_flush(&vm);
+        serial_puts("[DimonOS] Shutdown requested; final frame flushed.\n");
+        serial_puts("[DimonOS] Requesting QEMU ACPI power-off.\n");
+        outw(0x604, 0x2000);
+        serial_puts("[DimonOS] System halted. You may close QEMU.\n");
+    } else {
+        serial_printf("[DimonOS] VM stopped unexpectedly (rc=%d); halting.\n", vm_rc);
+    }
     for (;;) {
         cli();
         hlt();

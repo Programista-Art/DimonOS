@@ -15,7 +15,8 @@ An educational 64-bit RISC computer system and preemptive multitasking OS:
 - **Emulator (`dimon-emu`)**: Headless, ANSI TUI and X11 backends with
   64-bit debugger and disassembler.
 - **DimonOS-64 (`os.bin`)**: Multitasking kernel with timer ISR, round-robin
-  scheduler, background counter / clock / monitor tasks and shell main task.
+  scheduler, and a retained seven-app desktop with overlapping movable windows,
+  focus/Z-order, minimize/restore, taskbar switching and clipped composition.
 - **Examples**: `hello`, `math`, `fib`, `multitask` (timer-preempted tasks
   printing to distinct screen areas).
 
@@ -122,6 +123,9 @@ legacy `DB/DW/DS` aliases, `.include`, `.equ`
 | 24 | GET_TIMER_TICKS | returns `TIMERTICKS` |
 | 25 | GUI_DRAW_PIXEL | `(x, y, col32)` fast clipped pixel write |
 | 26 | GUI_DRAW_LINE | `(x0, y0, x1, y1, col32)` Bresenham line rasterizer |
+| 41 | GUI_SET_CONTEXT | translated/clipped drawing context; zero size resets |
+| 42 | GUI_TEXT_MEASURE | decoded UTF-8 glyph width in framebuffer pixels |
+| 43 | GUI_TEXT_FIT | padded-region text clipping and glyph-safe ellipsis |
 
 ---
 
@@ -147,8 +151,11 @@ legacy `DB/DW/DS` aliases, `.include`, `.equ`
 ## Build & Run
 
 ```bash
-make clean && make all && make test
-./dimon-emu os.bin              # X11 desktop (or TUI without DISPLAY)
+make all os.bin apps            # compile/assemble; does not run the VM
+make disk-new                   # explicit new FAT16 image (refuses overwrite)
+make regression                 # hosted/headless, X11, isolated QEMU checks
+./dimon-emu --disk dimon.iso --disk-writable os.bin
+                                # X11 desktop (or TUI without DISPLAY)
 ./dimon-emu os.bin tui          # ANSI terminal desktop
 ./dimon-emu examples/multitask.bin
 ./dimon-emu -d os.bin           # interactive 64-bit debugger
@@ -156,6 +163,20 @@ make clean && make all && make test
 ```
 
 Build flags: `-Wall -Wextra -O2 -std=c11`, warning-free.
+
+`make disk-new` packages `apps/snake.app` as `SNAKE.APP`. Existing disk images
+are never replaced implicitly. To intentionally recreate one, remove/move it
+yourself or call `./dimon-mkiso --force -o dimon.iso ...`. In the desktop
+Terminal, `run SNAKE.APP` loads it through the DEXE64 process loader.
+Install into an existing image without reformatting it with
+`make disk-install-apps`; an existing same-name app is preserved. To replace
+that one entry explicitly, use
+`./dimon-mkiso --add dimon.iso apps/snake.app:SNAKE.APP --force`.
+
+The historical `make test` target performs broad headless checks. Its FAT16
+fixture now lives at `build/regression/legacy-test-disk.img`; it never formats
+or writes `dimon.iso`. Focused multi-window results, diagnostics and QEMU PPM
+screenshots are written below `build/regression/`.
 
 ---
 
@@ -165,6 +186,8 @@ Build flags: `-Wall -Wextra -O2 -std=c11`, warning-free.
 - `docs/02_abi_syscalls.md` — register ABI and syscall reference.
 - `docs/03_multitasking.md` — timer, IVT, PCB, scheduler guide.
 - `docs/04_user_manual.md` — build, emulator flags, debugging.
+- `docs/05_executable_format.md` — DEXE64 loader, relocation and isolation ABI.
+- `docs/06_roadmap_status.md` — exact integrated/remaining roadmap scope.
 
 ---
 
@@ -174,3 +197,8 @@ Build flags: `-Wall -Wextra -O2 -std=c11`, warning-free.
 `multitask` plus headless GUI checks: desktop composition, Start menu,
 all 7 apps, calculator math, notepad/terminal input and multitasking
 (`ticks`/`switches` counters, clean halts where applicable).
+
+`make regression-hosted`, `make regression-x11`, and `make regression-qemu`
+exercise ordered press/move/release input, retained multi-window state,
+minimize/restore, app Close and system shutdown. The QEMU target launches the
+fresh `build/regression/dimon-regression.iso`, not an older top-level image.

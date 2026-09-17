@@ -4,6 +4,17 @@ This document chronologically tracks all changes for DimonVirtualCPU-64 and Dimo
 
 ---
 
+## [2026-09-17] - Multi-window regression repair
+
+- Fixed the minimize return-address loop that left the desktop unable to
+  dispatch later input, and bounded/validated related focus and Z-order scans.
+- Added ordered hosted input, real X11, and automated QEMU regression coverage
+  for minimize/restore, Close, dragging/release, retained state and shutdown.
+- Added an explicit shutdown frame and QEMU ACPI power-off with a defined halt
+  fallback; isolated all test disk/ISO artifacts from `dimon.iso`.
+
+---
+
 ## [2026-09-13] - DimonOS-64 Interactive Desktop GUI (64-bit RISC-V)
 
 - `os.asm`: full interactive desktop (blue `░` background, top bar,

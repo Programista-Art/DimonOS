@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "dimon64.h"
+#include "dimonfs.h"
 
 #define FAT16_RESERVED_SECTORS 4
 #define FAT16_NUM_FATS         2
@@ -34,12 +35,14 @@ static void usage(const char *p) {
         "  %s -b boot.bin [-o image.iso] [file[:NAME] ...]\n"
         "  %s -o image.iso\n"
         "  %s --list image.iso\n"
+        "  %s --add image.iso file[:NAME] [--force]\n"
         "Options:\n"
         "  -b FILE      Bootloader (sector 0, max 510 B)\n"
         "  -o FILE      Output image (default dimon.iso)\n"
         "  --list FILE  List FAT16 image contents\n"
+        "  --force      Allow replacing an existing output image\n"
         "Files: path[:NAME] - NAME is 8.3 filename (default basename).\n",
-        p, p, p);
+        p, p, p, p);
 }
 
 static uint8_t *read_file(const char *path, size_t *out_len) {
@@ -65,6 +68,34 @@ static const char *base_name(const char *p) {
     const char *s2 = strrchr(p, '\\');
     if (s2 && (!s || s2 > s)) s = s2;
     return s ? s + 1 : p;
+}
+
+static int add_to_iso(const char *image_path, char *spec, int replace) {
+    char *sep = strrchr(spec, ':');
+    const char *name = base_name(spec);
+    if (sep && !strchr(sep + 1, '/') && !strchr(sep + 1, '\\')) {
+        *sep = 0; name = sep + 1;
+    }
+    size_t image_len = 0, file_len = 0;
+    uint8_t *image = read_file(image_path, &image_len);
+    uint8_t *file = read_file(spec, &file_len);
+    if (!image || !file) { fprintf(stderr, "Cannot read image or input file.\n"); free(image); free(file); return 1; }
+    if (image_len % 512u || image_len / 512u > DISK_MAX_SECTORS || file_len > UINT32_MAX) {
+        fprintf(stderr, "Invalid image or oversized input.\n"); free(image); free(file); return 1;
+    }
+    VM vm; memset(&vm, 0, sizeof(vm)); vm.disk_data = image;
+    vm.disk_sectors = (uint32_t)(image_len / 512u); vm.disk_writable = 1;
+    snprintf(vm.disk_path, sizeof(vm.disk_path), "%s", image_path);
+    char path[32]; snprintf(path, sizeof(path), "/%s", name);
+    Dimon64DirEnt ent;
+    if (!replace && dimonfs_stat(&vm, path, &ent) == DFS_OK) {
+        fprintf(stderr, "Refusing to replace existing '%s' (use --force).\n", path);
+        free(image); free(file); return 1;
+    }
+    int rc = dimonfs_write(&vm, path, file, (uint32_t)file_len, 1, 1);
+    if (rc != DFS_OK) { fprintf(stderr, "Add failed: %s (%d)\n", dimonfs_error(rc), rc); free(image); free(file); return 1; }
+    printf("Added %s as %s to %s (%zu bytes)\n", spec, path, image_path, file_len);
+    free(image); free(file); return 0;
 }
 
 static void put16(uint8_t *b, int off, uint16_t v) {
@@ -185,8 +216,15 @@ int main(int argc, char **argv) {
     const char *inputs[DISK_FILE_MAX];
     const char *names[DISK_FILE_MAX];
     int ninputs = 0;
+    int force = 0;
 
     if (argc < 2) { usage(argv[0]); return 1; }
+    if (!strcmp(argv[1], "--add")) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        int replace = 0;
+        for (int i = 4; i < argc; i++) if (!strcmp(argv[i], "--force")) replace = 1;
+        return add_to_iso(argv[2], argv[3], replace);
+    }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list") && i + 1 < argc) {
             return list_iso(argv[++i]);
@@ -194,6 +232,8 @@ int main(int argc, char **argv) {
             boot = argv[++i];
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             out = argv[++i];
+        } else if (!strcmp(argv[i], "--force")) {
+            force = 1;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]); return 0;
         } else if (argv[i][0] == '-') {
@@ -201,23 +241,28 @@ int main(int argc, char **argv) {
         } else {
             char *sep = strchr(argv[i], ':');
             if (sep && strchr(sep + 1, '/')) sep = NULL;
-            if (!boot) {
-                boot = argv[i];
-            } else {
-                if (ninputs >= DISK_FILE_MAX) {
-                    fprintf(stderr, "Too many files (max %d)\n", DISK_FILE_MAX);
-                    return 1;
-                }
-                if (sep) {
-                    *sep = 0;
-                    inputs[ninputs] = argv[i];
-                    names[ninputs] = sep + 1;
-                } else {
-                    inputs[ninputs] = argv[i];
-                    names[ninputs] = base_name(argv[i]);
-                }
-                ninputs++;
+            if (ninputs >= DISK_FILE_MAX) {
+                fprintf(stderr, "Too many files (max %d)\n", DISK_FILE_MAX);
+                return 1;
             }
+            if (sep) {
+                *sep = 0;
+                inputs[ninputs] = argv[i];
+                names[ninputs] = sep + 1;
+            } else {
+                inputs[ninputs] = argv[i];
+                names[ninputs] = base_name(argv[i]);
+            }
+            ninputs++;
+        }
+    }
+
+    if (!force) {
+        FILE *existing = fopen(out, "rb");
+        if (existing) {
+            fclose(existing);
+            fprintf(stderr, "Refusing to overwrite existing image '%s' (use --force explicitly).\n", out);
+            return 1;
         }
     }
 
@@ -386,4 +431,3 @@ int main(int argc, char **argv) {
     free(img);
     return 0;
 }
-

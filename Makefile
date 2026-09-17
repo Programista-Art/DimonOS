@@ -1,6 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c11
 
+REG_BUILD ?= build/regression
+REG_OS = $(REG_BUILD)/os.bin
+REG_DISK = $(REG_BUILD)/test-disk.img
+REG_KERNEL = $(REG_BUILD)/dimon-kernel.elf
+REG_ISO = $(REG_BUILD)/dimon-regression.iso
+LEGACY_TEST_DISK = $(REG_BUILD)/legacy-test-disk.img
+
 ALL = dimon-as dimon-emu dimon-mkiso
 
 all: $(ALL)
@@ -8,19 +15,36 @@ all: $(ALL)
 dimon-as: assembler.c dimon64.h
 	$(CC) $(CFLAGS) -o dimon-as assembler.c
 
-dimon-emu: emulator.c vm.c dimon64.h font8x16.h
-	$(CC) $(CFLAGS) -o dimon-emu emulator.c vm.c -lX11 -pthread
+dimon-emu: emulator.c vm.c dimonfs.c dimon64.h dimonfs.h font8x16.h
+	$(CC) $(CFLAGS) -o dimon-emu emulator.c vm.c dimonfs.c -lX11 -pthread
 
-dimon-mkiso: mkiso.c dimon64.h
-	$(CC) $(CFLAGS) -o dimon-mkiso mkiso.c
+dimon-mkiso: mkiso.c dimonfs.c dimonfs.h dimon64.h
+	$(CC) $(CFLAGS) -o dimon-mkiso mkiso.c dimonfs.c
+
+disk-install-apps: dimon-mkiso apps
+	./dimon-mkiso --add dimon.iso apps/snake.app:SNAKE.APP
 
 os.bin: $(ALL) os.asm
 	./dimon-as os.asm -o os.bin
 
-dimon.iso: dimon-mkiso
-	./dimon-mkiso -o dimon.iso
+dimon.iso:
+	@echo "dimon.iso is missing; create it explicitly with 'make disk-new'" >&2
+	@false
 
-progs: $(ALL) os.bin dimon.iso
+# Explicit application artifacts. DEXE64 contains relocation metadata and is
+# loaded from FAT16 by SYS_APP_EXEC. Integrated desktop modules remain built as
+# part of os.bin while they are migrated to the process ABI.
+apps/snake.app: dimon-as apps/snake.asm
+	./dimon-as apps/snake.asm --dexe Snake -o apps/snake.app
+
+apps: apps/snake.app
+
+# Image creation is intentionally explicit and mkiso refuses to replace an
+# existing image unless --force is supplied directly by the operator.
+disk-new: dimon-mkiso apps
+	./dimon-mkiso -o dimon.iso apps/snake.app:SNAKE.APP
+
+progs: $(ALL) os.bin apps
 	./dimon-as examples/hello.asm -o examples/hello.bin
 	./dimon-as examples/math.asm -o examples/math.bin
 	./dimon-as examples/fib.asm -o examples/fib.bin
@@ -64,14 +88,15 @@ test: progs
 	./dimon-emu --headless --inject-keys "4" --inject-click "200,200;175,90;400,300" -m 300000 os.bin --dump-vram /tmp/dimon_paint_multi.bin
 	python3 -c "import struct; d=open('/tmp/dimon_paint_multi.bin','rb').read(); p=lambda x,y: struct.unpack_from('<I',d,(y*800+x)*4)[0]; assert p(200,200)==0xFFFF3B30 and p(400,300)==0xFF34C759, 'Paint multi-click swatch drawing failed'; print('paint swatch selection and multi-click drawing OK')"
 	@echo "--- FAT16 filesystem (mount, root directory listing, and Notepad write persistence) ---"
-	./dimon-mkiso -o dimon.iso
-	./dimon-mkiso --list dimon.iso
-	python3 -c "import struct; b=open('dimon.iso','rb').read(); assert b[510:512]==b'\x55\xAA', 'BPB signature missing'; assert b[3:11]==b'DIMON64 ', 'OEM missing'; assert b[54:62]==b'FAT16   ', 'FS type missing'; assert b[36*512:36*512+11]==b'NOTES   TXT', 'notes.txt missing in root dir'; print('FAT16 volume layout and root dir OK')"
-	./dimon-emu --headless --disk dimon.iso --disk-writable --inject-keys "2Hello DimonOS!\9" -m 1500000 os.bin
-	python3 -c "with open('dimon.iso','rb') as f: f.seek(68*512); d=f.read(512); assert b'Hello DimonOS!' in d, 'Saved text missing from FAT16 data cluster 2'; f.seek(36*512); ent=f.read(32); sz=ent[28]|(ent[29]<<8); assert sz==127+len('Hello DimonOS!'), f'Dir entry size mismatch: {sz}'; print('Notepad FAT16 cluster write & root dir update OK')"
-	./dimon-emu --headless --disk dimon.iso --inject-keys "2" -m 200000 os.bin --dump-vram /tmp/dimon_note_reload.bin
+	mkdir -p $(REG_BUILD)
+	./dimon-mkiso -o $(LEGACY_TEST_DISK) --force
+	./dimon-mkiso --list $(LEGACY_TEST_DISK)
+	python3 -c "import struct; b=open('$(LEGACY_TEST_DISK)','rb').read(); assert b[510:512]==b'\x55\xAA', 'BPB signature missing'; assert b[3:11]==b'DIMON64 ', 'OEM missing'; assert b[54:62]==b'FAT16   ', 'FS type missing'; assert b[36*512:36*512+11]==b'NOTES   TXT', 'notes.txt missing in root dir'; print('FAT16 volume layout and root dir OK')"
+	./dimon-emu --headless --disk $(LEGACY_TEST_DISK) --disk-writable --inject-keys "2Hello DimonOS!\9" -m 1500000 os.bin
+	python3 -c "with open('$(LEGACY_TEST_DISK)','rb') as f: f.seek(68*512); d=f.read(512); assert b'Hello DimonOS!' in d, 'Saved text missing from FAT16 data cluster 2'; f.seek(36*512); ent=f.read(32); sz=ent[28]|(ent[29]<<8); assert sz==127+len('Hello DimonOS!'), f'Dir entry size mismatch: {sz}'; print('Notepad FAT16 cluster write & root dir update OK')"
+	./dimon-emu --headless --disk $(LEGACY_TEST_DISK) --inject-keys "2" -m 200000 os.bin --dump-vram /tmp/dimon_note_reload.bin
 	python3 -c "import struct; d=open('/tmp/dimon_note_reload.bin','rb').read(); assert len(d)==800*600*4; print('Notepad reload from FAT16 OK')"
-	./dimon-emu --headless --disk dimon.iso --inject-keys "3" -m 200000 os.bin --dump-vram /tmp/dimon_fm_reload.bin
+	./dimon-emu --headless --disk $(LEGACY_TEST_DISK) --inject-keys "3" -m 200000 os.bin --dump-vram /tmp/dimon_fm_reload.bin
 	python3 -c "import struct; d=open('/tmp/dimon_fm_reload.bin','rb').read(); assert len(d)==800*600*4; p=lambda x,y: struct.unpack_from('<I',d,(y*800+x)*4)[0]; assert p(104,70)==0xFF2563EB, 'File Explorer title missing'; print('File Explorer FAT16 root directory viewer OK')"
 	@echo "--- snake game (advances, wall collision, and restart via 'R' without freezing) ---"
 	./dimon-emu --headless --inject-keys "                                        " -m 100000 apps/snake.bin --dump-vram /tmp/snake_collide.bin
@@ -93,11 +118,14 @@ arch/x86/boot.o: arch/x86/boot.S os.bin dimon.iso
 arch/x86/kernel.o: arch/x86/kernel.c arch/x86/io.h dimon64.h
 	$(BM_CC) $(BM_CFLAGS) -c -o arch/x86/kernel.o arch/x86/kernel.c
 
-vm_baremetal.o: vm.c dimon64.h font8x16.h
+vm_baremetal.o: vm.c dimon64.h dimonfs.h font8x16.h
 	$(BM_CC) $(BM_CFLAGS) -c -o vm_baremetal.o vm.c
 
-dimon-kernel.elf: arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o arch/x86/linker.ld
-	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o dimon-kernel.elf arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o
+dimonfs_baremetal.o: dimonfs.c dimonfs.h dimon64.h
+	$(BM_CC) $(BM_CFLAGS) -c -o dimonfs_baremetal.o dimonfs.c
+
+dimon-kernel.elf: arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o dimonfs_baremetal.o arch/x86/linker.ld
+	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o dimon-kernel.elf arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o dimonfs_baremetal.o
 
 baremetal: dimon-kernel.elf
 
@@ -115,8 +143,61 @@ qemu: dimon-baremetal.iso
 qemu-multiboot: dimon-kernel.elf
 	qemu-system-i386 -kernel dimon-kernel.elf -m 256M -serial stdio -vga std
 
-clean:
-	rm -rf dimon-as dimon-emu dimon-mkiso os.bin dimon.iso examples/*.bin apps/snake.bin
-	rm -rf dimon-kernel.elf dimon-baremetal.iso build arch/x86/*.o vm_baremetal.o *.ppm *.log /tmp/dimon_*.bin /tmp/snake_*.bin
+# Isolated regression artifacts. These rules never read, overwrite, or embed
+# the user's dimon.iso; boot.S paths are supplied explicitly to the assembler.
+$(REG_BUILD):
+	mkdir -p $(REG_BUILD)
 
-.PHONY: all progs test clean baremetal baremetal-iso qemu qemu-multiboot
+$(REG_OS): dimon-as os.asm | $(REG_BUILD)
+	./dimon-as os.asm -o $@ > $(REG_BUILD)/os.map
+
+$(REG_DISK): dimon-mkiso apps/snake.app | $(REG_BUILD)
+	./dimon-mkiso -o $@ apps/snake.app:SNAKE.APP --force > $(REG_BUILD)/mkiso.log
+
+$(REG_BUILD)/boot.o: arch/x86/boot.S $(REG_OS) $(REG_DISK) | $(REG_BUILD)
+	$(BM_CC) -DOS_IMAGE_PATH='"$(abspath $(REG_OS))"' -DDISK_IMAGE_PATH='"$(abspath $(REG_DISK))"' -c -o $@ arch/x86/boot.S
+
+$(REG_BUILD)/kernel.o: arch/x86/kernel.c arch/x86/io.h dimon64.h | $(REG_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c -o $@ arch/x86/kernel.c
+
+$(REG_BUILD)/vm.o: vm.c dimon64.h dimonfs.h font8x16.h | $(REG_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c -o $@ vm.c
+
+$(REG_BUILD)/dimonfs.o: dimonfs.c dimonfs.h dimon64.h | $(REG_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c -o $@ dimonfs.c
+
+$(REG_KERNEL): $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o arch/x86/linker.ld
+	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o $@ $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o
+
+$(REG_ISO): $(REG_KERNEL) arch/x86/grub.cfg
+	mkdir -p $(REG_BUILD)/iso/boot/grub
+	cp $(REG_KERNEL) $(REG_BUILD)/iso/boot/dimon-kernel.elf
+	cp arch/x86/grub.cfg $(REG_BUILD)/iso/boot/grub/grub.cfg
+	grub-mkrescue -o $@ $(REG_BUILD)/iso > $(REG_BUILD)/grub.log 2>&1
+
+regression-artifacts: all apps $(REG_OS) $(REG_DISK) $(REG_ISO)
+
+regression-hosted: all $(REG_OS)
+	python3 tests/desktop_regression.py --build-dir $(REG_BUILD)
+
+regression-x11: all $(REG_OS)
+	python3 tests/x11_regression.py --build-dir $(REG_BUILD)
+
+regression-qemu: regression-artifacts
+	python3 tests/qemu_regression.py --build-dir $(REG_BUILD)
+
+regression: regression-hosted regression-x11 regression-qemu
+
+# Remove generated programs, objects, boot ISOs, and test artifacts in one step.
+# dimon.iso is the persistent user disk and is intentionally preserved.
+clean:
+	@reg_dir="$(abspath $(REG_BUILD))"; \
+	case "$(CURDIR)/" in "$${reg_dir%/}/"*) \
+		echo "Refusing clean: REG_BUILD must not be the project directory or an ancestor." >&2; exit 1 ;; \
+	esac
+	rm -f -- $(ALL) $(addsuffix .exe,$(ALL)) os.bin dimon-kernel.elf dimon-baremetal.iso
+	rm -f -- *.o arch/x86/*.o examples/*.bin apps/*.bin apps/*.app
+	rm -f -- *.ppm *.log /tmp/dimon_*.bin /tmp/snake_*.bin /tmp/dimon_psg_test.out
+	rm -rf -- build "$(REG_BUILD)" tests/__pycache__
+
+.PHONY: all apps disk-new disk-install-apps progs test clean baremetal baremetal-iso qemu qemu-multiboot regression-artifacts regression-hosted regression-x11 regression-qemu regression

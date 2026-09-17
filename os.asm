@@ -32,12 +32,8 @@ boot:
     ; Initialize FAT16 on virtual disk if available
     CALL fat16_init
 
-    ; Initialize apps
-    CALL paint_init
-    CALL notepad_init
-    CALL calc_init
-    CALL snake_init
-    CALL terminal_init
+    ; Apps initialize lazily when their window is first opened.
+    CALL wm_init
 
     ; First repaint
     LA t0, need_redraw
@@ -66,7 +62,27 @@ main_no_paint:
     J main_loop
 
 do_exit:
-    EBREAK                   ; Halt entire system
+    ; Leave an explicit terminal screen before halting. The hosted backend
+    ; exits on EBREAK; the bare-metal wrapper flushes this frame, requests
+    ; QEMU power-off, and otherwise remains in a documented halted state.
+    CALL wm_reset_context
+    LI a0, 0
+    LI a1, 0
+    LI a2, 800
+    LI a3, 600
+    LI a4, 0xFF0F172A
+    LI a7, 14
+    ECALL
+    LI a0, 248
+    LI a1, 276
+    LA a2, str_system_halted
+    LI a3, 0xFFFFFFFF
+    LI a4, 0
+    LI a7, 15
+    ECALL
+    LI a7, 12
+    ECALL
+    EBREAK                   ; Defined terminal condition
 
 ; ------------------------------------------------------------------------------
 ; Timer ISR: bump monotonic interrupt counter
@@ -98,54 +114,32 @@ worker_task:
     J worker_task
 
 ; ------------------------------------------------------------------------------
-; Repaint Dispatcher: composite desktop, active window, and start menu
+; Repaint Dispatcher: full back-to-front composition. Full repainting is
+; intentional: moving/closing/minimizing a window cannot leave stale pixels.
 ; ------------------------------------------------------------------------------
 os_repaint:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
 
     CALL desktop_draw
 
-    LA t0, active_window
-    LW t1, 0(t0)
-    BEQ t1, zero, check_start_menu_draw
+    LI s0, 0
+    LA t0, win_z_count
+    LW s1, 0(t0)
+rep_window_loop:
+    BGE s0, s1, rep_windows_done
+    LA t0, win_z_order
+    ADD t0, t0, s0
+    LBU a0, 0(t0)
+    CALL wm_draw_window
+    ADDI s0, s0, 1
+    J rep_window_loop
 
-    LI t2, 1
-    BEQ t1, t2, rep_calc
-    LI t2, 2
-    BEQ t1, t2, rep_notes
-    LI t2, 3
-    BEQ t1, t2, rep_files
-    LI t2, 4
-    BEQ t1, t2, rep_paint
-    LI t2, 5
-    BEQ t1, t2, rep_info
-    LI t2, 6
-    BEQ t1, t2, rep_snake
-    LI t2, 7
-    BEQ t1, t2, rep_term
-    J check_start_menu_draw
-
-rep_calc:
-    CALL calc_draw
-    J check_start_menu_draw
-rep_notes:
-    CALL notepad_draw
-    J check_start_menu_draw
-rep_files:
-    CALL fileman_draw
-    J check_start_menu_draw
-rep_paint:
-    CALL paint_draw
-    J check_start_menu_draw
-rep_info:
-    CALL sysinfo_draw
-    J check_start_menu_draw
-rep_snake:
-    CALL snake_draw
-    J check_start_menu_draw
-rep_term:
-    CALL terminal_draw
+rep_windows_done:
+    CALL wm_reset_context
+    CALL desktop_draw_taskbar
 
 check_start_menu_draw:
     LA t0, start_menu_open
@@ -156,8 +150,139 @@ check_start_menu_draw:
 rep_flush:
     LI a7, 12
     ECALL                    ; SYS_GUI_FLUSH
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; Draw one non-minimized app through its translated/clipped context.
+wm_draw_window:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    SD a0, 0(sp)
+    LA t0, drawing_window
+    SW a0, 0(t0)
+    ADDI t0, a0, -1
+    SLLI t0, t0, 2
+    LA t1, win_flags
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    ANDI t3, t2, 1
+    BEQ t3, zero, wdw_done
+    ANDI t3, t2, 2
+    BNE t3, zero, wdw_done
+    LD a0, 0(sp)
+    CALL wm_set_context
+    LD t0, 0(sp)
+    LI t1, 1
+    BEQ t0, t1, wdw_calc
+    LI t1, 2
+    BEQ t0, t1, wdw_note
+    LI t1, 3
+    BEQ t0, t1, wdw_files
+    LI t1, 4
+    BEQ t0, t1, wdw_paint
+    LI t1, 5
+    BEQ t0, t1, wdw_info
+    LI t1, 6
+    BEQ t0, t1, wdw_snake
+    CALL terminal_draw
+    J wdw_done
+wdw_calc:
+    CALL calc_draw
+    J wdw_done
+wdw_note:
+    CALL notepad_draw
+    J wdw_done
+wdw_files:
+    CALL fileman_draw
+    J wdw_done
+wdw_paint:
+    CALL paint_draw
+    J wdw_done
+wdw_info:
+    CALL sysinfo_draw
+    J wdw_done
+wdw_snake:
+    CALL snake_draw
+wdw_done:
+    CALL wm_reset_context
     LD ra, 8(sp)
     ADDI sp, sp, 16
+    RET
+
+; a0=window id. Translate the app's historical fixed coordinates to the
+; retained window position and clip every accelerated drawing path to it.
+wm_set_context:
+    ADDI t0, a0, -1
+    SLLI t0, t0, 2
+    LA t1, win_x
+    ADD t1, t1, t0
+    LW a2, 0(t1)            ; screen clip X
+    LA t1, win_default_x
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    SUB a0, a2, t2          ; translation X
+    LA t1, win_y
+    ADD t1, t1, t0
+    LW a3, 0(t1)            ; screen clip Y
+    LA t1, win_default_y
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    SUB a1, a3, t2          ; translation Y
+    LA t1, win_w
+    ADD t1, t1, t0
+    LW a4, 0(t1)
+    LA t1, win_h
+    ADD t1, t1, t0
+    LW a5, 0(t1)
+    LI a7, 41
+    ECALL
+    RET
+
+wm_reset_context:
+    LI a0, 0
+    LI a1, 0
+    LI a2, 0
+    LI a3, 0
+    LI a4, 0
+    LI a5, 0
+    LI a7, 41
+    ECALL
+    RET
+
+; After a frame is drawn, narrow the same translation to its client area.
+; This prevents app content from painting over title controls or other windows.
+wm_set_client_context:
+    LA t0, drawing_window
+    LW t0, 0(t0)
+    ADDI t0, t0, -1
+    SLLI t0, t0, 2
+    LA t1, win_x
+    ADD t1, t1, t0
+    LW a2, 0(t1)
+    LA t1, win_default_x
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    SUB a0, a2, t2
+    LA t1, win_y
+    ADD t1, t1, t0
+    LW a3, 0(t1)
+    LA t1, win_default_y
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    SUB a1, a3, t2
+    ADDI a3, a3, 32
+    LA t1, win_w
+    ADD t1, t1, t0
+    LW a4, 0(t1)
+    LA t1, win_h
+    ADD t1, t1, t0
+    LW a5, 0(t1)
+    ADDI a5, a5, -32
+    LI a7, 41
+    ECALL
     RET
 
 ; ------------------------------------------------------------------------------
@@ -200,7 +325,9 @@ desktop_draw:
     LA a2, str_top_apps
     LI a3, 0xFF94A3B8        ; Slate gray
     LI a4, 0x00000000
-    LI a7, 15
+    LI a5, 444                ; stop before status region at X=656
+    LI a6, 16
+    LI a7, 43
     ECALL
 
     ; Top Bar uptime
@@ -326,7 +453,18 @@ desktop_draw:
     LI a7, 15
     ECALL
 
-    ; 4. Taskbar (Y=568..600, color 0xFF0F172A)
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; Taskbar is composed last, so no window can cover it. Seven fixed 76-pixel
+; slots fit between Start and the 136-pixel status area without overlap.
+desktop_draw_taskbar:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
     LI a0, 0
     LI a1, 568
     LI a2, 800
@@ -334,17 +472,6 @@ desktop_draw:
     LI a4, 0xFF0F172A
     LI a7, 14
     ECALL
-
-    ; Taskbar top accent line
-    LI a0, 0
-    LI a1, 568
-    LI a2, 800
-    LI a3, 1
-    LI a4, 0xFF334155
-    LI a7, 14
-    ECALL
-
-    ; [ START ] button (X=8, Y=572, W=84, H=24, color 0xFF10B981)
     LI a0, 8
     LI a1, 572
     LI a2, 84
@@ -352,53 +479,71 @@ desktop_draw:
     LI a4, 0xFF10B981
     LI a7, 14
     ECALL
-
     LI a0, 20
     LI a1, 576
     LA a2, str_start_btn
     LI a3, 0xFFFFFFFF
-    LI a4, 0x00000000
+    LI a4, 0
     LI a7, 15
     ECALL
-
-    ; Active window tab button (X=100, Y=572, W=190, H=24)
-    LI a0, 100
+    LI s0, 1
+    LI s1, 100
+dtb_loop:
+    LI t0, 8
+    BGE s0, t0, dtb_clock
+    ADDI t0, s0, -1
+    SLLI t0, t0, 2
+    LA t1, win_flags
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    ANDI t2, t2, 1
+    BEQ t2, zero, dtb_next
+    LA t0, active_window
+    LW t1, 0(t0)
+    LI s2, 0xFF334155
+    BNE t1, s0, dtb_color
+    LI s2, 0xFF2563EB
+dtb_color:
+    MV a0, s1
     LI a1, 572
-    LI a2, 190
+    LI a2, 74
     LI a3, 24
-    LI a4, 0xFF1E293B
+    MV a4, s2
     LI a7, 14
     ECALL
-
-    LI a0, 112
+    ADDI a0, s1, 6
     LI a1, 576
-    CALL get_active_win_name
+    MV a2, s0
+    CALL get_win_short_name
     MV a2, a0
-    LI a3, 0xFFE2E8F0
-    LI a4, 0x00000000
-    LI a7, 15
-    ECALL
-
-    ; Taskbar hint
-    LI a0, 310
+    ADDI a0, s1, 6
     LI a1, 576
-    LA a2, str_task_hint
-    LI a3, 0xFF64748B
-    LI a4, 0x00000000
-    LI a7, 15
+    LI a3, 0xFFFFFFFF
+    LI a4, 0
+    LI a5, 62
+    LI a6, 16
+    LI a7, 43
     ECALL
-
-    ; Taskbar live clock
-    LI a0, 680
+dtb_next:
+    ADDI s0, s0, 1
+    ADDI s1, s1, 78
+    J dtb_loop
+dtb_clock:
+    CALL format_clock
+    LI a0, 660
     LI a1, 576
     LA a2, clock_buf
     LI a3, 0xFF38BDF8
-    LI a4, 0x00000000
-    LI a7, 15
+    LI a4, 0
+    LI a5, 132
+    LI a6, 16
+    LI a7, 43
     ECALL
-
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
     RET
 
 ; ------------------------------------------------------------------------------
@@ -575,12 +720,32 @@ draw_window_frame:
     LI a7, 14
     ECALL
 
-    ; Title text
+    ; Title text: reserve 64 pixels for minimize/close controls and fit UTF-8
     ADDI a0, s0, 12
     ADDI a1, s1, 8
     MV a2, s4
     LI a3, 0xFFFFFFFF
     LI a4, 0x00000000
+    ADDI a5, s2, -88
+    LI a6, 16
+    LI a7, 43
+    ECALL
+
+    ; Minimize button
+    ADD a0, s0, s2
+    ADDI a0, a0, -52
+    ADDI a1, s1, 6
+    LI a2, 20
+    LI a3, 20
+    LI a4, 0xFF475569
+    LI a7, 14
+    ECALL
+    ADD a0, s0, s2
+    ADDI a0, a0, -46
+    ADDI a1, s1, 8
+    LA a2, str_minimize
+    LI a3, 0xFFFFFFFF
+    LI a4, 0
     LI a7, 15
     ECALL
 
@@ -604,6 +769,8 @@ draw_window_frame:
     LI a7, 15
     ECALL
 
+    CALL wm_set_client_context
+
     LD s4, 0(sp)
     LD s3, 8(sp)
     LD s2, 16(sp)
@@ -614,23 +781,35 @@ draw_window_frame:
     RET
 
 ; ------------------------------------------------------------------------------
-; format_clock: format "T+<worker_ticks>" in clock_buf
+; format_clock: host wall-clock source as Unix UTC seconds. Bare-metal platforms
+; without an RTC return zero and explicitly display "RTC N/A".
 ; ------------------------------------------------------------------------------
 format_clock:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    LA t0, worker_ticks
-    LD a0, 0(t0)
+    LI a7, 29                ; SYS_RTC_GET
+    ECALL
+    BEQ a0, zero, fc_no_rtc
     LA a1, num_tmp
     CALL num_to_dec
     LA t0, clock_buf
-    LI t1, 84                ; 'T'
+    LI t1, 85                ; U
     SB t1, 0(t0)
-    LI t1, 43                ; '+'
+    LI t1, 84                ; T
     SB t1, 1(t0)
-    ADDI a0, t0, 2
+    LI t1, 67                ; C
+    SB t1, 2(t0)
+    LI t1, 32
+    SB t1, 3(t0)
+    ADDI a0, t0, 4
     LA a1, num_tmp
     CALL str_copy
+    J fc_done
+fc_no_rtc:
+    LA a0, clock_buf
+    LA a1, str_rtc_unavailable
+    CALL str_copy
+fc_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -676,6 +855,40 @@ gwn_7:
     LA a0, str_wname_term
     RET
 
+get_win_short_name:
+    LI t0, 1
+    BEQ a2, t0, gws_1
+    LI t0, 2
+    BEQ a2, t0, gws_2
+    LI t0, 3
+    BEQ a2, t0, gws_3
+    LI t0, 4
+    BEQ a2, t0, gws_4
+    LI t0, 5
+    BEQ a2, t0, gws_5
+    LI t0, 6
+    BEQ a2, t0, gws_6
+    LA a0, str_short_term
+    RET
+gws_1:
+    LA a0, str_short_calc
+    RET
+gws_2:
+    LA a0, str_short_note
+    RET
+gws_3:
+    LA a0, str_short_files
+    RET
+gws_4:
+    LA a0, str_short_paint
+    RET
+gws_5:
+    LA a0, str_short_info
+    RET
+gws_6:
+    LA a0, str_short_snake
+    RET
+
 str_copy:
 sc_loop:
     LBU t0, 0(a1)
@@ -716,12 +929,34 @@ ev_poll_loop:
     BEQ a0, t0, ev_move
     LI t0, 4
     BEQ a0, t0, ev_timer
+    LI t0, 5
+    BEQ a0, t0, ev_release
     J ev_next
 
 ev_key:
     ; a1 = keycode
+    ; Alt+Tab is global and is consumed before any application sees Tab.
+    LI t0, 9
+    BNE a1, t0, ev_key_not_alt_tab
+    ANDI t0, a4, 4
+    BEQ t0, zero, ev_key_not_alt_tab
+    CALL wm_alt_tab
+    J ev_next
+ev_key_not_alt_tab:
     LI t0, 260               ; KEY_F1 (toggle start menu)
     BEQ a1, t0, toggle_menu
+    LI t0, 261
+    BEQ a1, t0, sm_open_2
+    LI t0, 262
+    BEQ a1, t0, sm_open_3
+    LI t0, 263
+    BEQ a1, t0, sm_open_4
+    LI t0, 264
+    BEQ a1, t0, sm_open_5
+    LI t0, 265
+    BEQ a1, t0, sm_open_6
+    LI t0, 266
+    BEQ a1, t0, sm_open_7
     LI t0, 1                 ; ASCII 1 / Ctrl-A / injected '\1'
     BEQ a1, t0, toggle_menu
     LI t0, 27                ; KEY_ESC
@@ -898,19 +1133,30 @@ ev_click:
     J toggle_menu
 
 chk_taskbar_tab:
-    ; Tab: X in 100..290 -> toggle or focus window
+    ; Seven stable app slots. Empty slots do nothing; the active slot minimizes.
     LI t0, 100
     BLT s0, t0, ev_next
-    LI t0, 290
+    LI t0, 646
     BGT s0, t0, ev_next
-    LA t0, active_window
-    LW t1, 0(t0)
-    BNE t1, zero, tb_close
-    LI a0, 1
-    CALL window_open
+    ADDI t0, s0, -100
+    LI t1, 78
+    DIV t0, t0, t1
+    ADDI t0, t0, 1
+    ADDI t1, t0, -1
+    SLLI t1, t1, 2
+    LA t2, win_flags
+    ADD t2, t2, t1
+    LW t3, 0(t2)
+    ANDI t3, t3, 1
+    BEQ t3, zero, ev_next
+    LA t1, active_window
+    LW t2, 0(t1)
+    BNE t2, t0, tb_focus
+    CALL window_minimize
     J ev_next
-tb_close:
-    CALL window_close
+tb_focus:
+    MV a0, t0
+    CALL window_open
     J ev_next
 
 chk_sm_click:
@@ -954,47 +1200,107 @@ close_sm_anyway:
     CALL flag_redraw
 
 chk_win_click:
-    ; 3. If window is open, check close button and window routing
-    LA t0, active_window
+    ; Hit-test the visible stack from front to back. Once a window is hit,
+    ; desktop icons and covered windows never receive the same click.
+    LA t0, win_z_count
     LW t1, 0(t0)
-    BEQ t1, zero, chk_desktop_icons
-
-    ; Check [X] close button
-    LA t0, cur_win_x
-    LW t2, 0(t0)
-    LA t0, cur_win_y
-    LW t3, 0(t0)
-    LA t0, cur_win_w
-    LW t4, 0(t0)
-    LA t0, cur_win_h
-    LW t5, 0(t0)
-
-    ; Close button rect: X in (t2+t4-30 .. t2+t4), Y in (t3 .. t3+32)
-    ADD t6, t2, t4
-    ADDI t0, t6, -30
-    BLT s0, t0, chk_win_interior
-    BGT s0, t6, chk_win_interior
-    BLT s1, t3, chk_win_interior
-    ADDI t0, t3, 32
-    BGT s1, t0, chk_win_interior
+    LI t2, 7
+    BLE t1, t2, chw_scan
+    MV t1, t2
+chw_scan:
+    ADDI t1, t1, -1
+    BLT t1, zero, chk_desktop_icons
+    LA t2, win_z_order
+    ADD t2, t2, t1
+    LBU t6, 0(t2)
+    LI t2, 1
+    BLT t6, t2, chw_scan
+    LI t2, 7
+    BGT t6, t2, chw_scan
+    ADDI t2, t6, -1
+    SLLI t2, t2, 2
+    LA t3, win_flags
+    ADD t3, t3, t2
+    LW t4, 0(t3)
+    ANDI t4, t4, 3
+    LI t5, 1
+    BNE t4, t5, chw_scan
+    LA t3, win_x
+    ADD t3, t3, t2
+    LW t4, 0(t3)
+    BLT s0, t4, chw_scan
+    LA t3, win_w
+    ADD t3, t3, t2
+    LW t5, 0(t3)
+    ADD t5, t5, t4
+    BGE s0, t5, chw_scan
+    LA t3, win_y
+    ADD t3, t3, t2
+    LW a5, 0(t3)
+    BLT s1, a5, chw_scan
+    LA t3, win_h
+    ADD t3, t3, t2
+    LW a6, 0(t3)
+    ADD a6, a6, a5
+    BGE s1, a6, chw_scan
+    LA t0, hit_window
+    SW t6, 0(t0)
+    MV a0, t6
+    CALL wm_raise
+    LA t0, hit_window
+    LW t1, 0(t0)
+    ADDI t2, t1, -1
+    SLLI t2, t2, 2
+    LA t3, win_x
+    ADD t3, t3, t2
+    LW t4, 0(t3)
+    LA t3, win_y
+    ADD t3, t3, t2
+    LW t5, 0(t3)
+    LA t3, win_w
+    ADD t3, t3, t2
+    LW t6, 0(t3)
+    ADD a6, t4, t6
+    ; Title controls and drag capture use screen coordinates.
+    ADDI a5, t5, 32
+    BGE s1, a5, chw_client
+    ADDI a5, a6, -28
+    BGE s0, a5, chw_close
+    ADDI a5, a6, -52
+    BGE s0, a5, chw_minimize
+    LA t0, drag_active
+    LI a0, 1
+    SW a0, 0(t0)
+    LA t0, drag_window
+    SW t1, 0(t0)
+    SUB a0, s0, t4
+    LA t0, drag_off_x
+    SW a0, 0(t0)
+    SUB a0, s1, t5
+    LA t0, drag_off_y
+    SW a0, 0(t0)
+    CALL flag_redraw
+    J ev_next
+chw_close:
     CALL window_close
     J ev_next
-
-chk_win_interior:
-    ; If click inside window bounds: route click to active app
-    BLT s0, t2, chk_desktop_icons
-    ADD t0, t2, t4
-    BGT s0, t0, chk_desktop_icons
-    BLT s1, t3, chk_desktop_icons
-    ADD t0, t3, t5
-    BGT s1, t0, chk_desktop_icons
-
-    ; Route click: a0 = X, a1 = Y, a2 = button
-    MV a0, s0
-    MV a1, s1
+chw_minimize:
+    CALL window_minimize
+    J ev_next
+chw_client:
+    ; Convert screen coordinates back into each app's historical coordinate
+    ; space. Rendering uses the exact inverse translation.
+    LA t3, win_default_x
+    ADD t3, t3, t2
+    LW a0, 0(t3)
+    SUB a3, s0, t4
+    ADD a0, a0, a3
+    LA t3, win_default_y
+    ADD t3, t3, t2
+    LW a1, 0(t3)
+    SUB a3, s1, t5
+    ADD a1, a1, a3
     MV a2, s2
-    LA t0, active_window
-    LW t1, 0(t0)
     LI t2, 1
     BEQ t1, t2, c_calc
     LI t2, 2
@@ -1080,27 +1386,114 @@ chk_col2:
     J ev_next
 
 ev_move:
-    ; a1 = X, a2 = Y, a3 = button
-    ; If left button is held down (a3 == 1) and Paint is active:
+    ; Pointer capture keeps dragging active until an explicit release event.
+    LA t0, drag_active
+    LW t1, 0(t0)
+    BEQ t1, zero, ev_move_paint
+    LA t0, drag_window
+    LW t1, 0(t0)
+    LI t2, 1
+    BLT t1, t2, ev_cancel_drag
+    LI t2, 7
+    BGT t1, t2, ev_cancel_drag
+    ADDI t2, t1, -1
+    SLLI t2, t2, 2
+    LA t0, win_flags
+    ADD t0, t0, t2
+    LW t3, 0(t0)
+    ANDI t3, t3, 3
+    LI t4, 1
+    BNE t3, t4, ev_cancel_drag
+    LA t0, drag_off_x
+    LW t3, 0(t0)
+    SUB t3, a1, t3
+    BGE t3, zero, drag_x_nonneg
+    LI t3, 0
+drag_x_nonneg:
+    LA t0, win_w
+    ADD t0, t0, t2
+    LW t4, 0(t0)
+    LI t5, 800
+    SUB t5, t5, t4
+    BLE t3, t5, drag_x_ok
+    MV t3, t5
+drag_x_ok:
+    LA t0, win_x
+    ADD t0, t0, t2
+    SW t3, 0(t0)
+    LA t0, drag_off_y
+    LW t3, 0(t0)
+    SUB t3, a2, t3
+    LI t4, 28
+    BGE t3, t4, drag_y_top_ok
+    MV t3, t4
+drag_y_top_ok:
+    LA t0, win_h
+    ADD t0, t0, t2
+    LW t4, 0(t0)
+    LI t5, 568
+    SUB t5, t5, t4
+    BLE t3, t5, drag_y_ok
+    MV t3, t5
+drag_y_ok:
+    LA t0, win_y
+    ADD t0, t0, t2
+    SW t3, 0(t0)
+    CALL flag_redraw
+    J ev_next
+ev_cancel_drag:
+    LA t0, drag_active
+    SW zero, 0(t0)
+    J ev_next
+ev_move_paint:
+    ; Paint receives drag only inside its own moved client/canvas mapping.
     LA t0, active_window
     LW t1, 0(t0)
     LI t2, 4
     BNE t1, t2, ev_next
     LI t2, 1
     BNE a3, t2, ev_next
-    MV a0, a1
-    MV a1, a2
+    LI t2, 3
+    SLLI t2, t2, 2
+    LA t0, win_x
+    ADD t0, t0, t2
+    LW t3, 0(t0)
+    LA t0, win_y
+    ADD t0, t0, t2
+    LW t4, 0(t0)
+    LA t0, win_w
+    ADD t0, t0, t2
+    LW t5, 0(t0)
+    BLT a1, t3, ev_next
+    ADD t5, t5, t3
+    BGE a1, t5, ev_next
+    LA t0, win_h
+    ADD t0, t0, t2
+    LW t5, 0(t0)
+    BLT a2, t4, ev_next
+    ADD t5, t5, t4
+    BGE a2, t5, ev_next
+    SUB a0, a1, t3
+    LI t5, 60
+    ADD a0, a0, t5
+    SUB a1, a2, t4
+    LI t5, 35
+    ADD a1, a1, t5
     CALL paint_on_drag
+    J ev_next
+
+ev_release:
+    LA t0, drag_active
+    SW zero, 0(t0)
     J ev_next
 
 ev_timer:
     ; Host timer (50 ms): advance clock and snake
     CALL flag_redraw
-    LA t0, active_window
-    LW t1, 0(t0)
-    LI t2, 6
-    BEQ t1, t2, t_snake
-    J ev_next
+    LA t0, win_flags
+    LW t1, 20(t0)
+    ANDI t1, t1, 1
+    BEQ t1, zero, ev_next
 t_snake:
     CALL snake_on_timer
     J ev_next
@@ -1117,91 +1510,238 @@ ev_done:
     ADDI sp, sp, 48
     RET
 
-window_open:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
+wm_init:
+    LA t0, win_z_count
+    SW zero, 0(t0)
     LA t0, active_window
-    SW a0, 0(t0)
+    SW zero, 0(t0)
+    LA t0, drag_active
+    SW zero, 0(t0)
+    RET
+
+; Move a0 to the top, adding it when first opened.
+wm_raise:
+    ADDI sp, sp, -32
+    SD s0, 24(sp)
+    SD s1, 16(sp)
+    MV s0, a0
+    LI t0, 1
+    BLT s0, t0, wmr_invalid
+    LI t0, 7
+    BGT s0, t0, wmr_invalid
+    LA t0, win_z_count
+    LW t1, 0(t0)
+    LI t2, 7
+    BLE t1, t2, wmr_count_ok
+    MV t1, t2
+wmr_count_ok:
+    LI t2, 0
+    LI t3, 0
+    LA t4, win_z_order
+wmr_scan:
+    BGE t2, t1, wmr_append
+    ADD t5, t4, t2
+    LBU t6, 0(t5)
+    BEQ t6, s0, wmr_found
+    ADD t5, t4, t3
+    SB t6, 0(t5)
+    ADDI t3, t3, 1
+    J wmr_step
+wmr_found:
+    LI s1, 1
+wmr_step:
+    ADDI t2, t2, 1
+    J wmr_scan
+wmr_append:
+    ADD t5, t4, t3
+    SB s0, 0(t5)
+    ADDI t3, t3, 1
+    SW t3, 0(t0)
+    LA t0, active_window
+    SW s0, 0(t0)
+wmr_invalid:
+    LD s1, 16(sp)
+    LD s0, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+window_open:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    LI t0, 1
+    BLT s0, t0, wo_done
+    LI t0, 7
+    BGT s0, t0, wo_done
+    ADDI t0, s0, -1
+    SLLI t0, t0, 2
+    LA t1, win_flags
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    ANDI t3, t2, 4
+    BNE t3, zero, wo_initialized
+    ORI t2, t2, 4
+    SW t2, 0(t1)
+    LI t3, 1
+    BEQ s0, t3, wo_init_calc
+    LI t3, 2
+    BEQ s0, t3, wo_init_note
+    LI t3, 4
+    BEQ s0, t3, wo_init_paint
+    LI t3, 6
+    BEQ s0, t3, wo_init_snake
+    LI t3, 7
+    BEQ s0, t3, wo_init_term
+    J wo_initialized
+wo_init_calc:
+    CALL calc_init
+    J wo_initialized
+wo_init_note:
+    CALL notepad_init
+    J wo_initialized
+wo_init_paint:
+    CALL paint_init
+    J wo_initialized
+wo_init_snake:
+    CALL snake_init
+    J wo_initialized
+wo_init_term:
+    CALL terminal_init
+wo_initialized:
+    ADDI t0, s0, -1
+    SLLI t0, t0, 2
+    LA t1, win_flags
+    ADD t1, t1, t0
+    LW t2, 0(t1)
+    ORI t2, t2, 1
+    ANDI t2, t2, -3
+    SW t2, 0(t1)
+    MV a0, s0
+    CALL wm_raise
     LA t0, start_menu_open
     SW zero, 0(t0)
-
-    LI t1, 1
-    BEQ a0, t1, wo_calc
-    LI t1, 2
-    BEQ a0, t1, wo_notes
-    LI t1, 3
-    BEQ a0, t1, wo_files
-    LI t1, 4
-    BEQ a0, t1, wo_paint
-    LI t1, 5
-    BEQ a0, t1, wo_info
-    LI t1, 6
-    BEQ a0, t1, wo_snake
-    LI t1, 7
-    BEQ a0, t1, wo_term
-    J wo_done
-
-wo_calc:
-    LI t1, 240
-    LI t2, 70
-    LI t3, 320
-    LI t4, 440
-    J wo_store
-wo_notes:
-    LI t1, 80
-    LI t2, 45
-    LI t3, 640
-    LI t4, 500
-    J wo_store
-wo_files:
-    LI t1, 100
-    LI t2, 60
-    LI t3, 600
-    LI t4, 460
-    J wo_store
-wo_paint:
-    LI t1, 60
-    LI t2, 35
-    LI t3, 680
-    LI t4, 520
-    J wo_store
-wo_info:
-    LI t1, 120
-    LI t2, 70
-    LI t3, 560
-    LI t4, 440
-    J wo_store
-wo_snake:
-    LI t1, 120
-    LI t2, 50
-    LI t3, 560
-    LI t4, 490
-    J wo_store
-wo_term:
-    LI t1, 100
-    LI t2, 60
-    LI t3, 600
-    LI t4, 460
-    J wo_store
-
-wo_store:
-    LA t0, cur_win_x
-    SW t1, 0(t0)
-    LA t0, cur_win_y
-    SW t2, 0(t0)
-    LA t0, cur_win_w
-    SW t3, 0(t0)
-    LA t0, cur_win_h
-    SW t4, 0(t0)
-
-wo_done:
     CALL flag_redraw
-    ; Window open tone (freq=1000, dur=30, wave=0, vol=140)
     LI a0, 1000
     LI a1, 30
     LI a2, 0
     LI a3, 140
     CALL sound_play_tone
+wo_done:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; Choose the highest non-minimized open window.
+wm_activate_top:
+    LA t0, win_z_count
+    LW t1, 0(t0)
+    LI t2, 7
+    BLE t1, t2, wmat_loop
+    MV t1, t2
+wmat_loop:
+    ADDI t1, t1, -1
+    BLT t1, zero, wmat_none
+    LA t2, win_z_order
+    ADD t2, t2, t1
+    LBU t3, 0(t2)
+    LI t4, 1
+    BLT t3, t4, wmat_loop
+    LI t4, 7
+    BGT t3, t4, wmat_loop
+    ADDI t4, t3, -1
+    SLLI t4, t4, 2
+    LA t5, win_flags
+    ADD t5, t5, t4
+    LW t6, 0(t5)
+    ANDI t4, t6, 3
+    LI t5, 1
+    BNE t4, t5, wmat_loop
+    LA t0, active_window
+    SW t3, 0(t0)
+    RET
+
+; Select the next window in reverse stacking order, including minimized ones.
+wm_alt_tab:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    LA t0, win_z_count
+    LW t1, 0(t0)
+    BEQ t1, zero, walt_done
+    LA t2, active_window
+    LW s0, 0(t2)
+    LI s1, 7                 ; stale lists/IDs can never create an endless scan
+    LI t3, 1
+    BLT s0, t3, walt_wrap
+    LI t3, 7
+    BGT s0, t3, walt_wrap
+    BEQ s0, zero, walt_wrap
+walt_scan:
+    ADDI s1, s1, -1
+    BLT s1, zero, walt_none
+    ADDI s0, s0, -1
+    BNE s0, zero, walt_check
+walt_wrap:
+    LI s0, 7
+walt_check:
+    ADDI t4, s0, -1
+    SLLI t4, t4, 2
+    LA t5, win_flags
+    ADD t5, t5, t4
+    LW t6, 0(t5)
+    ANDI t3, t6, 1
+    BEQ t3, zero, walt_scan
+    ANDI t6, t6, -3
+    SW t6, 0(t5)
+    MV a0, s0
+    CALL wm_raise
+    CALL flag_redraw
+    J walt_done
+walt_none:
+    LA t0, active_window
+    SW zero, 0(t0)
+    CALL flag_redraw
+walt_done:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+wmat_none:
+    LA t0, active_window
+    SW zero, 0(t0)
+    RET
+
+window_minimize:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, active_window
+    LW t1, 0(t0)
+    BEQ t1, zero, wmin_done
+    LI t0, 1
+    BLT t1, t0, wmin_clear_active
+    LI t0, 7
+    BGT t1, t0, wmin_clear_active
+    ADDI t2, t1, -1
+    SLLI t2, t2, 2
+    LA t3, win_flags
+    ADD t3, t3, t2
+    LW t4, 0(t3)
+    ORI t4, t4, 2
+    SW t4, 0(t3)
+    LA t0, drag_active
+    SW zero, 0(t0)
+    CALL wm_activate_top
+    CALL flag_redraw
+    J wmin_done
+wmin_clear_active:
+    LA t0, active_window
+    SW zero, 0(t0)
+    CALL flag_redraw
+wmin_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -1210,22 +1750,49 @@ window_close:
     ADDI sp, sp, -16
     SD ra, 8(sp)
     LA t0, active_window
+    LW t6, 0(t0)
+    BEQ t6, zero, wc_done
+    LI t0, 1
+    BLT t6, t0, wc_clear_active
+    LI t0, 7
+    BGT t6, t0, wc_clear_active
+    ADDI t1, t6, -1
+    SLLI t1, t1, 2
+    LA t2, win_flags
+    ADD t2, t2, t1
+    LW t3, 0(t2)
+    ANDI t3, t3, -4
+    SW t3, 0(t2)
+    LA t0, win_z_count
+    LW t1, 0(t0)
+    LI t2, 0
+    LI t3, 0
+    LA t4, win_z_order
+wc_scan:
+    BGE t2, t1, wc_compact_done
+    ADD t5, t4, t2
+    LBU a0, 0(t5)
+    BEQ a0, t6, wc_skip
+    ADD t5, t4, t3
+    SB a0, 0(t5)
+    ADDI t3, t3, 1
+wc_skip:
+    ADDI t2, t2, 1
+    J wc_scan
+wc_compact_done:
+    SW t3, 0(t0)
+    LA t0, drag_active
     SW zero, 0(t0)
-    LA t0, cur_win_x
+    CALL wm_activate_top
+    CALL flag_redraw
+    J wc_done
+wc_clear_active:
+    LA t0, active_window
     SW zero, 0(t0)
-    LA t0, cur_win_y
-    SW zero, 0(t0)
-    LA t0, cur_win_w
-    SW zero, 0(t0)
-    LA t0, cur_win_h
+    LA t0, drag_active
     SW zero, 0(t0)
     CALL flag_redraw
-    ; Window close tone (freq=600, dur=30, wave=0, vol=140)
-    LI a0, 600
-    LI a1, 30
-    LI a2, 0
-    LI a3, 140
-    CALL sound_play_tone
+wc_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -2296,6 +2863,8 @@ notepad_init:
     SW zero, 0(t0)
     LA t0, note_cursor
     SW zero, 0(t0)
+    LA t0, note_dirty
+    SW zero, 0(t0)
     LA t0, note_file_idx
     SW zero, 0(t0)
     LA a0, note_cur_filename
@@ -2417,6 +2986,14 @@ notepad_draw:
 
     LI t2, 0
 np_txt_loop:
+    LA t3, note_cursor
+    LW t3, 0(t3)
+    BNE t2, t3, np_not_cursor_pos
+    LA t3, note_cur_col
+    SW t0, 0(t3)
+    LA t3, note_cur_row
+    SW t1, 0(t3)
+np_not_cursor_pos:
     BGE t2, s1, np_draw_cursor
     ADD t3, s0, t2
     LBU t3, 0(t3)
@@ -2427,6 +3004,16 @@ np_txt_loop:
     LA t4, one_char_buf
     SB t3, 0(t4)
     SB zero, 1(t4)
+    LI t5, 0xC0
+    BLT t3, t5, np_char_ready
+    ADDI t6, t2, 1
+    BGE t6, s1, np_char_ready
+    ADD t6, s0, t6
+    LBU t6, 0(t6)
+    SB t6, 1(t4)
+    SB zero, 2(t4)
+    ADDI t2, t2, 1
+np_char_ready:
     MV a0, t0
     MV a1, t1
     LA a2, one_char_buf
@@ -2450,8 +3037,10 @@ np_next_char:
     J np_txt_loop
 
 np_draw_cursor:
-    MV a0, t0
-    MV a1, t1
+    LA t0, note_cur_col
+    LW a0, 0(t0)
+    LA t0, note_cur_row
+    LW a1, 0(t0)
     LI a2, 2
     LI a3, 16
     LI a4, 0xFF38BDF8
@@ -2472,9 +3061,21 @@ notepad_on_key:
     BEQ a1, t0, np_do_save
     LI t0, 269               ; F10 (Open)
     BEQ a1, t0, np_do_open
+    LI t0, 19                ; Ctrl+S from terminal/X11 backends
+    BEQ a1, t0, np_do_save
 
     LI t0, 8                 ; Backspace
     BEQ a1, t0, np_do_bksp
+    LI t0, 272               ; Delete
+    BEQ a1, t0, np_do_delete
+    LI t0, 258               ; Left
+    BEQ a1, t0, np_do_left
+    LI t0, 259               ; Right
+    BEQ a1, t0, np_do_right
+    LI t0, 270               ; Home
+    BEQ a1, t0, np_do_home
+    LI t0, 271               ; End
+    BEQ a1, t0, np_do_end
     LI t0, 13                ; Enter
     BEQ a1, t0, np_do_enter
     LI t0, 10
@@ -2482,48 +3083,172 @@ notepad_on_key:
 
     LI t0, 32
     BLT a1, t0, np_key_ret
-    LI t0, 126
+    LI t0, 255
     BGT a1, t0, np_key_ret
-
+    LI t0, 127
+    BEQ a1, t0, np_key_ret
+np_insert_byte:
     LA t0, note_len
     LW t1, 0(t0)
     LI t2, 4000
     BGE t1, t2, np_key_ret
-    LA t2, note_buf
-    ADD t2, t2, t1
-    SB a1, 0(t2)
+    LA t2, note_cursor
+    LW t3, 0(t2)
+    LA t4, note_buf
+    MV t5, t1
+np_ins_shift:
+    BLT t5, t3, np_ins_store
+    ADD t6, t4, t5
+    LBU a0, 0(t6)
+    SB a0, 1(t6)
+    ADDI t5, t5, -1
+    J np_ins_shift
+np_ins_store:
+    ADD t4, t4, t3
+    SB a1, 0(t4)
     ADDI t1, t1, 1
     SW t1, 0(t0)
-    ADDI t2, t2, 1
-    SB zero, 0(t2)
+    ADDI t3, t3, 1
+    SW t3, 0(t2)
+    LA t0, note_dirty
+    LI t1, 1
+    SW t1, 0(t0)
     CALL flag_redraw
     J np_key_ret
 
 np_do_enter:
-    LA t0, note_len
+    LI a1, 10
+    J np_insert_byte
+
+np_do_bksp:
+    LA t0, note_cursor
     LW t1, 0(t0)
-    LI t2, 4000
-    BGE t1, t2, np_key_ret
-    LA t2, note_buf
-    ADD t2, t2, t1
-    LI t3, 10
-    SB t3, 0(t2)
-    ADDI t1, t1, 1
+    BEQ t1, zero, np_key_ret
+    ADDI t2, t1, -1
+    LA t3, note_buf
+np_bs_utf8:
+    BEQ t2, zero, np_bs_remove
+    ADD t4, t3, t2
+    LBU t5, 0(t4)
+    ANDI t5, t5, 0xC0
+    LI t6, 0x80
+    BNE t5, t6, np_bs_remove
+    ADDI t2, t2, -1
+    J np_bs_utf8
+np_bs_remove:
+    MV a0, t2               ; destination/new cursor
+    MV a1, t1               ; source
+    J np_remove_range
+
+np_do_delete:
+    LA t0, note_cursor
+    LW t1, 0(t0)
+    LA t2, note_len
+    LW t3, 0(t2)
+    BGE t1, t3, np_key_ret
+    ADDI t4, t1, 1
+    LA t5, note_buf
+np_del_utf8:
+    BGE t4, t3, np_del_go
+    ADD t6, t5, t4
+    LBU a0, 0(t6)
+    ANDI a0, a0, 0xC0
+    LI a1, 0x80
+    BNE a0, a1, np_del_go
+    ADDI t4, t4, 1
+    J np_del_utf8
+np_del_go:
+    MV a0, t1
+    MV a1, t4
+np_remove_range:
+    LA t2, note_len
+    LW t3, 0(t2)
+    LA t4, note_buf
+    MV t5, a0
+    MV t6, a1
+np_rm_shift:
+    BGT t6, t3, np_rm_done
+    ADD a2, t4, t6
+    LBU a3, 0(a2)
+    ADD a2, t4, t5
+    SB a3, 0(a2)
+    ADDI t5, t5, 1
+    ADDI t6, t6, 1
+    J np_rm_shift
+np_rm_done:
+    SUB t3, t3, a1
+    ADD t3, t3, a0
+    SW t3, 0(t2)
+    LA t0, note_cursor
+    SW a0, 0(t0)
+    LA t0, note_dirty
+    LI t1, 1
     SW t1, 0(t0)
-    ADDI t2, t2, 1
-    SB zero, 0(t2)
     CALL flag_redraw
     J np_key_ret
 
-np_do_bksp:
-    LA t0, note_len
+np_do_left:
+    LA t0, note_cursor
     LW t1, 0(t0)
     BEQ t1, zero, np_key_ret
     ADDI t1, t1, -1
-    SW t1, 0(t0)
     LA t2, note_buf
-    ADD t2, t2, t1
-    SB zero, 0(t2)
+np_left_utf8:
+    BEQ t1, zero, np_move_store
+    ADD t3, t2, t1
+    LBU t4, 0(t3)
+    ANDI t4, t4, 0xC0
+    LI t5, 0x80
+    BNE t4, t5, np_move_store
+    ADDI t1, t1, -1
+    J np_left_utf8
+np_do_right:
+    LA t0, note_cursor
+    LW t1, 0(t0)
+    LA t2, note_len
+    LW t3, 0(t2)
+    BGE t1, t3, np_key_ret
+    ADDI t1, t1, 1
+    LA t2, note_buf
+np_right_utf8:
+    BGE t1, t3, np_move_store
+    ADD t4, t2, t1
+    LBU t5, 0(t4)
+    ANDI t5, t5, 0xC0
+    LI t6, 0x80
+    BNE t5, t6, np_move_store
+    ADDI t1, t1, 1
+    J np_right_utf8
+np_do_home:
+    LA t0, note_cursor
+    LW t1, 0(t0)
+    LA t2, note_buf
+np_home_loop:
+    BEQ t1, zero, np_move_store
+    ADDI t3, t1, -1
+    ADD t4, t2, t3
+    LBU t5, 0(t4)
+    LI t6, 10
+    BEQ t5, t6, np_move_store
+    MV t1, t3
+    J np_home_loop
+np_do_end:
+    LA t0, note_cursor
+    LW t1, 0(t0)
+    LA t2, note_len
+    LW t3, 0(t2)
+    LA t2, note_buf
+np_end_loop:
+    BGE t1, t3, np_move_store
+    ADD t4, t2, t1
+    LBU t5, 0(t4)
+    LI t6, 10
+    BEQ t5, t6, np_move_store
+    ADDI t1, t1, 1
+    J np_end_loop
+np_move_store:
+    LA t0, note_cursor
+    SW t1, 0(t0)
     CALL flag_redraw
     J np_key_ret
 
@@ -2582,6 +3307,11 @@ np_click_new:
     SW zero, 0(t0)
     LA t0, note_buf
     SB zero, 0(t0)
+    LA t0, note_cursor
+    SW zero, 0(t0)
+    LA t0, note_dirty
+    LI t1, 1
+    SW t1, 0(t0)
     LA a0, note_status_str
     LA a1, str_status_new
     CALL str_copy
@@ -2594,63 +3324,48 @@ np_click_ret:
     RET
 
 notepad_save_file:
-    ADDI sp, sp, -32
-    SD ra, 24(sp)
-    SD s0, 16(sp)
-
-    CALL fat16_read_dir
-
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
     LA a0, note_cur_filename
-    CALL fat16_find_file
-    BNE a0, zero, nps_has_ent
-
-    LA a0, fat16_dir_buf
-
-nps_has_ent:
-    MV s0, a0
     LA a1, note_buf
     LA t0, note_len
     LW a2, 0(t0)
-    CALL fat16_write_file
-
+    LI a3, 3                 ; create + truncate
+    LI a7, 34                ; SYS_FS_WRITE
+    ECALL
+    BLT a0, zero, nps_failed
     LA a0, note_status_str
     LA a1, str_status_saved
     CALL str_copy
-
-    LD s0, 16(sp)
-    LD ra, 24(sp)
-    ADDI sp, sp, 32
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    J nps_done
+nps_failed:
+    LA a0, note_status_str
+    LA a1, str_status_save_error
+    CALL str_copy
+nps_done:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
     RET
 
 notepad_open_file:
-    ADDI sp, sp, -32
-    SD ra, 24(sp)
-    SD s0, 16(sp)
-
-    CALL fat16_read_dir
-
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
     LA a0, note_cur_filename
-    CALL fat16_find_file
-    BNE a0, zero, npo_has_ent
-
-    LA a0, fat16_dir_buf
-
-npo_has_ent:
-    MV s0, a0
-    MV a0, s0
-    LA a1, note_cur_filename
-    CALL fat16_format_name
-
-    LHU a0, 26(s0)
-    LW a3, 28(s0)
-    LI t0, 4000
-    BLE a3, t0, npo_sz_ok
-    MV a3, t0
-npo_sz_ok:
+    LI a1, 0                 ; offset
     LA a1, note_buf
-    LI a2, 4000
-    CALL fat16_read_file
+    MV a2, a1
+    LI a1, 0
+    LI a3, 4000
+    LI a7, 33                ; SYS_FS_READ -> a0=read, a1=full size
+    ECALL
+    BLT a0, zero, npo_failed
+    LI t0, 4000
+    BGT a1, t0, npo_too_large
     LA t0, note_len
+    SW a0, 0(t0)
+    LA t0, note_cursor
     SW a0, 0(t0)
 
     LA t1, note_buf
@@ -2660,10 +3375,21 @@ npo_sz_ok:
     LA a0, note_status_str
     LA a1, str_status_opened
     CALL str_copy
-
-    LD s0, 16(sp)
-    LD ra, 24(sp)
-    ADDI sp, sp, 32
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    J npo_done
+npo_too_large:
+    LA a0, note_status_str
+    LA a1, str_status_too_large
+    CALL str_copy
+    J npo_done
+npo_failed:
+    LA a0, note_status_str
+    LA a1, str_status_open_error
+    CALL str_copy
+npo_done:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
     RET
 
 ; ==============================================================================
@@ -4168,6 +4894,46 @@ term_exec_cmd:
     CALL str_eq
     BNE a0, zero, tcmd_exit
 
+    LA a0, term_buf
+    LA a1, str_cmd_pwd
+    CALL str_eq
+    BNE a0, zero, tcmd_pwd
+
+    LA a0, term_buf
+    LA a1, str_cmd_ls
+    CALL str_eq
+    BNE a0, zero, tcmd_ls
+
+    ; Prefix command: run PATH
+    LA t0, term_buf
+    LBU t1, 0(t0)
+    LI t2, 114
+    BNE t1, t2, tcmd_unknown
+    LBU t1, 1(t0)
+    LI t2, 117
+    BNE t1, t2, tcmd_unknown
+    LBU t1, 2(t0)
+    LI t2, 110
+    BNE t1, t2, tcmd_unknown
+    LBU t1, 3(t0)
+    LI t2, 32
+    BNE t1, t2, tcmd_unknown
+    ADDI a0, t0, 4
+    LI a1, 0
+    LI a7, 40
+    ECALL
+    BLT a0, zero, tcmd_run_error
+    LA a0, term_out_buf
+    LA a1, str_term_run_ok
+    CALL str_copy
+    J tcmd_done
+tcmd_run_error:
+    LA a0, term_out_buf
+    LA a1, str_term_run_error
+    CALL str_copy
+    J tcmd_done
+
+tcmd_unknown:
     LA a0, term_out_buf
     LA a1, str_term_unknown
     CALL str_copy
@@ -4189,6 +4955,27 @@ tcmd_clear:
     J tcmd_done
 tcmd_exit:
     CALL window_close
+    J tcmd_done
+tcmd_pwd:
+    LA a0, term_out_buf
+    LA a1, str_root_path
+    CALL str_copy
+    J tcmd_done
+tcmd_ls:
+    LA a0, str_root_path
+    LI a1, 0
+    LA a2, term_dirent
+    LI a7, 35
+    ECALL
+    BLT a0, zero, tcmd_ls_empty
+    LA a0, term_out_buf
+    LA a1, term_dirent
+    CALL str_copy
+    J tcmd_done
+tcmd_ls_empty:
+    LA a0, term_out_buf
+    LA a1, str_term_ls_empty
+    CALL str_copy
 tcmd_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -4288,7 +5075,11 @@ sound_play_tone:
 str_top_title:
     .string "[ DimonOS-64 ]"
 str_top_apps:
-    .string "[1] Calculator  [2] Notepad  [3] Files  [4] Paint  [5] Info  [6] Snake  [7] Terminal"
+    .string "F1 Menu   1-7 Launch   Alt+Tab Switch"
+str_rtc_unavailable:
+    .string "RTC N/A"
+str_system_halted:
+    .string "System halted. You may close QEMU."
 str_start_btn:
     .string "[ START ]"
 str_wname_desk:
@@ -4311,6 +5102,22 @@ str_task_hint:
     .string "F1: Menu | ESC: Close Win"
 str_close_x:
     .string "X"
+str_minimize:
+    .string "-"
+str_short_calc:
+    .string "Calc"
+str_short_note:
+    .string "Notepad"
+str_short_files:
+    .string "Files"
+str_short_paint:
+    .string "Paint"
+str_short_info:
+    .string "Info"
+str_short_snake:
+    .string "Snake"
+str_short_term:
+    .string "Terminal"
 
 str_sm_title:
     .string "DimonOS Applications"
@@ -4332,19 +5139,19 @@ str_sm_exit:
     .string "X. Exit OS"
 
 str_ico_calc:
-    .string "[1] Calculator"
+    .string "Calculator"
 str_ico_note:
-    .string "[2] Notepad"
+    .string "Notepad"
 str_ico_disk:
-    .string "[3] Files"
+    .string "Files"
 str_ico_paint:
-    .string "[4] Paint"
+    .string "Paint"
 str_ico_info:
-    .string "[5] SysInfo"
+    .string "System Info"
 str_ico_snake:
-    .string "[6] Snake"
+    .string "Snake"
 str_ico_term:
-    .string "[7] Terminal CLI"
+    .string "Terminal"
 
 str_calc_title:
     .string "Calculator - 64-bit TrueColor"
@@ -4395,6 +5202,12 @@ str_status_opened:
     .string "FAT16: Loaded from Disk!"
 str_status_new:
     .string "FAT16: New document"
+str_status_save_error:
+    .string "Save failed (disk/name/I/O)"
+str_status_open_error:
+    .string "Open failed: file not found"
+str_status_too_large:
+    .string "Open refused: file exceeds 4000 bytes"
 str_sfs_f0:
     .string "notes.txt"
 str_sfs_f1:
@@ -4409,7 +5222,7 @@ str_file_title:
 str_fm_hdr:
     .string "FILENAME         CLUSTER  SIZE     ACTION"
 str_fm_open_btn:
-    .string "[Open in Notepad]"
+    .string "Open in Notepad"
 str_fm_empty:
     .string "(empty entry)"
 str_fm_nomount:
@@ -4467,11 +5280,19 @@ str_term_banner2:
 str_term_prompt:
     .string "dimon64:~$ "
 str_term_help_out:
-    .string "Commands: help  info  clear  exit"
+    .string "Commands: help info pwd ls run PATH clear exit"
 str_term_info_out:
     .string "DimonOS-64 Modern TrueColor LFB Kernel v3.0"
 str_term_unknown:
     .string "Unknown command. Type 'help'."
+str_term_run_ok:
+    .string "Application launched."
+str_term_run_error:
+    .string "Launch failed (missing/invalid DEXE or no slot)."
+str_term_ls_empty:
+    .string "Directory is empty or unavailable."
+str_root_path:
+    .string "/"
 str_cmd_help:
     .string "help"
 str_cmd_info:
@@ -4480,12 +5301,48 @@ str_cmd_clear:
     .string "clear"
 str_cmd_exit:
     .string "exit"
+str_cmd_pwd:
+    .string "pwd"
+str_cmd_ls:
+    .string "ls"
 
 worker_name:
     .string "worker"
 
     .align 4
 active_window:
+    .word 0
+win_z_count:
+    .word 0
+win_z_order:
+    .space 8
+    .align 4
+; bits: 0=open, 1=minimized, 2=initialized
+win_flags:
+    .word 0, 0, 0, 0, 0, 0, 0
+win_x:
+    .word 240, 80, 100, 60, 120, 120, 100
+win_y:
+    .word 70, 45, 60, 35, 70, 50, 60
+win_w:
+    .word 320, 640, 600, 680, 560, 560, 600
+win_h:
+    .word 440, 500, 460, 520, 440, 490, 460
+win_default_x:
+    .word 240, 80, 100, 60, 120, 120, 100
+win_default_y:
+    .word 70, 45, 60, 35, 70, 50, 60
+drag_active:
+    .word 0
+drag_window:
+    .word 0
+drag_off_x:
+    .word 0
+drag_off_y:
+    .word 0
+hit_window:
+    .word 0
+drawing_window:
     .word 0
 start_menu_open:
     .word 0
@@ -4519,6 +5376,8 @@ note_len:
     .word 0
 note_cursor:
     .word 0
+note_dirty:
+    .word 0
 note_file_idx:
     .word 0
 note_cur_col:
@@ -4526,7 +5385,7 @@ note_cur_col:
 note_cur_row:
     .word 0
 one_char_buf:
-    .space 4
+    .space 8
 note_status_str:
     .space 64
 
@@ -4565,6 +5424,8 @@ term_buf:
     .space 64
 term_out_buf:
     .space 128
+term_dirent:
+    .space 28
 
 ; Worker & Timer ticks
     .align 8

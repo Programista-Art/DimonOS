@@ -14,6 +14,18 @@ void *memcpy(void *dest, const void *src, size_t n);
 void *memmove(void *dest, const void *src, size_t n);
 size_t strlen(const char *s);
 int snprintf(char *str, size_t size, const char *format, ...);
+static inline int memcmp(const void *a, const void *b, size_t n) {
+    const unsigned char *x = (const unsigned char *)a, *y = (const unsigned char *)b;
+    for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    return 0;
+}
+static inline int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+static inline char *strcpy(char *dst, const char *src) {
+    char *out = dst; while ((*dst++ = *src++) != 0) {} return out;
+}
 static inline int abs(int v) { return v < 0 ? -v : v; }
 #endif
 
@@ -168,7 +180,22 @@ enum {
     DIMON64_SYS_GUI_DRAW_PIXEL    = 25, /* a0=x, a1=y, a2=color32 */
     DIMON64_SYS_GUI_DRAW_LINE     = 26, /* a0=x0, a1=y0, a2=x1, a3=y1, a4=color32 */
     DIMON64_SYS_GUI_BLIT          = 27, /* a0=dst_x, a1=dst_y, a2=w, a3=h, a4=src_addr */
-    DIMON64_SYS_MEMSET            = 28  /* a0=dst_addr, a1=val32, a2=count_words */
+    DIMON64_SYS_MEMSET            = 28, /* a0=dst_addr, a1=val32, a2=count_words */
+    DIMON64_SYS_RTC_GET           = 29, /* -> a0=Unix seconds, C=1 if unavailable */
+    DIMON64_SYS_PROC_INFO         = 30, /* a0=index, a1=Dimon64ProcInfo* -> 0/error */
+    DIMON64_SYS_PROC_KILL         = 31, /* a0=pid -> 0/error; pid 0 is protected */
+    DIMON64_SYS_FS_STAT           = 32, /* a0=path, a1=Dimon64DirEnt* */
+    DIMON64_SYS_FS_READ           = 33, /* a0=path,a1=offset,a2=buf,a3=cap -> bytes; a1=size */
+    DIMON64_SYS_FS_WRITE          = 34, /* a0=path,a1=buf,a2=len,a3=flags(create/truncate) */
+    DIMON64_SYS_FS_LIST           = 35, /* a0=dir,a1=index,a2=Dimon64DirEnt* */
+    DIMON64_SYS_FS_MKDIR          = 36, /* a0=path */
+    DIMON64_SYS_FS_REMOVE         = 37, /* a0=path; directories must be empty */
+    DIMON64_SYS_FS_RENAME         = 38, /* a0=old path,a1=new path */
+    DIMON64_SYS_FS_COPY           = 39, /* a0=source,a1=destination */
+    DIMON64_SYS_APP_EXEC          = 40, /* a0=path,a1=argument string -> pid/error */
+    DIMON64_SYS_GUI_SET_CONTEXT   = 41, /* a0=dx,a1=dy,a2=x,a3=y,a4=w,a5=h; w/h=0 resets */
+    DIMON64_SYS_GUI_TEXT_MEASURE  = 42, /* a0=UTF-8 string -> width in pixels */
+    DIMON64_SYS_GUI_TEXT_FIT      = 43  /* x,y,str,fg,bg,max_width; clips and ellipsizes */
 };
 
 /* Legacy aliases for assembly sources */
@@ -200,6 +227,21 @@ enum {
 #define SYS_GUI_DRAW_LINE DIMON64_SYS_GUI_DRAW_LINE
 #define SYS_GUI_BLIT DIMON64_SYS_GUI_BLIT
 #define SYS_MEMSET DIMON64_SYS_MEMSET
+#define SYS_RTC_GET DIMON64_SYS_RTC_GET
+#define SYS_PROC_INFO DIMON64_SYS_PROC_INFO
+#define SYS_PROC_KILL DIMON64_SYS_PROC_KILL
+#define SYS_FS_STAT DIMON64_SYS_FS_STAT
+#define SYS_FS_READ DIMON64_SYS_FS_READ
+#define SYS_FS_WRITE DIMON64_SYS_FS_WRITE
+#define SYS_FS_LIST DIMON64_SYS_FS_LIST
+#define SYS_FS_MKDIR DIMON64_SYS_FS_MKDIR
+#define SYS_FS_REMOVE DIMON64_SYS_FS_REMOVE
+#define SYS_FS_RENAME DIMON64_SYS_FS_RENAME
+#define SYS_FS_COPY DIMON64_SYS_FS_COPY
+#define SYS_APP_EXEC DIMON64_SYS_APP_EXEC
+#define SYS_GUI_SET_CONTEXT DIMON64_SYS_GUI_SET_CONTEXT
+#define SYS_GUI_TEXT_MEASURE DIMON64_SYS_GUI_TEXT_MEASURE
+#define SYS_GUI_TEXT_FIT DIMON64_SYS_GUI_TEXT_FIT
 #define SYSYIELD SYS_YIELD
 #define SYSSPAWN SYS_SPAWN
 #define SYSEXIT SYS_EXIT
@@ -215,6 +257,7 @@ enum {
 #define EVT_MOUSE_CLICK 2
 #define EVT_MOUSE_MOVE  3
 #define EVT_TIMER       4
+#define EVT_MOUSE_RELEASE 5
 
 /* Special keycodes */
 #define KEY_UP    256
@@ -231,6 +274,16 @@ enum {
 #define KEY_F8    267
 #define KEY_F9    268
 #define KEY_F10   269
+#define KEY_HOME  270
+#define KEY_END   271
+#define KEY_DELETE 272
+#define KEY_PGUP  273
+#define KEY_PGDN  274
+
+#define KEYMOD_SHIFT 0x01u
+#define KEYMOD_CTRL  0x02u
+#define KEYMOD_ALT   0x04u
+#define KEYMOD_META  0x08u
 
 #define VM_EVENT_QUEUE_SIZE 128
 
@@ -239,7 +292,50 @@ typedef struct {
     uint8_t  button; /* 1=left, 2=right, 0=none */
     uint16_t code;   /* keycode or mouse X (0..799) */
     uint16_t data;   /* mouse Y (0..599) */
+    uint8_t  modifiers; /* KEYMOD_* for keyboard and pointer events */
 } VMEvent;
+
+/* Stable guest-visible structures. Strings are UTF-8; FAT names are currently 8.3. */
+typedef struct {
+    char name[13];
+    uint8_t attributes;
+    uint8_t reserved[3];
+    uint32_t size;
+    uint32_t first_cluster;
+} Dimon64DirEnt;
+
+typedef struct {
+    uint64_t pid;
+    uint64_t state;
+    uint64_t memory_base;
+    uint64_t memory_size;
+    uint64_t cpu_steps;
+    uint64_t context_switches;
+    char name[16];
+    uint8_t essential;
+    uint8_t isolated;
+    uint8_t reserved[6];
+} Dimon64ProcInfo;
+
+#define DIMON64_EXEC_MAGIC "DEXE64\0"
+#define DIMON64_EXEC_VERSION 1u
+#define DIMON64_APP_BASE 0x02800000ULL
+#define DIMON64_APP_SLOT_SIZE 0x00100000ULL
+
+/* DEXE64 is little-endian: header, flat image, then uint32 relocation offsets.
+   Relocations identify assembler-emitted LUI+ADDI absolute-address pairs. */
+typedef struct {
+    uint8_t magic[8];
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t image_size;
+    uint32_t bss_size;
+    uint32_t entry_offset;
+    uint32_t memory_size;
+    uint32_t relocation_count;
+    uint32_t flags;
+    char name[16];
+} Dimon64ExecHeader;
 
 /* Disk / ISO image (DIMON-ISO): 512B sectors */
 #define DISK_SECTOR_SIZE 512
@@ -284,8 +380,15 @@ typedef struct {
     uint64_t stack_base;
     uint64_t stack_size;
     uint64_t sleep_until;
+    uint64_t memory_base;
+    uint64_t memory_size;
+    uint64_t cpu_steps;
+    uint64_t context_switches;
     char     name[16];
     uint8_t  used;
+    uint8_t  essential;
+    uint8_t  isolated;
+    int32_t  last_fault;
 } Dimon64Proc;
 
 typedef struct {
@@ -321,8 +424,16 @@ typedef struct {
     VMEvent  event_queue[VM_EVENT_QUEUE_SIZE];
     int      event_head;
     int      event_tail;
+    uint64_t event_owner_pid; /* foreground isolated app, 0 = desktop */
     uint8_t  gui_active;
     uint8_t  gui_dirty;
+    int32_t  draw_offset_x;
+    int32_t  draw_offset_y;
+    int32_t  draw_clip_x;
+    int32_t  draw_clip_y;
+    int32_t  draw_clip_w;
+    int32_t  draw_clip_h;
+    uint8_t  draw_context_active;
     void    (*gui_init_cb)(void *userdata);
     void    (*gui_flush_cb)(void *userdata);
     void    (*gui_poll_cb)(void *userdata);
@@ -341,6 +452,7 @@ typedef struct {
 /* GUI helpers */
 void vm_event_push(VM *vm, uint8_t type, uint16_t code, uint16_t data);
 void vm_event_push_ext(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button);
+void vm_event_push_mod(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button, uint8_t modifiers);
 int  vm_event_pop(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data);
 int  vm_event_pop_ext(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data, uint8_t *button);
 void vm_gui_draw_pixel(VM *vm, int x, int y, uint32_t color32);

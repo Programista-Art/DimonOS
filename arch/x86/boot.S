@@ -125,19 +125,25 @@ default_isr_stub:
     iretl
 
 # --- Embedded Assets ---
+#ifndef OS_IMAGE_PATH
+#define OS_IMAGE_PATH "os.bin"
+#endif
+#ifndef DISK_IMAGE_PATH
+#define DISK_IMAGE_PATH "dimon.iso"
+#endif
 .section .rodata
 .align 4
 .global _os_bin_start
 .global _os_bin_end
 _os_bin_start:
-    .incbin "os.bin"
+    .incbin OS_IMAGE_PATH
 _os_bin_end:
 
 .align 4
 .global _dimon_iso_start
 .global _dimon_iso_end
 _dimon_iso_start:
-    .incbin "dimon.iso"
+    .incbin DISK_IMAGE_PATH
 _dimon_iso_end:
 
 .section .note.GNU-stack,"",@progbits
