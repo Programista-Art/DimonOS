@@ -369,11 +369,11 @@ int vm_disk_attach(VM *vm, const char *path, int writable) {
     vm->disk_data = buf;
     vm->disk_sectors = sectors;
     if (writable) {
-        vm->disk_writable = 1;
-    } else {
         FILE *tf = fopen(path, "r+b");
         if (tf) { vm->disk_writable = 1; fclose(tf); }
         else { vm->disk_writable = 0; }
+    } else {
+        vm->disk_writable = 0;
     }
     strncpy(vm->disk_path, path, sizeof(vm->disk_path) - 1);
     return 0;

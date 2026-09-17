@@ -89,13 +89,17 @@ static int valid_char(unsigned char c) {
 }
 
 static int name83(const char *s, uint8_t out[11]) {
-    if (!s || !*s) return DFS_ERR_NAME;
+    if (!s) return DFS_ERR_NAME;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) return DFS_ERR_NAME;
     if (!strcmp(s, ".")) { memset(out, ' ', 11); out[0] = '.'; return DFS_OK; }
     if (!strcmp(s, "..")) { memset(out, ' ', 11); out[0] = out[1] = '.'; return DFS_OK; }
     memset(out, ' ', 11);
+    size_t slen = strlen(s);
+    while (slen > 0 && (s[slen - 1] == ' ' || s[slen - 1] == '\t')) slen--;
     int base = 0, ext = 0, seen_dot = 0;
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
         if (c == '.') {
             if (seen_dot || base == 0) return DFS_ERR_NAME;
             seen_dot = 1; continue;
@@ -128,17 +132,20 @@ static int dir_entry_at(Fat *f, Dir d, uint32_t slot, uint8_t **out) {
         *out = f->image + f->root_lba * 512u + slot * 32u;
         return DFS_OK;
     }
-    uint32_t per = f->cluster_bytes / 32u, guard = 0;
+    uint32_t per = f->cluster_bytes / 32u;
+    uint32_t clus_idx = slot / per;
+    uint32_t rem = slot % per;
     uint16_t c = d.cluster;
-    while (slot >= per) {
+    uint32_t guard = 0;
+    while (clus_idx--) {
         uint16_t next = fat_get(f, c);
         if (next >= FAT_EOC) return DFS_ERR_NOT_FOUND;
         if (next < 2 || next >= f->clusters + 2u || ++guard > f->clusters) return DFS_ERR_INVALID;
-        c = next; slot -= per;
+        c = next;
     }
     uint8_t *p = cluster_ptr(f, c);
     if (!p) return DFS_ERR_INVALID;
-    *out = p + slot * 32u;
+    *out = p + rem * 32u;
     return DFS_OK;
 }
 
@@ -191,10 +198,17 @@ static int split_parent(Fat *f, const char *path, Dir *parent, uint8_t leaf[11])
     while (n > 1 && (clean[n - 1] == '/' || clean[n - 1] == '\\')) clean[--n] = 0;
     char *slash = NULL;
     for (char *p = clean; *p; p++) if (*p == '/' || *p == '\\') slash = p;
-    const char *name = slash ? slash + 1 : clean;
-    if (slash) { if (slash == clean) slash[1] = 0; else *slash = 0; }
+    char name[260];
+    if (slash) {
+        strcpy(name, slash + 1);
+        if (slash == clean) clean[1] = 0;
+        else *slash = 0;
+    } else {
+        strcpy(name, clean);
+        strcpy(clean, "/");
+    }
     int rc = name83(name, leaf); if (rc) return rc;
-    return resolve_dir(f, slash ? clean : "/", parent);
+    return resolve_dir(f, clean, parent);
 }
 
 static int resolve_entry(Fat *f, const char *path, Dir *parent, uint8_t **entry) {

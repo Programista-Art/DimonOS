@@ -152,7 +152,11 @@ $(REG_OS): dimon-as os.asm | $(REG_BUILD)
 	./dimon-as os.asm -o $@ > $(REG_BUILD)/os.map
 
 $(REG_DISK): dimon-mkiso apps/snake.app | $(REG_BUILD)
-	./dimon-mkiso -o $@ apps/snake.app:SNAKE.APP --force > $(REG_BUILD)/mkiso.log
+	mkdir -p $(REG_BUILD)/fixtures
+	python3 -c "open('$(REG_BUILD)/fixtures/LARGE.TXT','wb').write(b'A'*4500); open('$(REG_BUILD)/fixtures/BADENC.BIN','wb').write(bytes([0xFF, 0xFE, 0xFD, 0xFC, 0x80, 0x81, 0xC0, 0xAF, 0xE0, 0x80])); open('$(REG_BUILD)/fixtures/sub_notes.txt','w').write('Subdirectory notes content\n')"
+	./dimon-mkiso -o $@ apps/snake.app:SNAKE.APP $(REG_BUILD)/fixtures/LARGE.TXT:LARGE.TXT $(REG_BUILD)/fixtures/BADENC.BIN:BADENC.BIN --force > $(REG_BUILD)/mkiso.log
+	./dimon-mkiso --mkdir $@ /DOCS >> $(REG_BUILD)/mkiso.log
+	./dimon-mkiso --add $@ $(REG_BUILD)/fixtures/sub_notes.txt:/DOCS/NOTES.TXT >> $(REG_BUILD)/mkiso.log
 
 $(REG_BUILD)/boot.o: arch/x86/boot.S $(REG_OS) $(REG_DISK) | $(REG_BUILD)
 	$(BM_CC) -DOS_IMAGE_PATH='"$(abspath $(REG_OS))"' -DDISK_IMAGE_PATH='"$(abspath $(REG_DISK))"' -c -o $@ arch/x86/boot.S
@@ -177,7 +181,7 @@ $(REG_ISO): $(REG_KERNEL) arch/x86/grub.cfg
 
 regression-artifacts: all apps $(REG_OS) $(REG_DISK) $(REG_ISO)
 
-regression-hosted: all $(REG_OS)
+regression-hosted: all apps $(REG_OS) $(REG_DISK)
 	python3 tests/desktop_regression.py --build-dir $(REG_BUILD)
 
 regression-x11: all $(REG_OS)

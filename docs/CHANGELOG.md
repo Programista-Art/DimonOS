@@ -4,6 +4,66 @@ This document chronologically tracks all changes for DimonVirtualCPU-64 and Dimo
 
 ---
 
+## [2026-09-17] - Fix Notepad Open and Save Workflow & FAT Shortname Validation
+
+- **Root-Cause Filesystem Fix (`dimonfs.c`)**:
+  - Fixed `split_parent()` root-path truncation bug where `slash == clean` caused `slash[1] = 0` to overwrite the first character of the filename (e.g. turning `"/NOTES.TXT"` into `"/\0OTES.TXT"`), causing root-directory file lookups to fail with `DFS_ERR_NOT_FOUND` or invalid name.
+  - Added leading and trailing whitespace trimming in `name83()` and `entry_usable()` volume label filtering.
+- **FAT Shortname Validation Routine (`os.asm`)**:
+  - Implemented shared `fat_validate_shortname` enforcing canonical FAT 8.3 rules with truthful user-facing error strings:
+    - Base name up to 8 characters (`Name exceeds 8 characters`).
+    - Extension up to 3 characters (`Extension exceeds 3 characters`).
+    - At most one dot (`Multiple dots not allowed`).
+    - Non-empty base name (`Missing base name`).
+    - Rejection of path separators in filename input (`No path separators in filename`).
+    - Rejection of invalid characters (`Invalid character in filename`).
+  - Whitespace-tolerant canonical 11-byte FAT shortname generation.
+- **Notepad Open & Save Improvements**:
+  - Default folder path initialized to `/` at root (never blank) and support for subdirectory navigation (e.g. `/DOCS/NOTES.TXT`).
+  - Staging buffer (`note_staging_buf`) and UTF-8 pre-validation preventing editor buffer clobbering when loading corrupt or oversized (>4000 B) files.
+  - Activation of Open dialog via Open button, Enter key, and list double-click.
+  - Case-insensitive filename matching (e.g. typing lowercase `notes.txt`).
+  - Mode 4 Overwrite confirmation modal dialog (`[Yes]` overwrites, `[No]` preserves Save As dialog & doc, `[Cancel]` dismisses).
+  - Truthful status reporting on read-only media (`Save failed: read-only disk`, document dirty marker `*` preserved, never reports "Saved").
+  - Fixed emulator read-only disk handling (`vm.c`, `vm_disk_attach`) ensuring `--disk-readonly` correctly sets `disk_writable = 0`.
+- **Automated Regressions (`tests/desktop_regression.py`)**:
+  - Added full automated suite for all 13 Notepad Open/Save test cases using real pointer and keyboard event paths with RAM and VRAM inspection.
+  - 100% test pass rate across `make test`, `make regression-hosted`, and `make regression-qemu`.
+
+---
+
+## [2026-09-17] - Native File Dialogs, Notepad Workflow, Explorer Dispatcher, Compact Taskbar & Fullscreen Emulator
+
+- **Native Modal Guest File Dialogs (`OpenDialog`, `SaveDialog`)**:
+  - Implemented Delphi-style modal guest file dialogs for FAT16 browsing with editable folder/path and filename fields.
+  - Keyboard & mouse list navigation, scrolling, single-click selection, double-click activation, text filter (*.TXT), and 8.3 name enforcement.
+  - Complete modal isolation: clicks and key events outside the dialog bounds are swallowed without bleeding into underlying windows.
+- **Coherent Notepad Document Workflow**:
+  - Support for untitled documents, modified indicator `*` in title bar upon edit.
+  - Save writes directly to the document path or triggers Save As when untitled.
+  - Save As validates existing files and prompts for overwrite confirmation.
+  - Save/Discard/Cancel dirty prompt on New, Open, Close, and OS Shutdown.
+  - Buffer limit (<4000 B) and valid UTF-8 validation before replacing document content.
+  - Full keyboard shortcuts: F2/F9/Ctrl+S (Save), F3 (Save As), F10/Ctrl+O (Open), Ctrl+N (New).
+- **File Explorer Metadata & Type Dispatcher**:
+  - Fixed initial 0 B file size bug using `SYS_FS_LIST`, formatting sizes as decimal B/KB/MB and directories as `<DIR>`.
+  - Replaced unconditional "Open in Notepad" with unified type dispatcher:
+    directories navigate into subfolders; `.TXT` files open in Notepad; `.APP` executables launch via `SYS_APP_EXEC` loader (e.g. `snake.app`); unsupported files report error status.
+  - Per-type action button labels (`[Open]`, `[Run]`, `[Edit]`, `[Info]`).
+- **Compact Taskbar**:
+  - Eliminated the unused reserved gap immediately to the right of Start.
+  - Open and minimized application buttons pack compactly starting at x=100 with stride 78.
+- **Hosted Virtual CPU Emulator Fullscreen Mode**:
+  - F11 fullscreen toggle and `--fullscreen`/`-f` CLI flags.
+  - Centered 4:3 letterboxed/pillarboxed viewport maintaining crisp nearest-neighbor bitmap text and scaled hardware cursor.
+  - Pointer coordinate mapping accounting for letterbox offsets, ignoring clicks in borders, and clearing capture on release and FocusOut.
+  - Discoverable window title with `[F11: Fullscreen]` and `[F11: Windowed]` indicators.
+- **Automated Verification**:
+  - Extended `tests/desktop_regression.py` and `tests/x11_regression.py` with test coverage for file dialogs, dirty workflow, Explorer metadata, compact taskbar, and F11 fullscreen toggle.
+  - Automated tests passing 100% across hosted headless, X11 with XTEST, and QEMU bare-metal.
+
+---
+
 ## [2026-09-17] - Multi-window regression repair
 
 - Fixed the minimize return-address loop that left the desktop unable to

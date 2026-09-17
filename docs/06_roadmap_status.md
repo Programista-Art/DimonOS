@@ -28,11 +28,31 @@
 
 - Shared validated FAT16 API: nested traversal, unbounded directory-chain
   enumeration, stat/read/create/truncate, mkdir, empty-directory deletion,
-  rename/move, file copy, allocation/release and explicit errors.
-- Notepad no longer falls back to the first entry. It rejects files above 4000
-  bytes without altering the buffer, reports save/open errors, and only clears
-  dirty state on success. Cursor-relative UTF-8 insertion, navigation,
-  Home/End, Backspace and Delete are implemented.
+  rename/move, file copy, allocation/release and explicit errors. Resolved
+  root-directory path truncation in `split_parent()` and filename whitespace handling.
+- Native Delphi-style modal guest file dialogs (`OpenDialog`, `SaveDialog`) browsing
+  FAT16 volumes with editable folder/path and filename fields, keyboard/mouse list
+  scrolling, text filter (*.TXT), root `/` path display, subdirectory navigation,
+  canonical 8.3 name enforcement (`fat_validate_shortname` with truthful errors),
+  and complete modal isolation.
+- Coherent Notepad document workflow: untitled documents by default, Save writes to
+  current path or opens Save As when untitled, Save As confirms overwrite via Mode 4 modal
+  if file exists (`[Yes]`, `[No]`, `[Cancel]`), title-bar modified indicator `*`,
+  Save/Discard/Cancel dirty prompt on New, Open, Close and Shutdown, 4000 byte buffer
+  enforcement, staging buffer and UTF-8 pre-validation preventing editor buffer clobbering,
+  truthful status reporting on read-only media (`Save failed: read-only disk`, dirty preserved),
+  and complete keyboard shortcuts (F2/F9/Ctrl+S, F3, F10/Ctrl+O, Ctrl+N).
+- File Explorer: correct non-zero decimal sizes (B/KB/MB) and `<DIR>` indicators on
+  the initial view via `SYS_FS_LIST`, directory navigation, per-type action buttons
+  (`[Open]`, `[Run]`, `[Edit]`, `[Info]`), and unified type dispatcher (.TXT to Notepad,
+  .APP to `SYS_APP_EXEC` loader, directories navigate, unsupported show error).
+- Compact taskbar: eliminated the unused reserved gap after Start; active and minimized
+  applications pack tightly from x=100 with stride 78.
+- Hosted X11 emulator fullscreen mode: F11 toggle, `--fullscreen`/`-f` CLI flags,
+  discoverable window title indicator, centered 4:3 letterboxed/pillarboxed viewport
+  preserving crisp bitmap font rendering and scaled hardware cursor, pointer coordinate
+  transformation ignoring clicks in letterbox borders and releasing capture on release/FocusOut,
+  and dynamic WM resize / `ConfigureNotify` handling without key desync.
 - Modifier-aware input, editing keys, UTF-8 byte entry and Polish glyphs.
 - A real wall-clock syscall; unavailable platforms display `RTC N/A`. Uptime
   remains available independently.
@@ -50,24 +70,28 @@
   pixels, text and blits are clipped by the VM, and mouse coordinates use the
   inverse transform. X11 and bare-metal PS/2 paths report release events and
   modifier state.
-- UTF-8 glyph measurement and fitted-text services. Desktop tiles, the bounded
-  seven-slot taskbar, top bar and window titles have explicit regions; titles
+- UTF-8 glyph measurement and fitted-text services. Desktop tiles, the compact
+  taskbar, top bar and window titles have explicit regions; titles
   use complete-glyph ellipsis and cannot overlap window controls.
 
 ## Not complete
 
-Explorer does not expose all shared operations or shared dialogs. Notepad lacks
-selection, clipboard, undo/redo, scrolling, Save As and unsaved-change prompts.
-Paint persistence/BMP/image viewer/shapes/fill/undo are absent. Terminal lacks
-general quoted parsing, cwd mutation, history/completion/scrollback and most
+Explorer does not expose write/delete/rename operations in GUI. Notepad lacks
+arbitrary selection/clipboard, undo/redo, and vertical scrolling for documents
+larger than one screen. Paint persistence/BMP/image viewer/shapes/fill/undo are absent.
+Terminal lacks general quoted parsing, cwd mutation, history/completion/scrollback and most
 file/process commands. Only Snake is a standalone DEXE64 app; the other apps
 still depend on desktop internals. System Info has not become a Task Manager UI,
 though the process API reports real metrics. Persistent Settings is absent.
 
 The seven desktop applications remain embedded modules with one instance each.
 The standalone DEXE64 display remains exclusive rather than being hosted in a
-managed desktop window. Arbitrary resizing/maximization and more than the fixed
-seven taskbar slots are outside this milestone.
+managed desktop window. Arbitrary window resizing/maximization is outside this milestone.
+
+Persistent storage on bare-metal across reboots requires an ATA/AHCI block driver;
+the standalone bare-metal ISO currently uses the embedded read-only root disk image
+(`vm.disk_writable = 0`), whereas the hosted emulator fully supports persistent
+FAT16 cluster and directory entry writes via `--disk-writable`.
 
 Isolation applies to DEXE64 apps. PID 0 and legacy `SPAWN` tasks remain shared
 for compatibility and must not be described as isolated.

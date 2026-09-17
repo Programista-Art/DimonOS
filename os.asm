@@ -32,6 +32,12 @@ boot:
     ; Initialize FAT16 on virtual disk if available
     CALL fat16_init
 
+    ; Initialize fm_cwd to "/"
+    LA t0, fm_cwd
+    LI t1, 47
+    SB t1, 0(t0)
+    SB zero, 1(t0)
+
     ; Apps initialize lazily when their window is first opened.
     CALL wm_init
 
@@ -144,8 +150,14 @@ rep_windows_done:
 check_start_menu_draw:
     LA t0, start_menu_open
     LW t1, 0(t0)
-    BEQ t1, zero, rep_flush
+    BEQ t1, zero, check_dlg_draw
     CALL desktop_draw_start_menu
+
+check_dlg_draw:
+    LA t0, dlg_active
+    LW t1, 0(t0)
+    BEQ t1, zero, rep_flush
+    CALL dlg_draw
 
 rep_flush:
     LI a7, 12
@@ -460,11 +472,12 @@ desktop_draw:
 ; Taskbar is composed last, so no window can cover it. Seven fixed 76-pixel
 ; slots fit between Start and the 136-pixel status area without overlap.
 desktop_draw_taskbar:
-    ADDI sp, sp, -48
-    SD ra, 40(sp)
-    SD s0, 32(sp)
-    SD s1, 24(sp)
-    SD s2, 16(sp)
+    ADDI sp, sp, -56
+    SD ra, 48(sp)
+    SD s0, 40(sp)
+    SD s1, 32(sp)
+    SD s2, 24(sp)
+    SD s3, 16(sp)
     LI a0, 0
     LI a1, 568
     LI a2, 800
@@ -486,11 +499,14 @@ desktop_draw_taskbar:
     LI a4, 0
     LI a7, 15
     ECALL
+    ; Compact taskbar: only open apps occupy buttons, packed from x=100.
+    ; taskbar_map[slot] -> window id; taskbar_count -> visible buttons.
     LI s0, 1
     LI s1, 100
+    LI s3, 0
 dtb_loop:
     LI t0, 8
-    BGE s0, t0, dtb_clock
+    BGE s0, t0, dtb_map_done
     ADDI t0, s0, -1
     SLLI t0, t0, 2
     LA t1, win_flags
@@ -498,6 +514,10 @@ dtb_loop:
     LW t2, 0(t1)
     ANDI t2, t2, 1
     BEQ t2, zero, dtb_next
+    LA t0, taskbar_map
+    ADD t0, t0, s3
+    SB s0, 0(t0)
+    ADDI s3, s3, 1
     LA t0, active_window
     LW t1, 0(t0)
     LI s2, 0xFF334155
@@ -524,10 +544,13 @@ dtb_color:
     LI a6, 16
     LI a7, 43
     ECALL
+    ADDI s1, s1, 78
 dtb_next:
     ADDI s0, s0, 1
-    ADDI s1, s1, 78
     J dtb_loop
+dtb_map_done:
+    LA t0, taskbar_count
+    SW s3, 0(t0)
 dtb_clock:
     CALL format_clock
     LI a0, 660
@@ -539,11 +562,12 @@ dtb_clock:
     LI a6, 16
     LI a7, 43
     ECALL
-    LD s2, 16(sp)
-    LD s1, 24(sp)
-    LD s0, 32(sp)
-    LD ra, 40(sp)
-    ADDI sp, sp, 48
+    LD s3, 16(sp)
+    LD s2, 24(sp)
+    LD s1, 32(sp)
+    LD s0, 40(sp)
+    LD ra, 48(sp)
+    ADDI sp, sp, 56
     RET
 
 ; ------------------------------------------------------------------------------
@@ -935,6 +959,12 @@ ev_poll_loop:
 
 ev_key:
     ; a1 = keycode
+    LA t0, dlg_active
+    LW t0, 0(t0)
+    BEQ t0, zero, ev_key_not_dlg
+    CALL dlg_on_key
+    J ev_next
+ev_key_not_dlg:
     ; Alt+Tab is global and is consumed before any application sees Tab.
     LI t0, 9
     BNE a1, t0, ev_key_not_alt_tab
@@ -1071,6 +1101,11 @@ esc_win:
     LA t0, active_window
     LW t1, 0(t0)
     BEQ t1, zero, ev_next
+    LI t2, 2
+    BNE t1, t2, esc_win_close
+    CALL notepad_request_close
+    BNE a0, zero, ev_next
+esc_win_close:
     CALL window_close
     J ev_next
 
@@ -1104,9 +1139,9 @@ sm_open_7:
     J ev_next
 
 do_quit_os:
-    LA t0, exit_requested
-    LI t1, 1
-    SW t1, 0(t0)
+    LA t0, start_menu_open
+    SW zero, 0(t0)
+    CALL notepad_request_shutdown
     J ev_done
 
 ev_click:
@@ -1122,6 +1157,16 @@ ev_click:
     LI a3, 160
     CALL sound_play_tone
 
+    LA t0, dlg_active
+    LW t0, 0(t0)
+    BEQ t0, zero, ev_click_not_dlg
+    MV a0, s0
+    MV a1, s1
+    MV a2, s2
+    CALL dlg_on_click
+    J ev_next
+ev_click_not_dlg:
+
     ; 1. Check Taskbar click (Y >= 568)
     LI t0, 568
     BLT s1, t0, chk_sm_click
@@ -1133,15 +1178,30 @@ ev_click:
     J toggle_menu
 
 chk_taskbar_tab:
-    ; Seven stable app slots. Empty slots do nothing; the active slot minimizes.
+    ; Compacted buttons: walk taskbar_map slots from x=100, stride 78.
+    ; Clicks in the 4px inter-button gap or past the last button do nothing.
     LI t0, 100
     BLT s0, t0, ev_next
-    LI t0, 646
-    BGT s0, t0, ev_next
-    ADDI t0, s0, -100
-    LI t1, 78
-    DIV t0, t0, t1
-    ADDI t0, t0, 1
+    LA t0, taskbar_count
+    LW t1, 0(t0)
+    LI t2, 0
+    LI t3, 100
+ctt_loop:
+    BGE t2, t1, ev_next
+    BLT s0, t3, ev_next
+    ADDI t4, t3, 74
+    BLT s0, t4, ctt_hit
+    ADDI t2, t2, 1
+    ADDI t3, t3, 78
+    J ctt_loop
+ctt_hit:
+    LA t4, taskbar_map
+    ADD t4, t4, t2
+    LBU t0, 0(t4)
+    LI t1, 1
+    BLT t0, t1, ev_next
+    LI t1, 7
+    BGT t0, t1, ev_next
     ADDI t1, t0, -1
     SLLI t1, t1, 2
     LA t2, win_flags
@@ -1282,6 +1342,8 @@ chw_scan:
     CALL flag_redraw
     J ev_next
 chw_close:
+    CALL notepad_request_close
+    BNE a0, zero, ev_next
     CALL window_close
     J ev_next
 chw_minimize:
@@ -1386,6 +1448,9 @@ chk_col2:
     J ev_next
 
 ev_move:
+    LA t0, dlg_active
+    LW t0, 0(t0)
+    BNE t0, zero, ev_next
     ; Pointer capture keeps dragging active until an explicit release event.
     LA t0, drag_active
     LW t1, 0(t0)
@@ -2867,8 +2932,9 @@ notepad_init:
     SW zero, 0(t0)
     LA t0, note_file_idx
     SW zero, 0(t0)
-    LA a0, note_cur_filename
-    LA a1, str_sfs_f0
+    ; Boot document: existing /NOTES.TXT destination (Save writes it back).
+    LA a0, note_path
+    LA a1, str_boot_note
     CALL str_copy
     CALL notepad_open_file
     LD ra, 8(sp)
@@ -2881,12 +2947,35 @@ notepad_draw:
     SD s0, 16(sp)
     SD s1, 8(sp)
 
+    ; Window title carries path + modified mark (fitted by the frame).
+    LA a0, note_title_buf
+    LA a1, str_note_title_base
+    CALL str_copy
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, np_title_untitled
+    LA a0, note_title_buf
+    LA a1, note_path
+    CALL str_append
+    J np_title_dirty
+np_title_untitled:
+    LA a0, note_title_buf
+    LA a1, str_note_untitled
+    CALL str_append
+np_title_dirty:
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, np_title_draw
+    LA a0, note_title_buf
+    LA a1, str_note_dirty_mark
+    CALL str_append
+np_title_draw:
     ; Window frame (X=80, Y=45, W=640, H=500)
     LI a0, 80
     LI a1, 45
     LI a2, 640
     LI a3, 500
-    LA a4, str_note_title
+    LA a4, note_title_buf
     CALL draw_window_frame
 
     ; Action Bar (X=80, Y=77, W=640, H=38, 0xFF242C3D)
@@ -2946,22 +3035,31 @@ notepad_draw:
     LI a7, 15
     ECALL
 
-    ; Filename text
-    LI a0, 380
+    ; Button [ Save As ] (X=375, Y=82, W=95, H=28, 0xFF7C3AED)
+    LI a0, 375
+    LI a1, 82
+    LI a2, 95
+    LI a3, 28
+    LI a4, 0xFF7C3AED
+    LI a7, 14
+    ECALL
+    LI a0, 383
     LI a1, 88
-    LA a2, note_cur_filename
-    LI a3, 0xFF38BDF8
+    LA a2, str_btn_saveas
+    LI a3, 0xFFFFFFFF
     LI a4, 0x00000000
     LI a7, 15
     ECALL
 
-    ; Status text
+    ; Status text (fitted; the path now lives in the window title).
     LI a0, 480
     LI a1, 88
     LA a2, note_status_str
     LI a3, 0xFF94A3B8
     LI a4, 0x00000000
-    LI a7, 15
+    LI a5, 225
+    LI a6, 16
+    LI a7, 43
     ECALL
 
     ; Text Editor Area: X=95, Y=125, W=610, H=400, 0xFF0F172A
@@ -3057,12 +3155,36 @@ notepad_on_key:
     ADDI sp, sp, -16
     SD ra, 8(sp)
 
+    ; Check KEYMOD_CTRL in a4 (bit 2: value 4)
+    ANDI t0, a4, 4
+    BEQ t0, zero, np_no_ctrl_mod
+    LI t0, 115               ; 's'
+    BEQ a1, t0, np_do_save
+    LI t0, 83                ; 'S'
+    BEQ a1, t0, np_do_save
+    LI t0, 111               ; 'o'
+    BEQ a1, t0, np_do_open
+    LI t0, 79                ; 'O'
+    BEQ a1, t0, np_do_open
+    LI t0, 110               ; 'n'
+    BEQ a1, t0, np_do_new
+    LI t0, 78                ; 'N'
+    BEQ a1, t0, np_do_new
+np_no_ctrl_mod:
+    LI t0, 14                ; Ctrl+N
+    BEQ a1, t0, np_do_new
+    LI t0, 261               ; F2 (Save)
+    BEQ a1, t0, np_do_save
+    LI t0, 262               ; F3 (Save As)
+    BEQ a1, t0, np_do_saveas
     LI t0, 268               ; F9 (Save)
     BEQ a1, t0, np_do_save
-    LI t0, 269               ; F10 (Open)
+    LI t0, 269               ; F10 (Open dialog)
     BEQ a1, t0, np_do_open
     LI t0, 19                ; Ctrl+S from terminal/X11 backends
     BEQ a1, t0, np_do_save
+    LI t0, 15                ; Ctrl+O opens the file dialog
+    BEQ a1, t0, np_do_open
 
     LI t0, 8                 ; Backspace
     BEQ a1, t0, np_do_bksp
@@ -3252,13 +3374,22 @@ np_move_store:
     CALL flag_redraw
     J np_key_ret
 
-np_do_save:
-    CALL notepad_save_file
+np_do_new:
+    CALL notepad_request_new
     CALL flag_redraw
     J np_key_ret
 
+np_do_saveas:
+    CALL dlg_show_saveas
+    CALL flag_redraw
+    J np_key_ret
+
+np_do_save:
+    CALL notepad_do_save
+    J np_key_ret
+
 np_do_open:
-    CALL notepad_open_file
+    CALL notepad_request_open_dlg
     CALL flag_redraw
     J np_key_ret
 
@@ -3290,31 +3421,29 @@ notepad_on_click:
     BLT a0, t0, np_click_ret
     LI t0, 365
     BLE a0, t0, np_do_save_c
+
+    LI t0, 375
+    BLT a0, t0, np_click_ret
+    LI t0, 470
+    BLE a0, t0, np_do_saveas_c
     J np_click_ret
 
 np_do_open_c:
-    CALL notepad_open_file
+    CALL notepad_request_open_dlg
     CALL flag_redraw
     J np_click_ret
 
 np_do_save_c:
-    CALL notepad_save_file
+    CALL notepad_do_save
+    J np_click_ret
+
+np_do_saveas_c:
+    CALL dlg_show_saveas
     CALL flag_redraw
     J np_click_ret
 
 np_click_new:
-    LA t0, note_len
-    SW zero, 0(t0)
-    LA t0, note_buf
-    SB zero, 0(t0)
-    LA t0, note_cursor
-    SW zero, 0(t0)
-    LA t0, note_dirty
-    LI t1, 1
-    SW t1, 0(t0)
-    LA a0, note_status_str
-    LA a1, str_status_new
-    CALL str_copy
+    CALL notepad_request_new
     CALL flag_redraw
     J np_click_ret
 
@@ -3323,83 +3452,25 @@ np_click_ret:
     ADDI sp, sp, 16
     RET
 
-notepad_save_file:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
-    LA a0, note_cur_filename
-    LA a1, note_buf
-    LA t0, note_len
-    LW a2, 0(t0)
-    LI a3, 3                 ; create + truncate
-    LI a7, 34                ; SYS_FS_WRITE
-    ECALL
-    BLT a0, zero, nps_failed
-    LA a0, note_status_str
-    LA a1, str_status_saved
-    CALL str_copy
-    LA t0, note_dirty
-    SW zero, 0(t0)
-    J nps_done
-nps_failed:
-    LA a0, note_status_str
-    LA a1, str_status_save_error
-    CALL str_copy
-nps_done:
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
-    RET
-
-notepad_open_file:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
-    LA a0, note_cur_filename
-    LI a1, 0                 ; offset
-    LA a1, note_buf
-    MV a2, a1
-    LI a1, 0
-    LI a3, 4000
-    LI a7, 33                ; SYS_FS_READ -> a0=read, a1=full size
-    ECALL
-    BLT a0, zero, npo_failed
-    LI t0, 4000
-    BGT a1, t0, npo_too_large
-    LA t0, note_len
-    SW a0, 0(t0)
-    LA t0, note_cursor
-    SW a0, 0(t0)
-
-    LA t1, note_buf
-    ADD t1, t1, a0
-    SB zero, 0(t1)
-
-    LA a0, note_status_str
-    LA a1, str_status_opened
-    CALL str_copy
-    LA t0, note_dirty
-    SW zero, 0(t0)
-    J npo_done
-npo_too_large:
-    LA a0, note_status_str
-    LA a1, str_status_too_large
-    CALL str_copy
-    J npo_done
-npo_failed:
-    LA a0, note_status_str
-    LA a1, str_status_open_error
-    CALL str_copy
-npo_done:
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
-    RET
+; (Legacy direct save/open bodies were replaced by the path-based
+; notepad_load_path / notepad_write_path service above.)
 
 ; ==============================================================================
-; Application 3: File Explorer (FAT16 Directory Viewer)
+; Application 3: File Explorer (shared FS_LIST model with validated sizes)
+;
+; The visible list is rebuilt from FS_LIST on every draw, so the first
+; completed listing already shows correct sizes (the old direct sector
+; reader lost its entry pointer across helper calls and showed zeros).
+; No sleeps or placeholder rows: FS_LIST skips deleted/empty entries.
+; Sizes render decimal B/KB/MB; folders show <DIR>, never a byte count.
 ; ==============================================================================
 fileman_draw:
-    ADDI sp, sp, -32
-    SD ra, 24(sp)
-    SD s0, 16(sp)
-    SD s1, 8(sp)
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    SD s3, 8(sp)
 
     LI a0, 100
     LI a1, 60
@@ -3408,125 +3479,466 @@ fileman_draw:
     LA a4, str_file_title
     CALL draw_window_frame
 
+    CALL fm_refresh
+
+    ; Current directory line (fitted, never overflows the frame).
     LI a0, 120
-    LI a1, 104
-    LA a2, str_fm_hdr
+    LI a1, 100
+    LA a2, fm_cwd
     LI a3, 0xFF38BDF8
+    LI a4, 0x00000000
+    LI a5, 430
+    LI a6, 16
+    LI a7, 43
+    ECALL
+
+    ; [Up] button (or "(top)" at the filesystem root).
+    LA t0, fm_cwd
+    LBU t1, 0(t0)
+    LI t2, 47
+    BNE t1, t2, fm_no_up
+    LBU t1, 1(t0)
+    BNE t1, zero, fm_no_up
+    LI a0, 570
+    LI a1, 96
+    LA a2, str_fm_top
+    LI a3, 0xFF64748B
     LI a4, 0x00000000
     LI a7, 15
     ECALL
-
-    LI a0, 120
-    LI a1, 124
-    LI a2, 560
-    LI a3, 1
+    J fm_after_up
+fm_no_up:
+    LI a0, 570
+    LI a1, 96
+    LI a2, 110
+    LI a3, 24
     LI a4, 0xFF334155
     LI a7, 14
     ECALL
-
-    CALL fat16_read_dir
-
-    LA t0, fat16_mounted
-    LW t0, 0(t0)
-    BNE t0, zero, fm_mounted_ok
-
-    LI a0, 120
-    LI a1, 140
-    LA a2, str_fm_nomount
-    LI a3, 0xFFEF4444
-    LI a4, 0x00000000
-    LI a7, 15
-    ECALL
-    J fm_draw_done
-
-fm_mounted_ok:
-    LI s0, 0
-    LI s1, 134
-fm_row_loop:
-    LI t0, 8
-    BGE s0, t0, fm_draw_done
-
-    SLLI t0, s0, 5
-    LA t1, fat16_dir_buf
-    ADD t1, t1, t0
-
-    LBU t2, 0(t1)
-    BEQ t2, zero, fm_free_entry
-    LI t3, 0xE5
-    BEQ t2, t3, fm_free_entry
-    LBU t3, 11(t1)
-    LI t4, 0x0F
-    BEQ t3, t4, fm_free_entry
-    ANDI t4, t3, 0x08
-    BNE t4, zero, fm_free_entry
-
-    MV a0, t1
-    LA a1, fm_name_buf
-    CALL fat16_format_name
-
-    LI a0, 120
-    MV a1, s1
-    LA a2, fm_name_buf
+    LI a0, 578
+    LI a1, 100
+    LA a2, str_fm_up
     LI a3, 0xFFFFFFFF
     LI a4, 0x00000000
     LI a7, 15
     ECALL
+fm_after_up:
 
-    LHU a0, 26(t1)
-    LA a1, num_tmp
-    CALL num_to_dec
-    LI a0, 280
-    MV a1, s1
-    LA a2, num_tmp
+    ; Column headers.
+    LI a0, 120
+    LI a1, 124
+    LA a2, str_fm_hdr_name
+    LI a3, 0xFF38BDF8
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 410
+    LI a1, 124
+    LA a2, str_fm_hdr_size
     LI a3, 0xFF38BDF8
     LI a4, 0x00000000
     LI a7, 15
     ECALL
 
-    LW a0, 28(t1)
-    LA a1, num_tmp
-    CALL num_to_dec
-    LI a0, 360
-    MV a1, s1
-    LA a2, num_tmp
-    LI a3, 0xFF34C759
-    LI a4, 0x00000000
-    LI a7, 15
-    ECALL
-
-    LI a0, 480
+    ; Rows: optional ".." parent row plus cached DirEnt entries.
+    LA t0, fm_cwd
+    LBU t1, 0(t0)
+    LI t2, 47
+    BNE t1, t2, fm_dotdot_no
+    LBU t1, 1(t0)
+    BEQ t1, zero, fm_dotdot_no
+    LI s3, 1
+    J fm_rows_begin
+fm_dotdot_no:
+    LI s3, 0
+fm_rows_begin:
+    LI s0, 0
+    LI s1, 146
+fm_row_loop:
+    LI t0, 8
+    BGE s0, t0, fm_status_line
+    LA t0, fm_scroll
+    LW t2, 0(t0)
+    ADD t2, t2, s0             ; visible row -> list position
+    BNE s3, zero, fm_row_mapped
+    LA t0, fm_count
+    LW t3, 0(t0)
+    BGE t2, t3, fm_draw_done2
+    J fm_row_draw_entry
+fm_row_mapped:
+    BEQ t2, zero, fm_row_dotdot
+    ADDI t2, t2, -1
+    LA t0, fm_count
+    LW t3, 0(t0)
+    BGE t2, t3, fm_draw_done2
+fm_row_draw_entry:
+    ; t2 = cache index. entry = fm_list_buf + t2*28.
+    LI t0, 28
+    MUL t0, t2, t0
+    LA t1, fm_list_buf
+    ADD s2, t1, t0             ; s2 = entry (callee-saved across calls)
+    LBU t0, 13(s2)             ; attributes
+    ANDI t0, t0, 0x10
+    BEQ t0, zero, fm_is_file
+    LA a2, str_fm_dir_tag
+    J fm_row_common
+fm_is_file:
+    LW a0, 20(s2)              ; size (32-bit, validated by FS_LIST)
+    LA a1, fm_size_buf
+    CALL fmt_size
+    LA a2, fm_size_buf
+fm_row_common:
+    ; Selection highlight behind name+size columns.
+    LA t0, fm_sel
+    LW t1, 0(t0)
+    LA t0, fm_scroll
+    LW t3, 0(t0)
+    ADD t3, t3, s0
+    BNE t1, t3, fm_no_hl
+    LI a0, 115
     MV a1, s1
     ADDI a1, a1, -2
-    LI a2, 140
-    LI a3, 20
+    LI a2, 415
+    LI a3, 24
+    LI a4, 0xFF1E3A8A
+    LI a7, 14
+    ECALL
+fm_no_hl:
+    ; Name (fitted to its column).
+    LI a0, 120
+    MV a1, s1
+    ADDI a2, s2, 0             ; entry name
+    LBU t0, 13(s2)
+    ANDI t0, t0, 0x10
+    LI a3, 0xFF38BDF8
+    BEQ t0, zero, fm_name_col
+    LI a3, 0xFFFFFFFF
+fm_name_col:
+    LI a4, 0x00000000
+    LI a5, 275
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Size / <DIR> tag.
+    LI a0, 410
+    MV a1, s1
+    LBU t0, 13(s2)
+    ANDI t0, t0, 0x10
+    BNE t0, zero, fm_draw_dir_tag
+    LA a2, fm_size_buf
+    J fm_draw_size_txt
+fm_draw_dir_tag:
+    LA a2, str_fm_dir_tag
+fm_draw_size_txt:
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a5, 120
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Action button with per-type label.
+    LI a0, 545
+    MV a1, s1
+    ADDI a1, a1, -2
+    LI a2, 135
+    LI a3, 24
     LI a4, 0xFF2563EB
     LI a7, 14
     ECALL
-    LI a0, 490
+    LBU t0, 13(s2)
+    ANDI t0, t0, 0x10
+    BNE t0, zero, fm_btn_open
+    ADDI a0, s2, 0
+    LA a1, str_ext_app
+    CALL ext_is
+    BNE a0, zero, fm_btn_run
+    ADDI a0, s2, 0
+    LA a1, str_ext_txt
+    CALL ext_is
+    BNE a0, zero, fm_btn_edit
+    LA a2, str_fm_info_btn
+    J fm_btn_draw
+fm_btn_run:
+    LA a2, str_fm_run_btn
+    J fm_btn_draw
+fm_btn_edit:
+    LA a2, str_fm_edit_btn
+    J fm_btn_draw
+fm_btn_open:
+    LA a2, str_fm_open_btn2
+fm_btn_draw:
+    LI a0, 555
     MV a1, s1
-    LA a2, str_fm_open_btn
     LI a3, 0xFFFFFFFF
     LI a4, 0x00000000
     LI a7, 15
     ECALL
     J fm_next_row
 
-fm_free_entry:
+fm_row_dotdot:
+    ; Synthetic parent row (".." / "<UP>").
+    LA t0, fm_sel
+    LW t1, 0(t0)
+    LA t0, fm_scroll
+    LW t3, 0(t0)
+    ADD t3, t3, s0
+    BNE t1, t3, fm_dd_nohl
+    LI a0, 115
+    MV a1, s1
+    ADDI a1, a1, -2
+    LI a2, 415
+    LI a3, 24
+    LI a4, 0xFF1E3A8A
+    LI a7, 14
+    ECALL
+fm_dd_nohl:
     LI a0, 120
     MV a1, s1
-    LA a2, str_fm_empty
-    LI a3, 0xFF64748B
+    LA a2, str_dotdot
+    LI a3, 0xFFFFFFFF
     LI a4, 0x00000000
     LI a7, 15
     ECALL
+    LI a0, 410
+    MV a1, s1
+    LA a2, str_fm_up_tag
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 545
+    MV a1, s1
+    ADDI a1, a1, -2
+    LI a2, 135
+    LI a3, 24
+    LI a4, 0xFF2563EB
+    LI a7, 14
+    ECALL
+    LI a0, 555
+    MV a1, s1
+    LA a2, str_fm_open_btn2
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    J fm_next_row
 
 fm_next_row:
     ADDI s0, s0, 1
-    ADDI s1, s1, 36
+    ADDI s1, s1, 30
     J fm_row_loop
 
+fm_status_line:
+    J fm_draw_status
+fm_draw_done2:
+    ; Fewer entries than rows: fall through to the status line.
+fm_draw_status:
+    LI a0, 120
+    LI a1, 392
+    LA a2, fm_status
+    LI a3, 0xFFEF4444
+    LI a4, 0x00000000
+    LI a5, 560
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    LI a0, 120
+    LI a1, 414
+    LA a2, str_fm_hint
+    LI a3, 0xFF64748B
+    LI a4, 0x00000000
+    LI a5, 560
+    LI a6, 16
+    LI a7, 43
+    ECALL
 fm_draw_done:
-    LD s1, 8(sp)
+    LD s3, 8(sp)
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; fm_refresh: enumerate fm_cwd via FS_LIST into fm_list_buf (max 32).
+; Preserves s0-s3. Clobbers a/t regs.
+fm_refresh:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    SD s3, 8(sp)
+    ; Lazy root init: an all-zero cwd behaves as "/" everywhere.
+    LA t0, fm_cwd
+    LBU t1, 0(t0)
+    BNE t1, zero, fr_have_cwd
+    LI t1, 47
+    SB t1, 0(t0)
+    SB zero, 1(t0)
+fr_have_cwd:
+    LI s0, 0
+    LI s1, 0
+fr_loop:
+    LI t0, 32
+    BGE s0, t0, fr_done
+    LA a0, fm_cwd
+    MV a1, s1
+    LI t0, 28
+    MUL t0, s0, t0
+    LA t1, fm_list_buf
+    ADD a2, t1, t0
+    LI a7, 35
+    ECALL
+    BLT a0, zero, fr_done
+    ADDI s1, s1, 1
+    ; Skip "." and ".."
+    LBU t2, 0(a2)
+    LI t3, 46                ; '.'
+    BNE t2, t3, fr_keep
+    LBU t4, 1(a2)
+    BEQ t4, zero, fr_loop    ; "." -> skip
+    BNE t4, t3, fr_keep
+    LBU t5, 2(a2)
+    BEQ t5, zero, fr_loop    ; ".." -> skip
+fr_keep:
+    ADDI s0, s0, 1
+    J fr_loop
+fr_done:
+    LA t0, fm_count
+    SW s0, 0(t0)
+    ; Clamp selection and scroll to the visible range.
+    LA t0, fm_sel
+    LW t1, 0(t0)
+    LA t2, fm_cwd
+    LBU t3, 0(t2)
+    LI t4, 47
+    BNE t3, t4, fr_nodot
+    LBU t3, 1(t2)
+    BEQ t3, zero, fr_nodot
+    ADDI s0, s0, 1             ; ".." occupies position 0
+fr_nodot:
+    BEQ s0, zero, fr_empty
+    BGE t1, s0, fr_sel_end
+    BLT t1, zero, fr_sel_zero
+    J fr_scroll
+fr_sel_end:
+    ADDI t1, s0, -1
+    SW t1, 0(t0)
+    J fr_scroll
+fr_sel_zero:
+    SW zero, 0(t0)
+    J fr_scroll
+fr_empty:
+    SW zero, 0(t0)
+fr_scroll:
+    LA t0, fm_scroll
+    LW t1, 0(t0)
+    BLT t1, zero, fr_scr_zero
+    LA t2, fm_sel
+    LW t2, 0(t2)
+    BLT t2, t1, fr_scr_sel
+    ADDI t3, t1, 8
+    BGE t2, t3, fr_scr_sel8
+    J fr_ret
+fr_scr_sel:
+    SW t2, 0(t0)
+    J fr_ret
+fr_scr_sel8:
+    ADDI t2, t2, -7
+    SW t2, 0(t0)
+    J fr_ret
+fr_scr_zero:
+    SW zero, 0(t0)
+fr_ret:
+    LD s3, 8(sp)
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; fm_visible_count: -> a0 = rows incl. synthetic ".." when not at root.
+fm_visible_count:
+    LA t0, fm_count
+    LW a0, 0(t0)
+    LA t1, fm_cwd
+    LBU t2, 0(t1)
+    LI t3, 47
+    BNE t2, t3, fvc_ret
+    LBU t2, 1(t1)
+    BEQ t2, zero, fvc_ret
+    ADDI a0, a0, 1
+fvc_ret:
+    RET
+
+; fm_row_entry: a0=visible row -> a0=cache index, or -1 for "..", -2 invalid.
+fm_row_entry:
+    LA t0, fm_cwd
+    LBU t1, 0(t0)
+    LI t2, 47
+    BNE t1, t2, fre_plain
+    LBU t1, 1(t0)
+    BNE t1, zero, fre_dot
+fre_plain:
+    LA t1, fm_count
+    LW t1, 0(t1)
+    BGE a0, t1, fre_bad
+    RET
+fre_dot:
+    BEQ a0, zero, fre_isdot
+    ADDI a0, a0, -1
+    LA t1, fm_count
+    LW t1, 0(t1)
+    BGE a0, t1, fre_bad
+    RET
+fre_isdot:
+    LI a0, -1
+    RET
+fre_bad:
+    LI a0, -2
+    RET
+
+; fm_select_row: a0=row -> clamp into range, store, redraw flag.
+fm_select_row:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    CALL fm_visible_count
+    BEQ a0, zero, fsr_ret
+    BLT s0, zero, fsr_zero
+    BGE s0, a0, fsr_end
+    LA t0, fm_sel
+    SW s0, 0(t0)
+    J fsr_scroll
+fsr_end:
+    ADDI t0, a0, -1
+    LA t1, fm_sel
+    SW t0, 0(t1)
+    J fsr_scroll
+fsr_zero:
+    LA t0, fm_sel
+    SW zero, 0(t0)
+fsr_scroll:
+    LA t0, fm_scroll
+    LW t1, 0(t0)
+    LA t2, fm_sel
+    LW t2, 0(t2)
+    BLT t2, t1, fsr_scr
+    ADDI t3, t1, 8
+    BGE t2, t3, fsr_scr8
+    J fsr_flag
+fsr_scr:
+    SW t2, 0(t0)
+    J fsr_flag
+fsr_scr8:
+    ADDI t2, t2, -7
+    SW t2, 0(t0)
+fsr_flag:
+    CALL flag_redraw
+fsr_ret:
     LD s0, 16(sp)
     LD ra, 24(sp)
     ADDI sp, sp, 32
@@ -3537,61 +3949,290 @@ fileman_on_key:
     SD ra, 8(sp)
     LI t0, 13
     BEQ a1, t0, fm_k_open
+    LI t0, 256
+    BEQ a1, t0, fm_k_up
+    LI t0, 257
+    BEQ a1, t0, fm_k_down
+    LI t0, 273
+    BEQ a1, t0, fm_k_pgup
+    LI t0, 274
+    BEQ a1, t0, fm_k_pgdn
+    LI t0, 270
+    BEQ a1, t0, fm_k_home
+    LI t0, 271
+    BEQ a1, t0, fm_k_end
+    LI t0, 8
+    BEQ a1, t0, fm_k_back
+    LI t0, 265
+    BEQ a1, t0, fm_k_refresh
     J fm_k_ret
 fm_k_open:
+    LA t0, fm_sel
+    LW a0, 0(t0)
+    CALL fm_open_index
+    J fm_k_ret
+fm_k_up:
+    LA t0, fm_sel
+    LW a0, 0(t0)
+    ADDI a0, a0, -1
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_down:
+    LA t0, fm_sel
+    LW a0, 0(t0)
+    ADDI a0, a0, 1
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_pgup:
+    LA t0, fm_sel
+    LW a0, 0(t0)
+    ADDI a0, a0, -8
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_pgdn:
+    LA t0, fm_sel
+    LW a0, 0(t0)
+    ADDI a0, a0, 8
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_home:
     LI a0, 0
-    CALL fm_open_row_notepad
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_end:
+    CALL fm_visible_count
+    ADDI a0, a0, -1
+    CALL fm_select_row
+    J fm_k_ret
+fm_k_back:
+    CALL fm_go_parent
+    J fm_k_ret
+fm_k_refresh:
+    CALL fm_refresh
+    CALL flag_redraw
 fm_k_ret:
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
 
-fileman_on_click:
+; fm_go_parent: navigate fm_cwd up (stays at root), reset sel/scroll.
+fm_go_parent:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    LI t0, 480
-    BLT a0, t0, fm_click_ret
-    LI t0, 620
-    BGT a0, t0, fm_click_ret
-    LI t0, 130
-    BLT a1, t0, fm_click_ret
-    LI t0, 420
-    BGT a1, t0, fm_click_ret
-
-    ADDI a1, a1, -130
-    LI t0, 36
-    DIVU a0, a1, t0
-    CALL fm_open_row_notepad
-
-fm_click_ret:
+    LA a0, fm_cwd
+    CALL path_parent
+    LA t0, fm_sel
+    SW zero, 0(t0)
+    LA t0, fm_scroll
+    SW zero, 0(t0)
+    LA t0, fm_status
+    SB zero, 0(t0)
+    CALL flag_redraw
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
 
+fileman_on_click:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    ; [Up] button.
+    LI t0, 570
+    BLT a0, t0, fmc_rows
+    LI t0, 680
+    BGT a0, t0, fmc_rows
+    LI t0, 96
+    BLT a1, t0, fmc_rows
+    LI t0, 120
+    BGT a1, t0, fmc_rows
+    CALL fm_go_parent
+    J fmc_ret
+fmc_rows:
+    LI t0, 115
+    BLT a0, t0, fmc_ret
+    LI t0, 680
+    BGT a0, t0, fmc_ret
+    LI t0, 144
+    BLT a1, t0, fmc_ret
+    LI t0, 386
+    BGT a1, t0, fmc_ret
+    ADDI t0, a1, -144
+    LI t1, 30
+    DIVU t0, t0, t1          ; row 0..7
+    LA t1, fm_scroll
+    LW t1, 0(t1)
+    ADD s0, t0, t1           ; visible position
+    CALL fm_visible_count
+    BGE s0, a0, fmc_ret
+    ; Double-click: same row within 400 ms opens immediately.
+    LI a7, 13
+    ECALL
+    MV t2, a0
+    LA t3, fm_last_row
+    LW t4, 0(t3)
+    BNE t4, s0, fmc_single
+    LA t3, fm_last_ms
+    LD t5, 0(t3)
+    SUB t5, t2, t5
+    LI t6, 400
+    BGT t5, t6, fmc_single
+    SD zero, 0(t3)
+    LA t3, fm_last_row
+    LI t4, -1
+    SW t4, 0(t3)
+    MV a0, s0
+    CALL fm_select_row
+    MV a0, s0
+    CALL fm_open_index
+    J fmc_ret
+fmc_single:
+    LA t3, fm_last_ms
+    SD t2, 0(t3)
+    LA t3, fm_last_row
+    SW s0, 0(t3)
+    LI t0, 545
+    BLT a0, t0, fmc_selonly
+    MV a0, s0
+    CALL fm_select_row
+    MV a0, s0
+    CALL fm_open_index
+    J fmc_ret
+fmc_selonly:
+    MV a0, s0
+    CALL fm_select_row
+fmc_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; fm_open_index: a0=visible row -> shared type dispatcher.
+fm_open_index:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    MV s0, a0
+    CALL fm_row_entry
+    LI t0, -2
+    BEQ a0, t0, foi_ret
+    LI t0, -1
+    BEQ a0, t0, foi_parent
+    ; Cache entry -> full path in fm_tmp_path.
+    LI t0, 28
+    MUL t0, a0, t0
+    LA t1, fm_list_buf
+    ADD s1, t1, t0
+    LBU t0, 13(s1)
+    ANDI t0, t0, 0x10
+    BNE t0, zero, foi_dir
+    ; Regular file: compose path, then dispatch by extension.
+    LA a0, fm_cwd
+    MV a1, s1
+    LA a2, fm_tmp_path
+    LI a3, 256
+    CALL path_join
+    BLT a0, zero, foi_toolong
+    MV s2, a0
+    LA a0, fm_tmp_path
+    LA a1, str_ext_app
+    CALL ext_is
+    BNE a0, zero, foi_app
+    LA a0, fm_tmp_path
+    LA a1, str_ext_txt
+    CALL ext_is
+    BNE a0, zero, foi_text
+    LA a0, fm_status
+    LA a1, str_fm_unsupported
+    CALL str_copy
+    CALL flag_redraw
+    J foi_ret
+foi_dir:
+    LA a0, fm_cwd
+    MV a1, s1
+    LA a2, fm_tmp_path
+    LI a3, 256
+    CALL path_join
+    BLT a0, zero, foi_toolong
+    ; Validate before navigating.
+    LA a0, fm_tmp_path
+    LA a1, term_dirent
+    LI a7, 32
+    ECALL
+    BLT a0, zero, foi_statbad
+    LA a0, fm_cwd
+    LA a1, fm_tmp_path
+    CALL str_copy
+    LA t0, fm_sel
+    SW zero, 0(t0)
+    LA t0, fm_scroll
+    SW zero, 0(t0)
+    LA t0, fm_status
+    SB zero, 0(t0)
+    CALL flag_redraw
+    J foi_ret
+foi_parent:
+    CALL fm_go_parent
+    J foi_ret
+foi_app:
+    MV a0, s2
+    LA a0, fm_tmp_path
+    CALL fs_launch_app
+    J foi_ret
+foi_text:
+    LA a0, fm_tmp_path
+    CALL notepad_open_path
+    J foi_ret
+foi_toolong:
+    LA a0, fm_status
+    LA a1, str_dlg_bad_name
+    CALL str_copy
+    CALL flag_redraw
+    J foi_ret
+foi_statbad:
+    LA a0, fm_status
+    LA a1, str_dlg_missing
+    CALL str_copy
+    CALL flag_redraw
+foi_ret:
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; fs_launch_app: a0=absolute DEXE path -> same validated loader as Terminal.
+; Never routes executable bytes into Notepad. Desktop state is retained and
+; the desktop is repainted when the standalone app exits.
+fs_launch_app:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    LI a1, 0
+    LI a7, 40
+    ECALL
+    BLT a0, zero, fla_bad
+    CALL flag_redraw
+    J fla_ret
+fla_bad:
+    LA a0, fm_status
+    LA a1, str_fm_launch_err
+    CALL str_copy
+    CALL flag_redraw
+fla_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; Legacy entry kept for compatibility; now routes through the dispatcher.
 fm_open_row_notepad:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    LI t0, 8
-    BGE a0, t0, fmor_done
-
-    SLLI t0, a0, 5
-    LA t1, fat16_dir_buf
-    ADD t1, t1, t0
-    LBU t2, 0(t1)
-    BEQ t2, zero, fmor_done
-    LI t3, 0xE5
-    BEQ t2, t3, fmor_done
-
-    MV a0, t1
-    LA a1, note_cur_filename
-    CALL fat16_format_name
-
-    LI a0, 2
-    CALL window_open
-    CALL notepad_open_file
-    CALL flag_redraw
-
-fmor_done:
+    CALL fm_open_index
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -5070,6 +5711,3413 @@ sound_play_tone:
     RET
 
 ; ==============================================================================
+; Shared file services: string/path helpers, decimal sizes, UTF-8 check.
+; Clobbers: a0-a3, t0-t6 unless noted. s-registers are preserved.
+; ==============================================================================
+
+; str_len: a0=str -> a0=length (bytes before NUL)
+str_len:
+    MV t0, a0
+    LI a0, 0
+slen_loop:
+    LBU t1, 0(t0)
+    BEQ t1, zero, slen_done
+    ADDI t0, t0, 1
+    ADDI a0, a0, 1
+    J slen_loop
+slen_done:
+    RET
+
+; path_join: a0=dir, a1=name, a2=dst, a3=cap -> a0=len or -1 on overflow.
+; Result is dir + ("/" unless dir is "/") + name. Never truncates.
+path_join:
+    ADDI sp, sp, -64
+    SD ra, 56(sp)
+    SD s0, 48(sp)
+    SD s1, 40(sp)
+    SD s2, 32(sp)
+    SD s3, 24(sp)
+    SD s4, 16(sp)
+    SD s5, 8(sp)
+
+    MV s0, a0                ; s0 = dir
+    MV s1, a1                ; s1 = name
+    MV s2, a2                ; s2 = dst
+    MV s3, a3                ; s3 = cap
+
+    MV a0, s0
+    CALL str_len
+    MV s4, a0                ; s4 = dir len
+
+    MV a0, s1
+    CALL str_len
+    MV s5, a0                ; s5 = name len
+
+    ADD t2, s4, s5
+    ADDI t2, t2, 2           ; slash + NUL
+    BGT t2, s3, pj_over
+
+    MV t3, s2                ; t3 = write pointer
+    MV t4, s0                ; t4 = read dir pointer
+
+pj_dir_l:
+    LBU t5, 0(t4)
+    BEQ t5, zero, pj_dir_d
+    SB t5, 0(t3)
+    ADDI t3, t3, 1
+    ADDI t4, t4, 1
+    J pj_dir_l
+
+pj_dir_d:
+    LI t5, 47                ; '/'
+    BEQ s4, zero, pj_slash   ; empty dir -> needs '/'
+
+    ; If dir is exactly "/", don't add another slash
+    LI t1, 1
+    BNE s4, t1, pj_check_trail
+    LBU t4, 0(s0)
+    BEQ t4, t5, pj_name_c    ; dir is "/", already has slash!
+
+pj_check_trail:
+    ADD t4, s0, s4
+    ADDI t4, t4, -1
+    LBU t4, 0(t4)
+    BEQ t4, t5, pj_name_c    ; already ends with '/', skip adding slash
+
+pj_slash:
+    SB t5, 0(t3)
+    ADDI t3, t3, 1
+
+pj_name_c:
+    MV t4, s1
+pj_name_l:
+    LBU t5, 0(t4)
+    BEQ t5, zero, pj_fin
+    SB t5, 0(t3)
+    ADDI t3, t3, 1
+    ADDI t4, t4, 1
+    J pj_name_l
+
+pj_fin:
+    SB zero, 0(t3)
+    SUB a0, t3, s2           ; len = write_ptr - dst
+    J pj_ret
+
+pj_over:
+    LI a0, -1
+
+pj_ret:
+    LD s5, 8(sp)
+    LD s4, 16(sp)
+    LD s3, 24(sp)
+    LD s2, 32(sp)
+    LD s1, 40(sp)
+    LD s0, 48(sp)
+    LD ra, 56(sp)
+    ADDI sp, sp, 64
+    RET
+
+; path_parent: a0=mutable path -> in place; "/" stays "/".
+path_parent:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    CALL str_len
+    LI t1, 1
+    BLE a0, t1, pp_root
+    ; strip trailing slashes if len > 1
+pp_strip:
+    BLE a0, t1, pp_root
+    ADD t2, s0, a0
+    ADDI t2, t2, -1
+    LBU t3, 0(t2)
+    LI t4, 47
+    BEQ t3, t4, pp_strip_slash
+    LI t4, 92
+    BEQ t3, t4, pp_strip_slash
+    J pp_scan_start
+pp_strip_slash:
+    SB zero, 0(t2)
+    ADDI a0, a0, -1
+    J pp_strip
+pp_scan_start:
+    ADD t1, s0, a0
+    ADDI t1, t1, -1
+pp_scan:
+    LBU t2, 0(t1)
+    LI t3, 47
+    BEQ t2, t3, pp_cut
+    LI t3, 92
+    BEQ t2, t3, pp_cut
+    BEQ t1, s0, pp_root
+    ADDI t1, t1, -1
+    J pp_scan
+pp_cut:
+    BEQ t1, s0, pp_keep_one
+    SB zero, 0(t1)
+    J pp_ret
+pp_keep_one:
+    ADDI t1, t1, 1
+    SB zero, 0(t1)
+    J pp_ret
+pp_root:
+    LI t1, 47
+    SB t1, 0(s0)
+    SB zero, 1(s0)
+pp_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; ext_is: a0=path, a1=UPPER ext ("APP") -> a0=1 match (case-insensitive).
+ext_is:
+    MV t0, a0
+    MV t1, a1
+    LI t2, 0                 ; last dot or 0
+    LI t3, 0                 ; last slash pos flag
+ei_scan:
+    LBU t4, 0(t0)
+    BEQ t4, zero, ei_have
+    LI t5, 47
+    BEQ t4, t5, ei_slash
+    LI t5, 92
+    BEQ t4, t5, ei_slash
+    LI t5, 46
+    BNE t4, t5, ei_next
+    MV t2, t0
+    J ei_next
+ei_slash:
+    LI t2, 0
+ei_next:
+    ADDI t0, t0, 1
+    J ei_scan
+ei_have:
+    BEQ t2, zero, ei_no
+    ADDI t2, t2, 1
+ei_cmp:
+    LBU t4, 0(t2)
+    LBU t5, 0(t1)
+    BEQ t5, zero, ei_endok
+    BEQ t4, zero, ei_no
+    LI t6, 97
+    BLT t4, t6, ei_cmp2
+    LI t6, 122
+    BGT t4, t6, ei_cmp2
+    ADDI t4, t4, -32
+ei_cmp2:
+    BNE t4, t5, ei_no
+    ADDI t2, t2, 1
+    ADDI t1, t1, 1
+    J ei_cmp
+ei_endok:
+    BEQ t4, zero, ei_yes
+ei_no:
+    LI a0, 0
+    RET
+ei_yes:
+    LI a0, 1
+    RET
+
+; fmt_size: a0=bytes, a1=dst -> NUL-terminated "N B" / "N.N KB" / "N.N MB".
+; Decimal SI (1000/divisor), one fractional digit for KB/MB. Zero only for
+; genuinely empty files; small sizes never round down to zero.
+fmt_size:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    SD s2, 0(sp)
+    MV s0, a0
+    MV s1, a1
+    LI t0, 1000
+    BLT s0, t0, fs_bytes
+    LI t0, 1000000
+    BLT s0, t0, fs_kb
+    LI t0, 100000
+    DIVU t0, s0, t0          ; tenths of MB
+    LI t1, 77                ; 'M'
+    J fs_scaled
+fs_kb:
+    LI t0, 100
+    DIVU t0, s0, t0          ; tenths of KB
+    LI t1, 75                ; 'K'
+fs_scaled:
+    LI t2, 10
+    DIVU a0, t0, t2          ; whole units
+    CALL num_to_dec_helper
+    REM t3, t0, t2
+    LI t4, 46
+    SB t4, 0(s1)
+    ADDI s1, s1, 1
+    ADDI t3, t3, 48
+    SB t3, 0(s1)
+    ADDI s1, s1, 1
+    LI t4, 32
+    SB t4, 0(s1)
+    ADDI s1, s1, 1
+    SB t1, 0(s1)
+    ADDI s1, s1, 1
+    LI t4, 66
+    SB t4, 0(s1)
+    ADDI s1, s1, 1
+    SB zero, 0(s1)
+    J fs_ret
+fs_bytes:
+    MV a0, s0
+    MV s2, s1
+    MV a1, s1
+    CALL num_to_dec
+    MV a0, s1
+    CALL str_len
+    ADD s1, s1, a0
+    LI t0, 32
+    SB t0, 0(s1)
+    ADDI s1, s1, 1
+    LI t0, 66
+    SB t0, 0(s1)
+    ADDI s1, s1, 1
+    SB zero, 0(s1)
+fs_ret:
+    LD s2, 0(sp)
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; num_to_dec_helper: a0=value -> appends decimal text at s1, advances s1.
+; (num_to_dec and str_len only clobber a/t regs, so s1 survives.)
+num_to_dec_helper:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    MV a1, s1
+    CALL num_to_dec
+    MV a0, s1
+    CALL str_len
+    ADD s1, s1, a0
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; str_append: a0=dst(NUL-term), a1=src -> appends src at dst end.
+str_append:
+    MV t0, a0
+sa_len:
+    LBU t1, 0(t0)
+    BEQ t1, zero, sa_copy
+    ADDI t0, t0, 1
+    J sa_len
+sa_copy:
+    LBU t1, 0(a1)
+    SB t1, 0(t0)
+    BEQ t1, zero, sa_ret
+    ADDI t0, t0, 1
+    ADDI a1, a1, 1
+    J sa_copy
+sa_ret:
+    RET
+
+; notepad_set_status: a0=message -> note_status_str.
+notepad_set_status:
+    MV t0, a0
+    LA a0, note_status_str
+    MV a1, t0
+    J str_copy
+
+; notepad_load_path: a0=absolute path -> a0=0 ok, else negative FS code.
+; Probe-then-read: missing/oversize never touch note_buf, so a failed open
+; keeps the existing text. On success adopts the path and clears dirty.
+notepad_load_path:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    MV s0, a0
+    ; Probe full size without touching any buffers (cap 0).
+    MV a0, s0
+    LI a1, 0
+    LA a2, note_staging_buf
+    LI a3, 0
+    LI a7, 33
+    ECALL
+    BLT a0, zero, nlp_fail
+    LI t0, 4000
+    BGT a1, t0, nlp_large
+    MV s1, a1                ; full size
+    ; Read into staging buffer, preserving note_buf untouched.
+    MV a0, s0
+    LI a1, 0
+    LA a2, note_staging_buf
+    LI a3, 4000
+    LI a7, 33
+    ECALL
+    BLT a0, zero, nlp_fail
+    MV s2, a0                ; bytes read
+    ; Encoding check on staging buffer before replacing the document.
+    LA a0, note_staging_buf
+    MV a1, s2
+    CALL utf8_valid
+    BEQ a0, zero, nlp_badenc
+    ; Validation passed: copy staging buffer into note_buf.
+    LA t0, note_buf
+    LA t1, note_staging_buf
+    MV t2, s2
+nlp_cp_loop:
+    BEQ t2, zero, nlp_cp_done
+    LBU t3, 0(t1)
+    SB t3, 0(t0)
+    ADDI t0, t0, 1
+    ADDI t1, t1, 1
+    ADDI t2, t2, -1
+    J nlp_cp_loop
+nlp_cp_done:
+    LA t0, note_len
+    SW s2, 0(t0)
+    LA t0, note_cursor
+    SW zero, 0(t0)
+    LA t1, note_buf
+    ADD t1, t1, s2
+    SB zero, 0(t1)
+    LA a0, note_path
+    MV a1, s0
+    CALL str_copy
+    LA a0, str_status_opened
+    CALL notepad_set_status
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    LI a0, 0
+    J nlp_ret
+nlp_large:
+    LA a0, str_status_too_large
+    CALL notepad_set_status
+    LI a0, -12
+    J nlp_ret
+nlp_badenc:
+    LA a0, str_status_bad_enc
+    CALL notepad_set_status
+    LI a0, -11
+    J nlp_ret
+nlp_fail:
+    MV s1, a0
+    LI t0, -3
+    BEQ a0, t0, nlp_msg_missing
+    LI t0, -10
+    BEQ a0, t0, nlp_msg_name
+    LI t0, -1
+    BEQ a0, t0, nlp_msg_disk
+    LA a0, str_status_open_error
+    CALL notepad_set_status
+    J nlp_fail_ret
+nlp_msg_missing:
+    LA a0, str_status_missing
+    CALL notepad_set_status
+    J nlp_fail_ret
+nlp_msg_name:
+    LA a0, str_status_bad_name
+    CALL notepad_set_status
+    J nlp_fail_ret
+nlp_msg_disk:
+    LA a0, str_status_no_disk
+    CALL notepad_set_status
+nlp_fail_ret:
+    MV a0, s1
+nlp_ret:
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; notepad_write_path: a0=absolute path -> a0=0 ok, else negative FS code.
+; Writes note_buf[0..note_len) with create+truncate. No state adopted here.
+notepad_write_path:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    MV s0, a0
+    LA t0, note_len
+    LW s1, 0(t0)
+    MV a0, s0
+    LA a1, note_buf
+    MV a2, s1
+    LI a3, 3
+    LI a7, 34
+    ECALL
+    BLT a0, zero, nwp_fail
+    CALL fm_refresh
+    LA a0, str_status_saved
+    CALL notepad_set_status
+    LI a0, 0
+    J nwp_ret
+nwp_fail:
+    MV s1, a0
+    LI t0, -8
+    BEQ a0, t0, nwp_msg_ro
+    LI t0, -7
+    BEQ a0, t0, nwp_msg_full
+    LI t0, -10
+    BEQ a0, t0, nwp_msg_name
+    LI t0, -1
+    BEQ a0, t0, nwp_msg_disk
+    LA a0, str_status_save_error
+    CALL notepad_set_status
+    J nwp_fail_ret
+nwp_msg_ro:
+    LA a0, str_status_readonly
+    CALL notepad_set_status
+    J nwp_fail_ret
+nwp_msg_full:
+    LA a0, str_status_diskfull
+    CALL notepad_set_status
+    J nwp_fail_ret
+nwp_msg_name:
+    LA a0, str_status_bad_name
+    CALL notepad_set_status
+    J nwp_fail_ret
+nwp_msg_disk:
+    LA a0, str_status_no_disk
+    CALL notepad_set_status
+nwp_fail_ret:
+    MV a0, s1
+nwp_ret:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; notepad_do_save: Save button/F9/Ctrl+S. Untitled opens Save As.
+notepad_do_save:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, nds_saveas
+    LA a0, note_path
+    CALL notepad_write_path
+    BLT a0, zero, nds_ret
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    J nds_ret
+nds_saveas:
+    CALL dlg_show_saveas
+nds_ret:
+    CALL flag_redraw
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; notepad_open_path: a0=path (dispatcher/dialog) -> dirty-aware load.
+notepad_open_path:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, nop_direct
+    LA a0, dlg_pending_path
+    MV a1, s0
+    CALL str_copy
+    LI a0, 2
+    CALL dlg_show_confirm
+    J nop_ret
+nop_direct:
+    MV a0, s0
+    CALL notepad_load_path
+    LI a0, 2
+    CALL window_open
+    CALL flag_redraw
+nop_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; notepad_request_open_dlg: F10/Open button -> confirm first when dirty.
+notepad_request_open_dlg:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, nrod_direct
+    LA t0, dlg_pending_path
+    SB zero, 0(t0)
+    LI a0, 2
+    CALL dlg_show_confirm
+    J nrod_ret
+nrod_direct:
+    CALL dlg_show_open
+nrod_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; notepad_request_new: New button -> confirm first when dirty.
+notepad_request_new:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, nrn_clean
+    LI a0, 1
+    CALL dlg_show_confirm
+    J nrn_ret
+nrn_clean:
+    CALL notepad_new_now
+nrn_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; notepad_new_now: pending action 1. Untitled, empty, unmodified.
+notepad_new_now:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_path
+    SB zero, 0(t0)
+    LA t0, note_len
+    SW zero, 0(t0)
+    LA t0, note_cursor
+    SW zero, 0(t0)
+    LA t0, note_buf
+    SB zero, 0(t0)
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    LA a0, str_status_new
+    CALL notepad_set_status
+    CALL flag_redraw
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; notepad_request_close: window_close/ESC path for dirty Notepad.
+; Returns a0=1 when the close was deferred to the confirm dialog.
+notepad_request_close:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, active_window
+    LW t1, 0(t0)
+    LI t2, 2
+    BNE t1, t2, nrc_no
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, nrc_no
+    LI a0, 3
+    CALL dlg_show_confirm
+    LI a0, 1
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+nrc_no:
+    LI a0, 0
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; notepad_request_shutdown: X.Exit path with unsaved text.
+notepad_request_shutdown:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_dirty
+    LW t1, 0(t0)
+    BEQ t1, zero, nrs_clean
+    LI a0, 4
+    CALL dlg_show_confirm
+    J nrs_ret
+nrs_clean:
+    CALL do_quit_os_now
+nrs_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+do_quit_os_now:
+    LA t0, exit_requested
+    LI t1, 1
+    SW t1, 0(t0)
+    RET
+
+; do_pending: resume after successful save or explicit discard.
+do_pending:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, dlg_pending
+    LW t1, 0(t0)
+    SW zero, 0(t0)
+    LI t0, 1
+    BEQ t1, t0, dp_new
+    LI t0, 2
+    BEQ t1, t0, dp_open
+    LI t0, 3
+    BEQ t1, t0, dp_close
+    LI t0, 4
+    BEQ t1, t0, dp_exit
+    J dp_ret
+dp_new:
+    CALL notepad_new_now
+    J dp_ret
+dp_open:
+    LA t0, dlg_pending_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, dp_open_dlg
+    LA a0, dlg_pending_path
+    CALL notepad_load_path
+    CALL flag_redraw
+    J dp_ret
+dp_open_dlg:
+    CALL dlg_show_open
+    J dp_ret
+dp_close:
+    CALL window_close
+    J dp_ret
+dp_exit:
+    CALL do_quit_os_now
+dp_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; Legacy wrappers kept for init compatibility; now path-based.
+notepad_save_file:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, nsf_ret
+    LA a0, note_path
+    CALL notepad_write_path
+    BLT a0, zero, nsf_ret
+    LA t0, note_dirty
+    SW zero, 0(t0)
+nsf_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+notepad_open_file:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, nof_ret
+    LA a0, note_path
+    CALL notepad_load_path
+nof_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; ==============================================================================
+; Shared native file dialogs (Delphi-like Open/SaveAs + dirty confirm).
+; Modal: ev_key/click/move/release route here while dlg_active != 0, so input
+; never leaks to underlying controls. Background timer work continues.
+; 8.3 limits are enforced by the FS layer and surfaced verbatim; names are
+; never truncated or rewritten by the dialog.
+; ==============================================================================
+; dlg geometry: DX=120 DY=80 DW=560 DH=420 (bottom 500, above taskbar).
+
+; field_insert: a0=buf,a1=lenA,a2=caretA,a3=cap,a4=char
+field_insert:
+    LW t0, 0(a1)              ; len
+    BGE t0, a3, fi_ret        ; full (never truncate: refuse instead)
+    LW t1, 0(a2)              ; caret
+    ADD t2, a0, t0            ; &buf[len] (NUL cell)
+    ADD t4, a0, t1            ; &buf[caret]
+fi_shift:
+    BLT t2, t4, fi_do
+    LBU t3, 0(t2)
+    SB t3, 1(t2)
+    ADDI t2, t2, -1
+    J fi_shift
+fi_do:
+    SB a4, 0(t4)
+    ADDI t0, t0, 1
+    SW t0, 0(a1)
+    ADDI t1, t1, 1
+    SW t1, 0(a2)
+fi_ret:
+    RET
+
+; field_bs: a0=buf,a1=lenA,a2=caretA (byte-wise; dialog fields are 8.3 ASCII)
+field_bs:
+    LW t1, 0(a2)
+    BEQ t1, zero, fb_ret
+    ADDI t1, t1, -1
+    SW t1, 0(a2)
+    LW t0, 0(a1)
+    ADD t2, a0, t1
+fb_shift:
+    ADDI t3, t2, 1
+    LBU t4, 0(t3)
+    SB t4, 0(t2)
+    BEQ t4, zero, fb_done
+    ADDI t2, t2, 1
+    J fb_shift
+fb_done:
+    ADDI t0, t0, -1
+    SW t0, 0(a1)
+fb_ret:
+    RET
+
+; field_del: a0=buf,a1=lenA,a2=caretA
+field_del:
+    LW t1, 0(a2)
+    LW t0, 0(a1)
+    BGE t1, t0, fd_ret
+    ADD t2, a0, t1
+fd_shift:
+    ADDI t3, t2, 1
+    LBU t4, 0(t3)
+    SB t4, 0(t2)
+    BEQ t4, zero, fd_done
+    ADDI t2, t2, 1
+    J fd_shift
+fd_done:
+    ADDI t0, t0, -1
+    SW t0, 0(a1)
+fd_ret:
+    RET
+
+; field_pick: a0=len,a1=x,a2=text_x,a3=scroll -> a0=caret clamped.
+field_pick:
+    SUB t0, a1, a2
+    ADDI t0, t0, -4
+    BLT t0, zero, fp_zero
+    SRLI t0, t0, 3             ; /8 px per cell
+    ADD t0, t0, a3
+    BGT t0, a0, fp_end
+    MV a0, t0
+    RET
+fp_end:
+    RET
+fp_zero:
+    LI a0, 0
+    RET
+
+; dlg_visible_copy: a0=buf,a1=len,a2=scroll,a3=dst (NUL-term substring)
+dlg_visible_copy:
+    ADD t0, a0, a2
+    ADD t1, a0, a1
+    MV t2, a3
+dvc_loop:
+    BGE t0, t1, dvc_fin
+    LBU t3, 0(t0)
+    SB t3, 0(t2)
+    ADDI t0, t0, 1
+    ADDI t2, t2, 1
+    J dvc_loop
+dvc_fin:
+    SB zero, 0(t2)
+    RET
+
+; dlg_fix_scroll: a0=lenA,a1=caretA,a2=scrollA,a3=field_w (keeps caret visible)
+dlg_fix_scroll:
+    LW t0, 0(a0)
+    LW t1, 0(a1)
+    LW t2, 0(a2)
+    BLT t1, t2, dfs_caret
+    SUB t3, t1, t2
+    SLLI t3, t3, 3
+    ADDI t4, a3, -12
+    BLE t3, t4, dfs_shrink
+    ADDI t2, t2, 1
+    SW t2, 0(a2)
+    J dlg_fix_scroll
+dfs_caret:
+    SW t1, 0(a2)
+    RET
+dfs_shrink:
+    BEQ t2, zero, dfs_ret
+    SUB t3, t0, t2
+    SLLI t3, t3, 3
+    ADDI t4, a3, -12
+    BGE t3, t4, dfs_ret
+    ADDI t2, t2, -1
+    SW t2, 0(a2)
+    J dlg_fix_scroll
+dfs_ret:
+    RET
+
+; ==============================================================================
+; FAT 8.3 Short-Name Validation & Conversion
+;
+; is_fat_char: a0=char -> a0=1 if valid FAT 8.3 char, 0 if invalid
+; ==============================================================================
+is_fat_char:
+    LI t0, 32
+    BLE a0, t0, ifc_no
+    LI t0, 127
+    BGE a0, t0, ifc_no
+    LI t0, 34                ; '"'
+    BEQ a0, t0, ifc_no
+    LI t0, 42                ; '*'
+    BEQ a0, t0, ifc_no
+    LI t0, 43                ; '+'
+    BEQ a0, t0, ifc_no
+    LI t0, 44                ; ','
+    BEQ a0, t0, ifc_no
+    LI t0, 47                ; '/'
+    BEQ a0, t0, ifc_no
+    LI t0, 58                ; ':'
+    BEQ a0, t0, ifc_no
+    LI t0, 59                ; ';'
+    BEQ a0, t0, ifc_no
+    LI t0, 60                ; '<'
+    BEQ a0, t0, ifc_no
+    LI t0, 61                ; '='
+    BEQ a0, t0, ifc_no
+    LI t0, 62                ; '>'
+    BEQ a0, t0, ifc_no
+    LI t0, 63                ; '?'
+    BEQ a0, t0, ifc_no
+    LI t0, 91                ; '['
+    BEQ a0, t0, ifc_no
+    LI t0, 92                ; '\'
+    BEQ a0, t0, ifc_no
+    LI t0, 93                ; ']'
+    BEQ a0, t0, ifc_no
+    LI t0, 124               ; '|'
+    BEQ a0, t0, ifc_no
+    LI a0, 1
+    RET
+ifc_no:
+    LI a0, 0
+    RET
+
+; ==============================================================================
+; fat_validate_shortname:
+;   a0 = input string
+;   a1 = output buffer for trimmed display string (or 0)
+;   a2 = output buffer for 11-byte space-padded canonical FAT name (or 0)
+; Returns a0:
+;    0 = OK
+;   -1 = Empty or whitespace only
+;   -2 = Contains path separator ('/' or '\')
+;   -3 = Base name exceeds 8 characters
+;   -4 = Extension exceeds 3 characters
+;   -5 = Multiple dots
+;   -6 = Missing base name
+;   -7 = Invalid character
+; ==============================================================================
+fat_validate_shortname:
+    ADDI sp, sp, -80
+    SD ra, 72(sp)
+    SD s0, 64(sp)            ; input
+    SD s1, 56(sp)            ; out_disp
+    SD s2, 48(sp)            ; out_canon
+    SD s3, 40(sp)            ; trimmed start
+    SD s4, 32(sp)            ; trimmed end (exclusive)
+    SD s5, 24(sp)            ; scan ptr
+    SD s6, 16(sp)            ; seen_dot
+    SD s7, 8(sp)             ; base_len
+    SD s8, 0(sp)             ; ext_len
+
+    MV s0, a0
+    MV s1, a1
+    MV s2, a2
+
+    ; Trim leading whitespace
+    MV s3, s0
+fvs_lead:
+    LBU t0, 0(s3)
+    BEQ t0, zero, fvs_err_empty
+    LI t1, 32                ; ' '
+    BEQ t0, t1, fvs_lead_next
+    LI t1, 9                 ; '\t'
+    BEQ t0, t1, fvs_lead_next
+    J fvs_find_end
+fvs_lead_next:
+    ADDI s3, s3, 1
+    J fvs_lead
+
+fvs_find_end:
+    MV s4, s3
+fvs_scan_end:
+    LBU t0, 0(s4)
+    BEQ t0, zero, fvs_trim_trail
+    ADDI s4, s4, 1
+    J fvs_scan_end
+
+fvs_trim_trail:
+fvs_trail_loop:
+    BEQ s4, s3, fvs_err_empty
+    ADDI t2, s4, -1
+    LBU t0, 0(t2)
+    LI t1, 32
+    BEQ t0, t1, fvs_trail_step
+    LI t1, 9
+    BEQ t0, t1, fvs_trail_step
+    J fvs_have_bounds
+fvs_trail_step:
+    MV s4, t2
+    J fvs_trail_loop
+
+fvs_have_bounds:
+    ; Check special "." and ".."
+    SUB t0, s4, s3
+    LI t1, 1
+    BNE t0, t1, fvs_chk_dotdot
+    LBU t2, 0(s3)
+    LI t3, 46                ; '.'
+    BEQ t2, t3, fvs_special_dot
+
+fvs_chk_dotdot:
+    LI t1, 2
+    BNE t0, t1, fvs_scan_body
+    LBU t2, 0(s3)
+    LBU t3, 1(s3)
+    LI t4, 46
+    BNE t2, t4, fvs_scan_body
+    BNE t3, t4, fvs_scan_body
+    J fvs_special_dotdot
+
+fvs_scan_body:
+    MV s5, s3
+    LI s6, 0                 ; seen_dot = 0
+    LI s7, 0                 ; base_len = 0
+    LI s8, 0                 ; ext_len = 0
+
+fvs_loop:
+    BEQ s5, s4, fvs_done_scan
+    LBU a0, 0(s5)
+
+    LI t0, 47                ; '/'
+    BEQ a0, t0, fvs_err_pathsep
+    LI t0, 92                ; '\'
+    BEQ a0, t0, fvs_err_pathsep
+
+    LI t0, 46                ; '.'
+    BNE a0, t0, fvs_char
+
+    ; Dot
+    BNE s6, zero, fvs_err_multidot
+    BEQ s7, zero, fvs_err_emptybase
+    LI s6, 1
+    ADDI s5, s5, 1
+    J fvs_loop
+
+fvs_char:
+    CALL is_fat_char
+    BEQ a0, zero, fvs_err_invalchar
+
+    BNE s6, zero, fvs_ext_char
+    ADDI s7, s7, 1
+    LI t0, 8
+    BGT s7, t0, fvs_err_baselen
+    ADDI s5, s5, 1
+    J fvs_loop
+
+fvs_ext_char:
+    ADDI s8, s8, 1
+    LI t0, 3
+    BGT s8, t0, fvs_err_extlen
+    ADDI s5, s5, 1
+    J fvs_loop
+
+fvs_done_scan:
+    BEQ s7, zero, fvs_err_emptybase
+
+    ; Copy display string if buffer provided
+    BEQ s1, zero, fvs_fill_canon
+    MV t0, s3
+    MV t1, s1
+fvs_disp_cp:
+    BEQ t0, s4, fvs_disp_done
+    LBU t2, 0(t0)
+    SB t2, 0(t1)
+    ADDI t0, t0, 1
+    ADDI t1, t1, 1
+    J fvs_disp_cp
+fvs_disp_done:
+    SB zero, 0(t1)
+
+fvs_fill_canon:
+    BEQ s2, zero, fvs_ok
+    LI t0, 32
+    LI t1, 0
+fvs_clr_canon:
+    LI t2, 11
+    BGE t1, t2, fvs_cp_canon
+    ADD t3, s2, t1
+    SB t0, 0(t3)
+    ADDI t1, t1, 1
+    J fvs_clr_canon
+
+fvs_cp_canon:
+    MV t0, s3
+    LI t1, 0                 ; base idx
+    LI t2, 8                 ; ext idx
+    LI t3, 0                 ; dot flag
+fvs_canon_loop:
+    BEQ t0, s4, fvs_ok
+    LBU t4, 0(t0)
+    LI t5, 46
+    BNE t4, t5, fvs_canon_char
+    LI t3, 1
+    ADDI t0, t0, 1
+    J fvs_canon_loop
+fvs_canon_char:
+    LI t5, 97
+    BLT t4, t5, fvs_canon_store
+    LI t5, 122
+    BGT t4, t5, fvs_canon_store
+    ADDI t4, t4, -32
+fvs_canon_store:
+    BNE t3, zero, fvs_store_ext
+    ADD t5, s2, t1
+    SB t4, 0(t5)
+    ADDI t1, t1, 1
+    ADDI t0, t0, 1
+    J fvs_canon_loop
+fvs_store_ext:
+    ADD t5, s2, t2
+    SB t4, 0(t5)
+    ADDI t2, t2, 1
+    ADDI t0, t0, 1
+    J fvs_canon_loop
+
+fvs_special_dot:
+    BEQ s1, zero, fvs_dot_canon
+    LI t0, 46
+    SB t0, 0(s1)
+    SB zero, 1(s1)
+fvs_dot_canon:
+    BEQ s2, zero, fvs_ok
+    LI t0, 32
+    LI t1, 1
+fvs_clr_dcanon:
+    LI t2, 11
+    BGE t1, t2, fvs_set_dot
+    ADD t3, s2, t1
+    SB t0, 0(t3)
+    ADDI t1, t1, 1
+    J fvs_clr_dcanon
+fvs_set_dot:
+    LI t0, 46
+    SB t0, 0(s2)
+    J fvs_ok
+
+fvs_special_dotdot:
+    BEQ s1, zero, fvs_dd_canon
+    LI t0, 46
+    SB t0, 0(s1)
+    SB t0, 1(s1)
+    SB zero, 2(s1)
+fvs_dd_canon:
+    BEQ s2, zero, fvs_ok
+    LI t0, 32
+    LI t1, 2
+fvs_clr_ddcanon:
+    LI t2, 11
+    BGE t1, t2, fvs_set_dotdot
+    ADD t3, s2, t1
+    SB t0, 0(t3)
+    ADDI t1, t1, 1
+    J fvs_clr_ddcanon
+fvs_set_dotdot:
+    LI t0, 46
+    SB t0, 0(s2)
+    SB t0, 1(s2)
+    J fvs_ok
+
+fvs_ok:
+    LI a0, 0
+    J fvs_ret
+fvs_err_empty:
+    LI a0, -1
+    J fvs_ret
+fvs_err_pathsep:
+    LI a0, -2
+    J fvs_ret
+fvs_err_baselen:
+    LI a0, -3
+    J fvs_ret
+fvs_err_extlen:
+    LI a0, -4
+    J fvs_ret
+fvs_err_multidot:
+    LI a0, -5
+    J fvs_ret
+fvs_err_emptybase:
+    LI a0, -6
+    J fvs_ret
+fvs_err_invalchar:
+    LI a0, -7
+    J fvs_ret
+
+fvs_ret:
+    LD s8, 0(sp)
+    LD s7, 8(sp)
+    LD s6, 16(sp)
+    LD s5, 24(sp)
+    LD s4, 32(sp)
+    LD s3, 40(sp)
+    LD s2, 48(sp)
+    LD s1, 56(sp)
+    LD s0, 64(sp)
+    LD ra, 72(sp)
+    ADDI sp, sp, 80
+    RET
+
+; ==============================================================================
+; fat_error_msg: a0=code -> a0=pointer to error string
+; ==============================================================================
+fat_error_msg:
+    LI t0, -1
+    BEQ a0, t0, fem_nofile
+    LI t0, -2
+    BEQ a0, t0, fem_sep
+    LI t0, -3
+    BEQ a0, t0, fem_baselen
+    LI t0, -4
+    BEQ a0, t0, fem_extlen
+    LI t0, -5
+    BEQ a0, t0, fem_multidot
+    LI t0, -6
+    BEQ a0, t0, fem_emptybase
+    LI t0, -7
+    BEQ a0, t0, fem_invalchar
+    LA a0, str_dlg_bad_name
+    RET
+fem_nofile:
+    LA a0, str_dlg_no_file
+    RET
+fem_sep:
+    LA a0, str_dlg_sep_err
+    RET
+fem_baselen:
+    LA a0, str_dlg_base_len
+    RET
+fem_extlen:
+    LA a0, str_dlg_ext_len
+    RET
+fem_multidot:
+    LA a0, str_dlg_multi_dot
+    RET
+fem_emptybase:
+    LA a0, str_dlg_empty_base
+    RET
+fem_invalchar:
+    LA a0, str_dlg_invalid_char
+    RET
+
+; dlg_fs_error: a0=negative FS code -> dlg_err message.
+dlg_fs_error:
+    LI t0, -3
+    BEQ a0, t0, dfe_missing
+    LI t0, -10
+    BEQ a0, t0, dfe_name
+    LI t0, -1
+    BEQ a0, t0, dfe_disk
+    LI t0, -8
+    BEQ a0, t0, dfe_ro
+    LI t0, -7
+    BEQ a0, t0, dfe_full
+    LI t0, -11
+    BEQ a0, t0, dfe_badenc
+    LI t0, -12
+    BEQ a0, t0, dfe_large
+    LI t0, -4
+    BEQ a0, t0, dfe_exists
+    LA a1, str_dlg_io
+    J dfe_copy
+dfe_badenc:
+    LA a1, str_dlg_bad_enc
+    J dfe_copy
+dfe_missing:
+    LA a1, str_dlg_missing
+    J dfe_copy
+dfe_name:
+    LA a1, str_dlg_bad_name
+    J dfe_copy
+dfe_disk:
+    LA a1, str_dlg_no_disk
+    J dfe_copy
+dfe_ro:
+    LA a1, str_dlg_ro
+    J dfe_copy
+dfe_full:
+    LA a1, str_dlg_full
+    J dfe_copy
+dfe_large:
+    LA a1, str_dlg_too_large
+    J dfe_copy
+dfe_exists:
+    LA a1, str_dlg_exists
+dfe_copy:
+    LA a0, dlg_err
+    J str_copy
+
+; dlg_show_open / dlg_show_saveas: modal file dialogs for Notepad.
+dlg_show_open:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI a0, 1
+    CALL dlg_show_file
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+dlg_show_saveas:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI a0, 2
+    CALL dlg_show_file
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+; dlg_show_file: a0=1 open, 2 saveas. Preserves any pending action.
+dlg_show_file:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    LA t0, active_window
+    LW t1, 0(t0)
+    LA t0, dlg_owner
+    SW t1, 0(t0)
+    LA t0, dlg_mode
+    SW s0, 0(t0)
+    LI t0, 1
+    LA t1, dlg_filter
+    SW t0, 0(t1)               ; text files (*.TXT)
+    LI t0, 2
+    LA t1, dlg_focus
+    SW t0, 0(t1)               ; start in the filename field
+    LA t0, dlg_armed
+    SW zero, 0(t0)
+    LA t0, dlg_err
+    SB zero, 0(t0)
+    ; Start folder: dirname(note_path) for SaveAs, else Explorer cwd.
+    LI t0, 2
+    BNE s0, t0, dsf_explorer_dir
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, dsf_explorer_dir
+    LA a0, dlg_dir
+    LA a1, note_path
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL path_parent
+    LA a0, dlg_path
+    LA a1, dlg_dir
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_path_scroll
+    SW zero, 0(t0)
+    ; Initial name: basename of the current document.
+    LA t0, note_path
+    MV t1, t0
+dsf_base:
+    LBU t2, 0(t1)
+    BEQ t2, zero, dsf_base_d
+    LI t3, 47
+    BEQ t2, t3, dsf_base_s
+    ADDI t1, t1, 1
+    J dsf_base
+dsf_base_s:
+    ADDI t1, t1, 1
+    MV t0, t1
+    J dsf_base
+dsf_base_d:
+    LA a0, dlg_name
+    MV a1, t0
+    CALL str_copy
+    LA a0, dlg_name
+    CALL str_len
+    J dsf_name_set
+dsf_explorer_dir:
+    LA t0, fm_cwd
+    LBU t1, 0(t0)
+    BNE t1, zero, dsf_copy_fm
+    LI t1, 47
+    SB t1, 0(t0)
+    SB zero, 1(t0)
+dsf_copy_fm:
+    LA a0, dlg_dir
+    LA a1, fm_cwd
+    CALL str_copy
+    LA t0, dlg_dir
+    LBU t1, 0(t0)
+    BNE t1, zero, dsf_dir_ok
+    LI t1, 47
+    SB t1, 0(t0)
+    SB zero, 1(t0)
+dsf_dir_ok:
+    LA a0, dlg_path
+    LA a1, dlg_dir
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_path_scroll
+    SW zero, 0(t0)
+    LA t0, dlg_name
+    SB zero, 0(t0)
+    LI a0, 0
+dsf_name_set:
+    LA t0, dlg_name_len
+    SW a0, 0(t0)
+    LA t0, dlg_name_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    LA t0, dlg_last_row
+    LI t1, -1
+    SW t1, 0(t0)
+    CALL dlg_refresh_list
+    LA t0, dlg_active
+    SW s0, 0(t0)
+    CALL flag_redraw
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; dlg_show_confirm: a0=pending action -> Save/Discard/Cancel dialog.
+dlg_show_confirm:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, active_window
+    LW t1, 0(t0)
+    LA t0, dlg_owner
+    SW t1, 0(t0)
+    LA t0, dlg_pending
+    SW a0, 0(t0)
+    LI t0, 0
+    LA t1, dlg_focus
+    SW t0, 0(t1)
+    LA t0, dlg_err
+    SB zero, 0(t0)
+    LI t0, 3
+    LA t1, dlg_active
+    SW t0, 0(t1)
+    CALL flag_redraw
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; dlg_dismiss: close dialog, drop armed, restore owner focus, redraw.
+dlg_dismiss:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, dlg_active
+    SW zero, 0(t0)
+    LA t0, dlg_armed
+    SW zero, 0(t0)
+    LA t0, dlg_err
+    SB zero, 0(t0)
+    LA t0, dlg_owner
+    LW a0, 0(t0)
+    BEQ a0, zero, dd_noraise
+    CALL wm_raise
+dd_noraise:
+    CALL flag_redraw
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; dlg_cancel: Esc/Cancel -> dismiss, abort pending, preserve document.
+dlg_cancel:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA t0, dlg_pending
+    SW zero, 0(t0)
+    CALL dlg_dismiss
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; dlg_refresh_list: enumerate dlg_dir through FS_LIST with text filter.
+dlg_refresh_list:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    LI s0, 0
+    LI s1, 0
+    LA t0, dlg_dir
+    LBU t1, 0(t0)
+    BNE t1, zero, drl_have
+    LI t1, 47
+    SB t1, 0(t0)
+    SB zero, 1(t0)
+drl_have:
+drl_loop:
+    LI t0, 32
+    BGE s0, t0, drl_done
+    LA a0, dlg_dir
+    MV a1, s1
+    LI t0, 28
+    MUL t0, s0, t0
+    LA t1, dlg_list_buf
+    ADD a2, t1, t0
+    MV s2, a2
+    LI a7, 35
+    ECALL
+    BLT a0, zero, drl_done
+    ADDI s1, s1, 1
+    ; Skip "." and ".."
+    LBU t0, 0(s2)
+    LI t1, 46                ; '.'
+    BNE t0, t1, drl_chk_filter
+    LBU t2, 1(s2)
+    BEQ t2, zero, drl_loop   ; "." -> skip
+    BNE t2, t1, drl_chk_filter
+    LBU t3, 2(s2)
+    BEQ t3, zero, drl_loop   ; ".." -> skip
+drl_chk_filter:
+    ; Text filter: directories always pass; files need .TXT.
+    LA t0, dlg_filter
+    LW t1, 0(t0)
+    BEQ t1, zero, drl_keep
+    LBU t0, 13(s2)
+    ANDI t0, t0, 0x10
+    BNE t0, zero, drl_keep
+    MV a0, s2
+    LA a1, str_ext_txt
+    CALL ext_is
+    BEQ a0, zero, drl_loop
+drl_keep:
+    ADDI s0, s0, 1
+    J drl_loop
+drl_done:
+    LA t0, dlg_count
+    SW s0, 0(t0)
+    LA t0, dlg_sel
+    LW t1, 0(t0)
+    BEQ s0, zero, drl_empty
+    BGE t1, s0, drl_end
+    BLT t1, zero, drl_zero
+    J drl_scroll
+drl_end:
+    ADDI t1, s0, -1
+    SW t1, 0(t0)
+    J drl_scroll
+drl_zero:
+    SW zero, 0(t0)
+    J drl_scroll
+drl_empty:
+    SW zero, 0(t0)
+drl_scroll:
+    LA t0, dlg_scroll
+    LW t1, 0(t0)
+    BLT t1, zero, drl_szero
+    LA t2, dlg_sel
+    LW t2, 0(t2)
+    BLT t2, t1, drl_ssel
+    ADDI t3, t1, 10
+    BGE t2, t3, drl_sscroll
+    J drl_ret
+drl_ssel:
+    SW t2, 0(t0)
+    J drl_ret
+drl_sscroll:
+    ADDI t2, t2, -9
+    SW t2, 0(t0)
+    J drl_ret
+drl_szero:
+    SW zero, 0(t0)
+drl_ret:
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; dlg_vis_count: -> a0 = rows incl. synthetic ".." when not at root.
+dlg_vis_count:
+    LA t0, dlg_count
+    LW a0, 0(t0)
+    LA t1, dlg_dir
+    LBU t2, 0(t1)
+    LI t3, 47
+    BNE t2, t3, dvc_ret
+    LBU t2, 1(t1)
+    BEQ t2, zero, dvc_ret
+    ADDI a0, a0, 1
+dvc_ret:
+    RET
+
+; dlg_row_entry: a0=visible row -> a0=cache index, or -1 for "..", -2 invalid.
+dlg_row_entry:
+    LA t0, dlg_dir
+    LBU t1, 0(t0)
+    LI t2, 47
+    BNE t1, t2, dre_plain
+    LBU t1, 1(t0)
+    BNE t1, zero, dre_dot
+dre_plain:
+    LA t1, dlg_count
+    LW t1, 0(t1)
+    BGE a0, t1, dre_bad
+    RET
+dre_dot:
+    BEQ a0, zero, dre_isdot
+    ADDI a0, a0, -1
+    LA t1, dlg_count
+    LW t1, 0(t1)
+    BGE a0, t1, dre_bad
+    RET
+dre_isdot:
+    LI a0, -1
+    RET
+dre_bad:
+    LI a0, -2
+    RET
+
+; dlg_draw: topmost modal paint (called from os_repaint before flush).
+dlg_draw:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    LA t0, dlg_active
+    LW t0, 0(t0)
+    LI t1, 3
+    BEQ t0, t1, dlg_draw_confirm
+    LI t1, 4
+    BEQ t0, t1, dlg_draw_overwrite
+    CALL dlg_draw_file
+    J dlg_draw_ret
+dlg_draw_confirm:
+    CALL dlg_draw_confirm_body
+    J dlg_draw_ret
+dlg_draw_overwrite:
+    CALL dlg_draw_overwrite_body
+dlg_draw_ret:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; dlg_draw_box: a0=x,a1=y,a2=w,a3=h,a4=focused -> field background.
+dlg_draw_box:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    SD s3, 8(sp)
+    MV s0, a0
+    MV s1, a1
+    MV s2, a2
+    MV s3, a3
+    BEQ a4, zero, ddb_plain
+    ADDI a0, s0, -2
+    ADDI a1, s1, -2
+    ADDI a2, s2, 4
+    ADDI a3, s3, 4
+    LI a4, 0xFF38BDF8
+    LI a7, 14
+    ECALL
+ddb_plain:
+    MV a0, s0
+    MV a1, s1
+    MV a2, s2
+    MV a3, s3
+    LI a4, 0xFF0F172A
+    LI a7, 14
+    ECALL
+    LD s3, 8(sp)
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+dlg_draw_file:
+    ADDI sp, sp, -48
+    SD ra, 40(sp)
+    SD s0, 32(sp)
+    SD s1, 24(sp)
+    SD s2, 16(sp)
+    ; Title with visible filter tag.
+    LA a0, dlg_tmp
+    LA t0, dlg_mode
+    LW t1, 0(t0)
+    LI t2, 1
+    BNE t1, t2, ddf_save_title
+    LA a1, str_dlg_open_title
+    CALL str_copy
+    LA a0, dlg_tmp
+    LA a1, str_dlg_txt_tag
+    CALL str_append
+    J ddf_frame
+ddf_save_title:
+    LA a1, str_dlg_save_title
+    CALL str_copy
+ddf_frame:
+    LI a0, 120
+    LI a1, 80
+    LI a2, 560
+    LI a3, 420
+    LA a4, dlg_tmp
+    CALL draw_window_frame
+    ; Folder label + path field.
+    LI a0, 132
+    LI a1, 122
+    LA a2, str_dlg_folder
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    LI a4, 0
+    BEQ t1, zero, ddf_path_box
+    LI a4, 0
+    J ddf_path_box2
+ddf_path_box:
+    LI a4, 1
+ddf_path_box2:
+    LI a0, 196
+    LI a1, 118
+    LI a2, 472
+    LI a3, 24
+    CALL dlg_draw_box
+    LA a0, dlg_path_len
+    LA a1, dlg_path_caret
+    LA a2, dlg_path_scroll
+    LI a3, 472
+    CALL dlg_fix_scroll
+    LA a0, dlg_path
+    LA t0, dlg_path_len
+    LW a1, 0(t0)
+    LA t0, dlg_path_scroll
+    LW a2, 0(t0)
+    LA a3, dlg_tmp
+    CALL dlg_visible_copy
+    LI a0, 200
+    LI a1, 122
+    LA a2, dlg_tmp
+    LI a3, 0xFFF1F5F9
+    LI a4, 0x00000000
+    LI a5, 464
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    BNE t1, zero, ddf_list
+    LA t0, dlg_path_caret
+    LW t1, 0(t0)
+    LA t0, dlg_path_scroll
+    LW t2, 0(t0)
+    SUB t1, t1, t2
+    SLLI t1, t1, 3
+    ADDI a0, t1, 200
+    LI a1, 122
+    LI a2, 2
+    LI a3, 16
+    LI a4, 0xFF38BDF8
+    LI a7, 14
+    ECALL
+ddf_list:
+    ; List box + rows.
+    LI a0, 132
+    LI a1, 150
+    LI a2, 536
+    LI a3, 210
+    LI a4, 0xFF0F172A
+    LI a7, 14
+    ECALL
+    CALL dlg_vis_count
+    MV s0, a0                ; rows
+    LI s1, 0
+    LI s2, 154
+ddf_row:
+    LI t0, 10
+    BGE s1, t0, ddf_name
+    LA t0, dlg_scroll
+    LW t1, 0(t0)
+    ADD t1, t1, s1
+    BGE t1, s0, ddf_name
+    MV a0, t1
+    CALL dlg_row_entry
+    LI t0, -2
+    BEQ a0, t0, ddf_row_next
+    LI t0, -1
+    BEQ a0, t0, ddf_row_dotdot
+    ; Regular entry: a0 is cache index
+    LI t0, 28
+    MUL t0, a0, t0
+    LA t1, dlg_list_buf
+    ADD t0, t1, t0              ; t0 = entry pointer
+    ; Highlight if selected
+    LA t1, dlg_sel
+    LW t1, 0(t1)
+    LA t2, dlg_scroll
+    LW t2, 0(t2)
+    ADD t2, t2, s1
+    BNE t1, t2, ddf_file_nohl
+    LI a0, 134
+    MV a1, s2
+    ADDI a1, a1, -1
+    LI a2, 532
+    LI a3, 20
+    LI a4, 0xFF1E3A8A
+    LI a7, 14
+    ECALL
+ddf_file_nohl:
+    LBU t1, 13(t0)
+    ANDI t1, t1, 0x10
+    BNE t1, zero, ddf_file_isdir
+    ; Regular file: format size
+    SD t0, 8(sp)
+    LW a0, 20(t0)
+    LA a1, fm_size_buf
+    CALL fmt_size
+    LD t0, 8(sp)
+    ; Draw file name
+    LI a0, 138
+    MV a1, s2
+    MV a2, t0                   ; name
+    LI a3, 0xFFF1F5F9
+    LI a4, 0x00000000
+    LI a5, 350
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Draw file size
+    LI a0, 500
+    MV a1, s2
+    LA a2, fm_size_buf
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a5, 150
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    J ddf_row_next
+ddf_file_isdir:
+    ; Draw dir name
+    LI a0, 138
+    MV a1, s2
+    MV a2, t0                   ; name
+    LI a3, 0xFF38BDF8
+    LI a4, 0x00000000
+    LI a5, 350
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Draw <DIR>
+    LI a0, 500
+    MV a1, s2
+    LA a2, str_fm_dir_tag
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a5, 150
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    J ddf_row_next
+ddf_row_dotdot:
+    LA t1, dlg_sel
+    LW t1, 0(t1)
+    LA t2, dlg_scroll
+    LW t2, 0(t2)
+    ADD t2, t2, s1
+    BNE t1, t2, ddf_dd_nohl
+    LI a0, 134
+    MV a1, s2
+    ADDI a1, a1, -1
+    LI a2, 532
+    LI a3, 20
+    LI a4, 0xFF1E3A8A
+    LI a7, 14
+    ECALL
+ddf_dd_nohl:
+    LI a0, 138
+    MV a1, s2
+    LA a2, str_dotdot
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a5, 350
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    LI a0, 500
+    MV a1, s2
+    LA a2, str_fm_up_tag
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a5, 150
+    LI a6, 16
+    LI a7, 43
+    ECALL
+ddf_row_next:
+    ADDI s1, s1, 1
+    ADDI s2, s2, 20
+    J ddf_row
+ddf_name:
+    ; File label + name field.
+    LI a0, 132
+    LI a1, 370
+    LA a2, str_dlg_file
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    LI t2, 2
+    LI a4, 0
+    BEQ t1, t2, ddf_name_box_f
+    J ddf_name_box2
+ddf_name_box_f:
+    LI a4, 1
+ddf_name_box2:
+    LI a0, 196
+    LI a1, 366
+    LI a2, 330
+    LI a3, 24
+    CALL dlg_draw_box
+    LA a0, dlg_name_len
+    LA a1, dlg_name_caret
+    LA a2, dlg_name_scroll_unused
+    LI a3, 330
+    CALL dlg_fix_scroll_name
+    LA a0, dlg_name
+    LA t0, dlg_name_len
+    LW a1, 0(t0)
+    LI a2, 0
+    LA a3, dlg_tmp
+    CALL dlg_visible_copy
+    LI a0, 200
+    LI a1, 370
+    LA a2, dlg_tmp
+    LI a3, 0xFFF1F5F9
+    LI a4, 0x00000000
+    LI a5, 322
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    LI t2, 2
+    BNE t1, t2, ddf_buttons
+    LA t0, dlg_name_caret
+    LW t1, 0(t0)
+    SLLI t1, t1, 3
+    ADDI a0, t1, 200
+    LI a1, 370
+    LI a2, 2
+    LI a3, 16
+    LI a4, 0xFF38BDF8
+    LI a7, 14
+    ECALL
+ddf_buttons:
+    ; Primary + Cancel buttons.
+    LA t0, dlg_mode
+    LW t1, 0(t0)
+    LI t2, 1
+    LA a2, str_dlg_save_btn
+    BNE t1, t2, ddf_prim
+    LA a2, str_dlg_open_btn
+ddf_prim:
+    LI a0, 548
+    LI a1, 366
+    LI a2, 112
+    LI a3, 24
+    LI a4, 0xFF059669
+    LI a7, 14
+    ECALL
+    LA t0, dlg_mode
+    LW t1, 0(t0)
+    LI t2, 1
+    LA a2, str_dlg_save_btn
+    BNE t1, t2, ddf_prim_t
+    LA a2, str_dlg_open_btn
+ddf_prim_t:
+    LI a0, 556
+    LI a1, 370
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 548
+    LI a1, 396
+    LI a2, 112
+    LI a3, 24
+    LI a4, 0xFF334155
+    LI a7, 14
+    ECALL
+    LI a0, 556
+    LI a1, 400
+    LA a2, str_dlg_cancel_btn
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    ; Error line (fitted, always inside its bounds).
+    LI a0, 132
+    LI a1, 398
+    LA a2, dlg_err
+    LI a3, 0xFFEF4444
+    LI a4, 0x00000000
+    LI a5, 400
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    LD s2, 16(sp)
+    LD s1, 24(sp)
+    LD s0, 32(sp)
+    LD ra, 40(sp)
+    ADDI sp, sp, 48
+    RET
+
+; dlg_fix_scroll_name: name field has no scroll word; caret always visible
+; (names cap at 63 chars * 8px = 504 > 322px, so scroll by 8-char pages).
+dlg_fix_scroll_name:
+    LW t0, 0(a0)
+    LW t1, 0(a1)
+    BLT t1, t0, dfn_ok
+    SW t0, 0(a1)
+dfn_ok:
+    RET
+
+; dlg_draw_confirm_body: centered Save/Discard/Cancel prompt.
+dlg_draw_confirm_body:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    LI a0, 200
+    LI a1, 220
+    LI a2, 400
+    LI a3, 160
+    LA a4, str_dlg_confirm_title
+    CALL draw_window_frame
+    LI a0, 212
+    LI a1, 256
+    LA a2, str_confirm_msg
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 212
+    LI a1, 280
+    LA a2, dlg_err
+    LI a3, 0xFFEF4444
+    LI a4, 0x00000000
+    LI a5, 376
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Three buttons; focused one is blue, others slate.
+    LA t0, dlg_focus
+    LW s0, 0(t0)
+    LI a0, 212
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 0
+    BEQ s0, t0, ddc_f0
+    LI a4, 0xFF334155
+    J ddc_b0
+ddc_f0:
+    LI a4, 0xFF2563EB
+ddc_b0:
+    LI a7, 14
+    ECALL
+    LI a0, 220
+    LI a1, 326
+    LA a2, str_dlg_yes_btn
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 334
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 1
+    BEQ s0, t0, ddc_f1
+    LI a4, 0xFF334155
+    J ddc_b1
+ddc_f1:
+    LI a4, 0xFF2563EB
+ddc_b1:
+    LI a7, 14
+    ECALL
+    LI a0, 342
+    LI a1, 326
+    LA a2, str_dlg_no_btn
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 456
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 2
+    BEQ s0, t0, ddc_f2
+    LI a4, 0xFF334155
+    J ddc_b2
+ddc_f2:
+    LI a4, 0xFF2563EB
+ddc_b2:
+    LI a7, 14
+    ECALL
+    LI a0, 464
+    LI a1, 326
+    LA a2, str_dlg_cancel_btn
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; dlg_confirm_action: a0 = button index (0=Save, 1=Discard, 2=Cancel)
+dlg_confirm_action:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    MV s0, a0
+    LI t0, 2
+    BEQ s0, t0, dca_cancel
+    LI t0, 1
+    BEQ s0, t0, dca_discard
+    ; Save action (0)
+    LA t0, note_path
+    LBU t1, 0(t0)
+    BEQ t1, zero, dca_untitled
+    LA a0, note_path
+    CALL notepad_write_path
+    BLT a0, zero, dca_save_fail
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    CALL dlg_dismiss
+    CALL do_pending
+    J dca_done
+dca_untitled:
+    CALL dlg_show_saveas
+    J dca_done
+dca_save_fail:
+    CALL dlg_fs_error
+    CALL flag_redraw
+    J dca_done
+dca_discard:
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    CALL dlg_dismiss
+    CALL do_pending
+    J dca_done
+dca_cancel:
+    CALL dlg_cancel
+dca_done:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dlg_on_key_confirm:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI t0, 27                 ; Esc
+    BEQ a1, t0, dokc_esc
+    LI t0, 9                  ; Tab
+    BEQ a1, t0, dokc_tab
+    LI t0, 258                ; Left
+    BEQ a1, t0, dokc_left
+    LI t0, 259                ; Right
+    BEQ a1, t0, dokc_right
+    LI t0, 13                 ; Enter
+    BEQ a1, t0, dokc_act
+    LI t0, 10
+    BEQ a1, t0, dokc_act
+    LI t0, 32                 ; Space
+    BEQ a1, t0, dokc_act
+    LI t0, 83                 ; 'S'
+    BEQ a1, t0, dokc_save
+    LI t0, 115                ; 's'
+    BEQ a1, t0, dokc_save
+    LI t0, 68                 ; 'D'
+    BEQ a1, t0, dokc_disc
+    LI t0, 100                ; 'd'
+    BEQ a1, t0, dokc_disc
+    LI t0, 67                 ; 'C'
+    BEQ a1, t0, dokc_canc
+    LI t0, 99                 ; 'c'
+    BEQ a1, t0, dokc_canc
+    J dokc_ret
+dokc_esc:
+    LI a0, 2
+    CALL dlg_confirm_action
+    J dokc_ret
+dokc_tab:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    LI t2, 3
+    REM t1, t1, t2
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dokc_ret
+dokc_left:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, -1
+    BGE t1, zero, dokc_set_f
+    LI t1, 0
+    J dokc_set_f
+dokc_right:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    LI t2, 2
+    BLE t1, t2, dokc_set_f
+    LI t1, 2
+dokc_set_f:
+    LA t0, dlg_focus
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dokc_ret
+dokc_act:
+    LA t0, dlg_focus
+    LW a0, 0(t0)
+    CALL dlg_confirm_action
+    J dokc_ret
+dokc_save:
+    LI a0, 0
+    CALL dlg_confirm_action
+    J dokc_ret
+dokc_disc:
+    LI a0, 1
+    CALL dlg_confirm_action
+    J dokc_ret
+dokc_canc:
+    LI a0, 2
+    CALL dlg_confirm_action
+    J dokc_ret
+dokc_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+dlg_on_click_confirm:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI t0, 320
+    BLT a1, t0, docc_ret
+    LI t0, 348
+    BGT a1, t0, docc_ret
+    LI t0, 212
+    BLT a0, t0, docc_ret
+    LI t0, 322
+    BLE a0, t0, docc_save
+    LI t0, 334
+    BLT a0, t0, docc_ret
+    LI t0, 444
+    BLE a0, t0, docc_disc
+    LI t0, 456
+    BLT a0, t0, docc_ret
+    LI t0, 566
+    BLE a0, t0, docc_canc
+    J docc_ret
+docc_save:
+    LI a0, 0
+    CALL dlg_confirm_action
+    J docc_ret
+docc_disc:
+    LI a0, 1
+    CALL dlg_confirm_action
+    J docc_ret
+docc_canc:
+    LI a0, 2
+    CALL dlg_confirm_action
+    J docc_ret
+docc_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+; ==============================================================================
+; Overwrite Confirmation Dialog (Mode 4)
+; ==============================================================================
+dlg_draw_overwrite_body:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    LI a0, 200
+    LI a1, 220
+    LI a2, 400
+    LI a3, 160
+    LA a4, str_dlg_overwrite_title
+    CALL draw_window_frame
+    LI a0, 212
+    LI a1, 256
+    LA a2, str_dlg_exists
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+    LI a0, 212
+    LI a1, 280
+    LA a2, dlg_err
+    LI a3, 0xFFEF4444
+    LI a4, 0x00000000
+    LI a5, 376
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Three buttons: 0=Yes, 1=No, 2=Cancel
+    LA t0, dlg_focus
+    LW s0, 0(t0)
+
+    ; Button 0: [Yes] (212..322)
+    LI a0, 212
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 0
+    BEQ s0, t0, ddo_f0
+    LI a4, 0xFF334155
+    J ddo_b0
+ddo_f0:
+    LI a4, 0xFF2563EB
+ddo_b0:
+    LI a7, 14
+    ECALL
+    LI a0, 220
+    LI a1, 326
+    LA a2, str_dlg_btn_yes
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+
+    ; Button 1: [No] (334..444)
+    LI a0, 334
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 1
+    BEQ s0, t0, ddo_f1
+    LI a4, 0xFF334155
+    J ddo_b1
+ddo_f1:
+    LI a4, 0xFF2563EB
+ddo_b1:
+    LI a7, 14
+    ECALL
+    LI a0, 342
+    LI a1, 326
+    LA a2, str_dlg_btn_no
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+
+    ; Button 2: [Cancel] (456..566)
+    LI a0, 456
+    LI a1, 320
+    LI a2, 110
+    LI a3, 28
+    LI t0, 2
+    BEQ s0, t0, ddo_f2
+    LI a4, 0xFF334155
+    J ddo_b2
+ddo_f2:
+    LI a4, 0xFF2563EB
+ddo_b2:
+    LI a7, 14
+    ECALL
+    LI a0, 464
+    LI a1, 326
+    LA a2, str_dlg_cancel_btn
+    LI a3, 0xFFFFFFFF
+    LI a4, 0x00000000
+    LI a7, 15
+    ECALL
+
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dlg_overwrite_action:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI t0, 0
+    BEQ a0, t0, doa_yes
+    LI t0, 1
+    BEQ a0, t0, doa_no
+    ; 2: Cancel
+    CALL dlg_cancel
+    J doa_done
+doa_yes:
+    CALL dpa_do_write
+    J doa_done
+doa_no:
+    ; Restore Save As dialog
+    LI t0, 2
+    LA t1, dlg_active
+    SW t0, 0(t1)
+    LI t0, 2                 ; focus on filename field
+    LA t1, dlg_focus
+    SW t0, 0(t1)
+    LA t0, dlg_err
+    SB zero, 0(t0)
+    CALL flag_redraw
+doa_done:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+dlg_on_key_overwrite:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI t0, 27                 ; Esc
+    BEQ a1, t0, doko_esc
+    LI t0, 9                  ; Tab
+    BEQ a1, t0, doko_tab
+    LI t0, 258                ; Left
+    BEQ a1, t0, doko_left
+    LI t0, 259                ; Right
+    BEQ a1, t0, doko_right
+    LI t0, 13                 ; Enter
+    BEQ a1, t0, doko_act
+    LI t0, 10
+    BEQ a1, t0, doko_act
+    LI t0, 32                 ; Space
+    BEQ a1, t0, doko_act
+    LI t0, 121                ; 'y'
+    BEQ a1, t0, doko_yes
+    LI t0, 89                 ; 'Y'
+    BEQ a1, t0, doko_yes
+    LI t0, 110                ; 'n'
+    BEQ a1, t0, doko_no
+    LI t0, 78                 ; 'N'
+    BEQ a1, t0, doko_no
+    LI t0, 67                 ; 'C'
+    BEQ a1, t0, doko_esc
+    LI t0, 99                 ; 'c'
+    BEQ a1, t0, doko_esc
+    J doko_ret
+
+doko_esc:
+    LI a0, 2                  ; Cancel
+    CALL dlg_overwrite_action
+    J doko_ret
+
+doko_yes:
+    LI a0, 0                  ; Yes
+    CALL dlg_overwrite_action
+    J doko_ret
+
+doko_no:
+    LI a0, 1                  ; No
+    CALL dlg_overwrite_action
+    J doko_ret
+
+doko_tab:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    LI t2, 3
+    REM t1, t1, t2
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J doko_ret
+
+doko_left:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 2
+    LI t2, 3
+    REM t1, t1, t2
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J doko_ret
+
+doko_right:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    LI t2, 3
+    REM t1, t1, t2
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J doko_ret
+
+doko_act:
+    LA t0, dlg_focus
+    LW a0, 0(t0)
+    CALL dlg_overwrite_action
+    J doko_ret
+
+doko_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+dlg_on_click_overwrite:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LI t0, 320
+    BLT a1, t0, dco_chk_frame
+    LI t0, 348
+    BGT a1, t0, dco_chk_frame
+    LI t0, 212
+    BLT a0, t0, dco_chk_frame
+    LI t0, 322
+    BGT a0, t0, dco_chk_b1
+    LI a0, 0
+    CALL dlg_overwrite_action
+    J dco_ret
+dco_chk_b1:
+    LI t0, 334
+    BLT a0, t0, dco_chk_frame
+    LI t0, 444
+    BGT a0, t0, dco_chk_b2
+    LI a0, 1
+    CALL dlg_overwrite_action
+    J dco_ret
+dco_chk_b2:
+    LI t0, 456
+    BLT a0, t0, dco_chk_frame
+    LI t0, 566
+    BGT a0, t0, dco_chk_frame
+    LI a0, 2
+    CALL dlg_overwrite_action
+    J dco_ret
+dco_chk_frame:
+    CALL flag_redraw
+dco_ret:
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+dlg_activate_sel:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    LA t0, dlg_sel
+    LW a0, 0(t0)
+    CALL dlg_row_entry
+    LI t0, -1
+    BEQ a0, t0, das_parent
+    BLT a0, zero, das_ret
+    LI t0, 28
+    MUL t0, a0, t0
+    LA t1, dlg_list_buf
+    ADD s0, t1, t0
+    LBU t1, 13(s0)
+    ANDI t1, t1, 0x10
+    BNE t1, zero, das_dir
+    ; Regular file: copy name to dlg_name
+    LA a0, dlg_name
+    MV a1, s0
+    CALL str_copy
+    LA a0, dlg_name
+    CALL str_len
+    LA t0, dlg_name_len
+    SW a0, 0(t0)
+    LA t0, dlg_name_caret
+    SW a0, 0(t0)
+    CALL dlg_primary_action
+    J das_ret
+das_parent:
+    LA a0, dlg_dir
+    CALL path_parent
+    LA a0, dlg_path
+    LA a1, dlg_dir
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    CALL dlg_refresh_list
+    CALL flag_redraw
+    J das_ret
+das_dir:
+    LA a0, dlg_dir
+    MV a1, s0
+    LA a2, dlg_tmp_path
+    LI a3, 256
+    CALL path_join
+    BLT a0, zero, das_ret
+    LA a0, dlg_dir
+    LA a1, dlg_tmp_path
+    CALL str_copy
+    LA a0, dlg_path
+    LA a1, dlg_tmp_path
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    CALL dlg_refresh_list
+    CALL flag_redraw
+das_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dlg_primary_action:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    LA a0, dlg_name
+    LA a1, dlg_name           ; trimmed display string back into dlg_name
+    LI a2, 0                  ; skip canonical
+    CALL fat_validate_shortname
+    BEQ a0, zero, dpa_name_valid
+    CALL fat_error_msg
+    MV a1, a0
+    LA a0, dlg_err
+    CALL str_copy
+    CALL flag_redraw
+    J dpa_ret
+dpa_name_valid:
+    LA a0, dlg_name
+    CALL str_len
+    LA t0, dlg_name_len
+    SW a0, 0(t0)
+    LA t0, dlg_name_caret
+    SW a0, 0(t0)
+    LA a0, dlg_dir
+    LA a1, dlg_name
+    LA a2, dlg_tmp_path
+    LI a3, 256
+    CALL path_join
+    BLT a0, zero, dpa_badname
+dpa_check_mode:
+    LA t0, dlg_mode
+    LW t1, 0(t0)
+    LI t2, 1
+    BEQ t1, t2, dpa_do_open
+    ; Save As mode (2)
+    LA a0, dlg_tmp_path
+    LA a1, term_dirent
+    LI a7, 32                 ; SYS_FS_STAT
+    ECALL
+    BLT a0, zero, dpa_stat_neg
+    ; Destination exists!
+    LA t0, term_dirent
+    LBU t1, 13(t0)
+    ANDI t1, t1, 0x10
+    BNE t1, zero, dpa_badname ; cannot overwrite directory
+    ; Show Mode 4 Overwrite Confirmation
+    LI t0, 4
+    LA t1, dlg_active
+    SW t0, 0(t1)
+    LI t0, 0                  ; focus on [Yes]
+    LA t1, dlg_focus
+    SW t0, 0(t1)
+    LA t0, dlg_err
+    SB zero, 0(t0)
+    CALL flag_redraw
+    J dpa_ret
+dpa_stat_neg:
+    LI t0, -3                 ; DFS_ERR_NOT_FOUND
+    BEQ a0, t0, dpa_do_write
+    J dpa_fs_fail
+dpa_do_write:
+    LA a0, dlg_tmp_path
+    CALL notepad_write_path
+    BLT a0, zero, dpa_fs_fail
+    LA a0, note_path
+    LA a1, dlg_tmp_path
+    CALL str_copy
+    LA t0, note_dirty
+    SW zero, 0(t0)
+    CALL dlg_dismiss
+    CALL do_pending
+    J dpa_ret
+dpa_do_open:
+    LA a0, dlg_tmp_path
+    LA a1, term_dirent
+    LI a7, 32                 ; SYS_FS_STAT
+    ECALL
+    BLT a0, zero, dpa_fs_fail
+    LA t0, term_dirent
+    LBU t1, 13(t0)
+    ANDI t1, t1, 0x10
+    BEQ t1, zero, dpa_open_file
+    ; It is a directory -> navigate into it!
+    LA a0, dlg_dir
+    LA a1, dlg_tmp_path
+    CALL str_copy
+    LA a0, dlg_path
+    LA a1, dlg_tmp_path
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    LA t0, dlg_name
+    SB zero, 0(t0)
+    LA t0, dlg_name_len
+    SW zero, 0(t0)
+    LA t0, dlg_name_caret
+    SW zero, 0(t0)
+    CALL dlg_refresh_list
+    CALL flag_redraw
+    J dpa_ret
+dpa_open_file:
+    LA a0, dlg_tmp_path
+    CALL notepad_load_path
+    BLT a0, zero, dpa_fs_fail
+    CALL dlg_dismiss
+    CALL do_pending
+    J dpa_ret
+dpa_badname:
+    LA a0, dlg_err
+    LA a1, str_dlg_bad_name
+    CALL str_copy
+    CALL flag_redraw
+    J dpa_ret
+dpa_fs_fail:
+    CALL dlg_fs_error
+    CALL flag_redraw
+dpa_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dlg_on_key:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    MV s0, a1                 ; keycode
+    MV s1, a4                 ; modifiers
+    LA t0, dlg_active
+    LW t1, 0(t0)
+    LI t2, 3
+    BEQ t1, t2, dok_confirm
+    LI t2, 4
+    BEQ t1, t2, dok_overwrite
+    ; File dialog (mode 1 or 2)
+    LI t0, 27                 ; Esc
+    BEQ s0, t0, dok_esc
+    LI t0, 9                  ; Tab
+    BEQ s0, t0, dok_tab
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    BEQ t1, zero, dok_focus_path
+    LI t2, 1
+    BEQ t1, t2, dok_focus_list
+    LI t2, 2
+    BEQ t1, t2, dok_focus_name
+    LI t2, 3
+    BEQ t1, t2, dok_focus_prim
+    LI t2, 4
+    BEQ t1, t2, dok_focus_canc
+    J dok_ret
+dok_confirm:
+    MV a1, s0
+    MV a4, s1
+    CALL dlg_on_key_confirm
+    J dok_ret
+dok_overwrite:
+    MV a1, s0
+    MV a4, s1
+    CALL dlg_on_key_overwrite
+    J dok_ret
+dok_esc:
+    CALL dlg_cancel
+    J dok_ret
+dok_tab:
+    LA t0, dlg_focus
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    LI t2, 5
+    REM t1, t1, t2
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dok_ret
+dok_focus_prim:
+    LI t0, 13
+    BEQ s0, t0, dok_p_act
+    LI t0, 10
+    BEQ s0, t0, dok_p_act
+    LI t0, 32
+    BEQ s0, t0, dok_p_act
+    J dok_ret
+dok_p_act:
+    CALL dlg_primary_action
+    J dok_ret
+dok_focus_canc:
+    LI t0, 13
+    BEQ s0, t0, dok_c_act
+    LI t0, 10
+    BEQ s0, t0, dok_c_act
+    LI t0, 32
+    BEQ s0, t0, dok_c_act
+    J dok_ret
+dok_c_act:
+    CALL dlg_cancel
+    J dok_ret
+
+dok_focus_path:
+    LI t0, 13
+    BEQ s0, t0, dok_path_enter
+    LI t0, 10
+    BEQ s0, t0, dok_path_enter
+    LI t0, 258                ; Left
+    BEQ s0, t0, dok_path_left
+    LI t0, 259                ; Right
+    BEQ s0, t0, dok_path_right
+    LI t0, 270                ; Home
+    BEQ s0, t0, dok_path_home
+    LI t0, 271                ; End
+    BEQ s0, t0, dok_path_end
+    LI t0, 8                  ; Backspace
+    BEQ s0, t0, dok_path_bs
+    LI t0, 272                ; Delete
+    BEQ s0, t0, dok_path_del
+    LI t0, 32
+    BLT s0, t0, dok_ret
+    LI t0, 126
+    BGT s0, t0, dok_ret
+    LA a0, dlg_path
+    LA a1, dlg_path_len
+    LA a2, dlg_path_caret
+    LI a3, 250
+    MV a4, s0
+    CALL field_insert
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_enter:
+    ; Navigate to typed path if directory
+    LA a0, dlg_path
+    LA a1, term_dirent
+    LI a7, 32                 ; SYS_FS_STAT
+    ECALL
+    BLT a0, zero, dok_path_bad
+    LA t0, term_dirent
+    LBU t1, 13(t0)
+    ANDI t1, t1, 0x10
+    BEQ t1, zero, dok_path_bad
+    LA a0, dlg_dir
+    LA a1, dlg_path
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    LA t0, dlg_focus
+    LI t1, 2
+    SW t1, 0(t0)
+    CALL dlg_refresh_list
+    CALL flag_redraw
+    J dok_ret
+dok_path_bad:
+    LA a0, dlg_err
+    LA a1, str_dlg_not_found
+    CALL str_copy
+    CALL flag_redraw
+    J dok_ret
+dok_path_left:
+    LA t0, dlg_path_caret
+    LW t1, 0(t0)
+    ADDI t1, t1, -1
+    BLT t1, zero, dok_ret
+    SW t1, 0(t0)
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_right:
+    LA t0, dlg_path_len
+    LW t2, 0(t0)
+    LA t0, dlg_path_caret
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    BGT t1, t2, dok_ret
+    SW t1, 0(t0)
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_home:
+    LA t0, dlg_path_caret
+    SW zero, 0(t0)
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_end:
+    LA t0, dlg_path_len
+    LW t1, 0(t0)
+    LA t0, dlg_path_caret
+    SW t1, 0(t0)
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_bs:
+    LA a0, dlg_path
+    LA a1, dlg_path_len
+    LA a2, dlg_path_caret
+    CALL field_bs
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_del:
+    LA a0, dlg_path
+    LA a1, dlg_path_len
+    LA a2, dlg_path_caret
+    CALL field_del
+    CALL dok_path_fix
+    CALL flag_redraw
+    J dok_ret
+dok_path_fix:
+    ADDI sp, sp, -16
+    SD ra, 8(sp)
+    LA a0, dlg_path_len
+    LA a1, dlg_path_caret
+    LA a2, dlg_path_scroll
+    LI a3, 472
+    CALL dlg_fix_scroll
+    LD ra, 8(sp)
+    ADDI sp, sp, 16
+    RET
+
+dok_focus_list:
+    LI t0, 13
+    BEQ s0, t0, dok_list_enter
+    LI t0, 10
+    BEQ s0, t0, dok_list_enter
+    LI t0, 256                ; Up
+    BEQ s0, t0, dok_list_up
+    LI t0, 257                ; Down
+    BEQ s0, t0, dok_list_down
+    LI t0, 273                ; PgUp
+    BEQ s0, t0, dok_list_pgup
+    LI t0, 274                ; PgDn
+    BEQ s0, t0, dok_list_pgdn
+    LI t0, 270                ; Home
+    BEQ s0, t0, dok_list_home
+    LI t0, 271                ; End
+    BEQ s0, t0, dok_list_end
+    LI t0, 8                  ; Backspace
+    BEQ s0, t0, dok_list_back
+    J dok_ret
+dok_list_enter:
+    CALL dlg_activate_sel
+    J dok_ret
+dok_list_up:
+    LA t0, dlg_sel
+    LW t1, 0(t0)
+    ADDI t1, t1, -1
+    BLT t1, zero, dok_ret
+    SW t1, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_down:
+    CALL dlg_vis_count
+    MV t2, a0
+    LA t0, dlg_sel
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    BGE t1, t2, dok_ret
+    SW t1, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_pgup:
+    LA t0, dlg_sel
+    LW t1, 0(t0)
+    ADDI t1, t1, -10
+    BGE t1, zero, dok_lpu_ok
+    LI t1, 0
+dok_lpu_ok:
+    LA t0, dlg_sel
+    SW t1, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_pgdn:
+    CALL dlg_vis_count
+    MV t2, a0
+    LA t0, dlg_sel
+    LW t1, 0(t0)
+    ADDI t1, t1, 10
+    BLT t1, t2, dok_lpd_ok
+    ADDI t1, t2, -1
+    BLT t1, zero, dok_ret
+dok_lpd_ok:
+    LA t0, dlg_sel
+    SW t1, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_home:
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_end:
+    CALL dlg_vis_count
+    ADDI t1, a0, -1
+    BLT t1, zero, dok_ret
+    LA t0, dlg_sel
+    SW t1, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J dok_ret
+dok_list_back:
+    LA a0, dlg_dir
+    CALL path_parent
+    LA a0, dlg_path
+    LA a1, dlg_dir
+    CALL str_copy
+    LA a0, dlg_dir
+    CALL str_len
+    LA t0, dlg_path_len
+    SW a0, 0(t0)
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    LA t0, dlg_sel
+    SW zero, 0(t0)
+    LA t0, dlg_scroll
+    SW zero, 0(t0)
+    CALL dlg_refresh_list
+    CALL flag_redraw
+    J dok_ret
+
+dok_list_sync:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    LA t0, dlg_sel
+    LW s0, 0(t0)
+    LA t0, dlg_scroll
+    LW t1, 0(t0)
+    BLT s0, t1, dls_sc_up
+    ADDI t2, t1, 10
+    BGE s0, t2, dls_sc_down
+    J dls_up_name
+dls_sc_up:
+    SW s0, 0(t0)
+    J dls_up_name
+dls_sc_down:
+    ADDI t2, s0, -9
+    SW t2, 0(t0)
+dls_up_name:
+    MV a0, s0
+    CALL dlg_row_entry
+    BLT a0, zero, dls_ret
+    LI t0, 28
+    MUL t0, a0, t0
+    LA t1, dlg_list_buf
+    ADD t0, t1, t0
+    LBU t1, 13(t0)
+    ANDI t1, t1, 0x10
+    BNE t1, zero, dls_ret
+    ; Selected item is a file: update dlg_name
+    LA a0, dlg_name
+    MV a1, t0
+    CALL str_copy
+    LA a0, dlg_name
+    CALL str_len
+    LA t0, dlg_name_len
+    SW a0, 0(t0)
+    LA t0, dlg_name_caret
+    SW a0, 0(t0)
+dls_ret:
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dok_focus_name:
+    LI t0, 13
+    BEQ s0, t0, dok_name_enter
+    LI t0, 10
+    BEQ s0, t0, dok_name_enter
+    LI t0, 258                ; Left
+    BEQ s0, t0, dok_name_left
+    LI t0, 259                ; Right
+    BEQ s0, t0, dok_name_right
+    LI t0, 270                ; Home
+    BEQ s0, t0, dok_name_home
+    LI t0, 271                ; End
+    BEQ s0, t0, dok_name_end
+    LI t0, 8                  ; Backspace
+    BEQ s0, t0, dok_name_bs
+    LI t0, 272                ; Delete
+    BEQ s0, t0, dok_name_del
+    LI t0, 32
+    BLT s0, t0, dok_ret
+    LI t0, 126
+    BGT s0, t0, dok_ret
+    LA a0, dlg_name
+    LA a1, dlg_name_len
+    LA a2, dlg_name_caret
+    LI a3, 60
+    MV a4, s0
+    CALL field_insert
+    CALL flag_redraw
+    J dok_ret
+dok_name_enter:
+    CALL dlg_primary_action
+    J dok_ret
+dok_name_left:
+    LA t0, dlg_name_caret
+    LW t1, 0(t0)
+    ADDI t1, t1, -1
+    BLT t1, zero, dok_ret
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dok_ret
+dok_name_right:
+    LA t0, dlg_name_len
+    LW t2, 0(t0)
+    LA t0, dlg_name_caret
+    LW t1, 0(t0)
+    ADDI t1, t1, 1
+    BGT t1, t2, dok_ret
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dok_ret
+dok_name_home:
+    LA t0, dlg_name_caret
+    SW zero, 0(t0)
+    CALL flag_redraw
+    J dok_ret
+dok_name_end:
+    LA t0, dlg_name_len
+    LW t1, 0(t0)
+    LA t0, dlg_name_caret
+    SW t1, 0(t0)
+    CALL flag_redraw
+    J dok_ret
+dok_name_bs:
+    LA a0, dlg_name
+    LA a1, dlg_name_len
+    LA a2, dlg_name_caret
+    CALL field_bs
+    CALL flag_redraw
+    J dok_ret
+dok_name_del:
+    LA a0, dlg_name
+    LA a1, dlg_name_len
+    LA a2, dlg_name_caret
+    CALL field_del
+    CALL flag_redraw
+    J dok_ret
+
+dok_ret:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+dlg_on_click:
+    ADDI sp, sp, -32
+    SD ra, 24(sp)
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    MV s0, a0                 ; X
+    MV s1, a1                 ; Y
+    LA t0, dlg_active
+    LW t1, 0(t0)
+    LI t2, 3
+    BEQ t1, t2, doc_confirm
+    LI t2, 4
+    BEQ t1, t2, doc_overwrite
+    ; Primary button: X: 548..660, Y: 366..390
+    LI t0, 548
+    BLT s0, t0, doc_chk_cancel
+    LI t0, 660
+    BGT s0, t0, doc_chk_cancel
+    LI t0, 366
+    BLT s1, t0, doc_chk_cancel
+    LI t0, 390
+    BGT s1, t0, doc_chk_cancel
+    LA t0, dlg_focus
+    LI t1, 3
+    SW t1, 0(t0)
+    CALL dlg_primary_action
+    J doc_done
+
+doc_chk_cancel:
+    ; Cancel button: X: 548..660, Y: 396..420
+    LI t0, 548
+    BLT s0, t0, doc_chk_path
+    LI t0, 660
+    BGT s0, t0, doc_chk_path
+    LI t0, 396
+    BLT s1, t0, doc_chk_path
+    LI t0, 420
+    BGT s1, t0, doc_chk_path
+    CALL dlg_cancel
+    J doc_done
+
+doc_chk_path:
+    ; Path edit box: X: 196..668, Y: 118..142
+    LI t0, 196
+    BLT s0, t0, doc_chk_name
+    LI t0, 668
+    BGT s0, t0, doc_chk_name
+    LI t0, 118
+    BLT s1, t0, doc_chk_name
+    LI t0, 142
+    BGT s1, t0, doc_chk_name
+    LA t0, dlg_focus
+    SW zero, 0(t0)
+    LA t0, dlg_path_len
+    LW a0, 0(t0)
+    MV a1, s0
+    LI a2, 200
+    LA t0, dlg_path_scroll
+    LW a3, 0(t0)
+    CALL field_pick
+    LA t0, dlg_path_caret
+    SW a0, 0(t0)
+    CALL flag_redraw
+    J doc_done
+
+doc_chk_name:
+    ; Filename edit box: X: 196..526, Y: 366..390
+    LI t0, 196
+    BLT s0, t0, doc_chk_list
+    LI t0, 526
+    BGT s0, t0, doc_chk_list
+    LI t0, 366
+    BLT s1, t0, doc_chk_list
+    LI t0, 390
+    BGT s1, t0, doc_chk_list
+    LA t0, dlg_focus
+    LI t1, 2
+    SW t1, 0(t0)
+    LA t0, dlg_name_len
+    LW a0, 0(t0)
+    MV a1, s0
+    LI a2, 200
+    LI a3, 0
+    CALL field_pick
+    LA t0, dlg_name_caret
+    SW a0, 0(t0)
+    CALL flag_redraw
+    J doc_done
+
+doc_chk_list:
+    ; List box: X: 132..668, Y: 150..360
+    LI t0, 132
+    BLT s0, t0, doc_outside
+    LI t0, 668
+    BGT s0, t0, doc_outside
+    LI t0, 154
+    BLT s1, t0, doc_outside
+    LI t0, 354
+    BGT s1, t0, doc_outside
+    ADDI t0, s1, -154
+    LI t1, 20
+    DIVU t0, t0, t1           ; row 0..9
+    LA t1, dlg_scroll
+    LW t1, 0(t1)
+    ADD s0, t0, t1            ; visible row
+    CALL dlg_vis_count
+    BGE s0, a0, doc_outside
+    ; Valid row clicked!
+    LA t0, dlg_focus
+    LI t1, 1
+    SW t1, 0(t0)
+    LI a7, 13
+    ECALL                     ; current ms
+    MV t2, a0
+    LA t3, dlg_last_row
+    LW t4, 0(t3)
+    BNE t4, s0, doc_l_single
+    LA t3, dlg_last_ms
+    LD t5, 0(t3)
+    SUB t5, t2, t5
+    LI t6, 400
+    BGT t5, t6, doc_l_single
+    ; Double click on list row!
+    LA t3, dlg_last_row
+    LI t4, -1
+    SW t4, 0(t3)
+    LA t0, dlg_sel
+    SW s0, 0(t0)
+    CALL dlg_activate_sel
+    J doc_done
+doc_l_single:
+    LA t3, dlg_last_row
+    SW s0, 0(t3)
+    LA t3, dlg_last_ms
+    SD t2, 0(t3)
+    LA t0, dlg_sel
+    SW s0, 0(t0)
+    CALL dok_list_sync
+    CALL flag_redraw
+    J doc_done
+
+doc_confirm:
+    MV a0, s0
+    MV a1, s1
+    MV a2, a2
+    CALL dlg_on_click_confirm
+    J doc_done
+
+doc_overwrite:
+    MV a0, s0
+    MV a1, s1
+    CALL dlg_on_click_overwrite
+    J doc_done
+
+doc_outside:
+    ; Modal isolation: consume clicks outside controls
+    CALL flag_redraw
+doc_done:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    LD ra, 24(sp)
+    ADDI sp, sp, 32
+    RET
+
+; utf8_valid: a0=buf, a1=len -> a0=1 valid, 0 invalid.
+utf8_valid:
+    MV t0, a0
+    MV t1, a1
+    LI t2, 0
+uv_loop:
+    BGE t2, t1, uv_ok
+    ADD t3, t0, t2
+    LBU t3, 0(t3)
+    LI t4, 0x80
+    BLT t3, t4, uv_next1
+    LI t4, 0xC2
+    BLT t3, t4, uv_bad
+    LI t4, 0xE0
+    BLT t3, t4, uv_need1
+    LI t4, 0xF0
+    BLT t3, t4, uv_need2
+    LI t4, 0xF5
+    BGE t3, t4, uv_bad
+    J uv_need3
+uv_need1:
+    LI t4, 1
+    J uv_check
+uv_need2:
+    LI t4, 2
+    J uv_check
+uv_need3:
+    LI t4, 3
+uv_check:
+    ADD t5, t2, t4
+    BGE t5, t1, uv_bad
+    MV t6, t2
+uv_cont:
+    BGE t6, t5, uv_seq_ok
+    ADDI t6, t6, 1
+    ADD a0, t0, t6
+    LBU a0, 0(a0)
+    ANDI a0, a0, 0xC0
+    LI t3, 0x80
+    BNE a0, t3, uv_bad
+    J uv_cont
+uv_seq_ok:
+    ; Reject overlongs and surrogates by first-byte/lead rules.
+    ADD t3, t0, t2
+    LBU t3, 0(t3)
+    LI a0, 0xE0
+    BNE t3, a0, uv_ne0
+    ADD t3, t0, t2
+    ADDI t3, t3, 1
+    LBU t3, 0(t3)
+    LI a0, 0xA0
+    BLT t3, a0, uv_bad
+uv_ne0:
+    ADD t3, t0, t2
+    LBU t3, 0(t3)
+    LI a0, 0xED
+    BNE t3, a0, uv_ned
+    ADD t3, t0, t2
+    ADDI t3, t3, 1
+    LBU t3, 0(t3)
+    LI a0, 0xA0
+    BGE t3, a0, uv_bad
+uv_ned:
+    ADD t3, t0, t2
+    LBU t3, 0(t3)
+    LI a0, 0xF0
+    BNE t3, a0, uv_nf0
+    ADD t3, t0, t2
+    ADDI t3, t3, 1
+    LBU t3, 0(t3)
+    LI a0, 0x90
+    BLT t3, a0, uv_bad
+uv_nf0:
+    ADD t3, t0, t2
+    LBU t3, 0(t3)
+    LI a0, 0xF4
+    BNE t3, a0, uv_adv
+    ADD t3, t0, t2
+    ADDI t3, t3, 1
+    LBU t3, 0(t3)
+    LI a0, 0x90
+    BGE t3, a0, uv_bad
+uv_adv:
+    ADD t2, t2, t4
+    ADDI t2, t2, 1
+    J uv_loop
+uv_next1:
+    ADDI t2, t2, 1
+    J uv_loop
+uv_ok:
+    LI a0, 1
+    RET
+uv_bad:
+    LI a0, 0
+    RET
+
+; ==============================================================================
 ; Data Segment
 ; ==============================================================================
 str_top_title:
@@ -5196,6 +9244,10 @@ str_btn_open:
     .string "[ Open ]"
 str_btn_save:
     .string "[ Save ]"
+str_btn_saveas:
+    .string "[Save As]"
+str_boot_note:
+    .string "/NOTES.TXT"
 str_status_saved:
     .string "FAT16: Saved to Disk!"
 str_status_opened:
@@ -5208,6 +9260,22 @@ str_status_open_error:
     .string "Open failed: file not found"
 str_status_too_large:
     .string "Open refused: file exceeds 4000 bytes"
+str_status_bad_enc:
+    .string "Open refused: not valid UTF-8"
+str_status_missing:
+    .string "Open failed: not found"
+str_status_bad_name:
+    .string "Use 8.3 names (e.g. NOTES.TXT)"
+str_status_no_disk:
+    .string "Open failed: no disk"
+str_status_readonly:
+    .string "Save failed: read-only disk"
+str_status_diskfull:
+    .string "Save failed: disk full"
+str_note_title_base:
+    .string "Notepad - "
+str_note_dirty_mark:
+    .string " *"
 str_sfs_f0:
     .string "notes.txt"
 str_sfs_f1:
@@ -5224,9 +9292,119 @@ str_fm_hdr:
 str_fm_open_btn:
     .string "Open in Notepad"
 str_fm_empty:
-    .string "(empty entry)"
+    .string "(empty folder)"
 str_fm_nomount:
     .string "(No FAT16 volume detected)"
+str_fm_up:
+    .string "[ Up ]"
+str_fm_top:
+    .string "(top)"
+str_fm_hdr_name:
+    .string "NAME"
+str_fm_hdr_size:
+    .string "SIZE"
+str_fm_run_btn:
+    .string "[Run]"
+str_fm_edit_btn:
+    .string "[Edit]"
+str_fm_open_btn2:
+    .string "[Open]"
+str_fm_info_btn:
+    .string "[Info]"
+str_fm_dir_tag:
+    .string "<DIR>"
+str_fm_up_tag:
+    .string "<UP>"
+str_fm_hint:
+    .string "Enter open  Bksp up  F5 refresh"
+str_fm_unsupported:
+    .string "Unsupported file type"
+str_fm_launch_err:
+    .string "Cannot launch (bad DEXE/slot)"
+str_fm_items:
+    .string "items"
+str_root_path2:
+    .string "/"
+str_dotdot:
+    .string ".."
+str_ext_app:
+    .string "APP"
+str_ext_txt:
+    .string "TXT"
+str_dlg_open_title:
+    .string "Open file"
+str_dlg_save_title:
+    .string "Save As"
+str_dlg_confirm_title:
+    .string "Unsaved changes"
+str_dlg_folder:
+    .string "Folder:"
+str_dlg_file:
+    .string "File:"
+str_dlg_open_btn:
+    .string "[Open]"
+str_dlg_save_btn:
+    .string "[Save]"
+str_dlg_cancel_btn:
+    .string "[Cancel]"
+str_dlg_keep_btn:
+    .string "[Keep]"
+str_dlg_yes_btn:
+    .string "[Save]"
+str_dlg_no_btn:
+    .string "[Discard]"
+str_dlg_txt_tag:
+    .string " (*.TXT)"
+str_dlg_txt_filter:
+    .string "Text files (*.TXT)"
+str_dlg_all_filter:
+    .string "All files"
+str_dlg_83_rule:
+    .string "Use 8.3 names (e.g. NOTES.TXT)"
+str_dlg_not_found:
+    .string "Folder not found"
+str_dlg_no_file:
+    .string "Select or type a file"
+str_dlg_no_disk:
+    .string "No disk"
+str_dlg_ro:
+    .string "Read-only disk"
+str_dlg_full:
+    .string "Disk or directory full"
+str_dlg_bad_name:
+    .string "Invalid 8.3 name"
+str_dlg_missing:
+    .string "File not found"
+str_dlg_too_large:
+    .string "File exceeds 4000 bytes"
+str_dlg_bad_enc:
+    .string "Not valid UTF-8 text"
+str_dlg_io:
+    .string "Disk I/O error"
+str_dlg_exists:
+    .string "Replace existing file?"
+str_confirm_msg:
+    .string "Save changes first?"
+str_note_untitled:
+    .string "untitled"
+str_dlg_overwrite_title:
+    .string "Confirm Overwrite"
+str_dlg_btn_yes:
+    .string "[Yes]"
+str_dlg_btn_no:
+    .string "[No]"
+str_dlg_sep_err:
+    .string "No path separators in filename"
+str_dlg_base_len:
+    .string "Name exceeds 8 characters"
+str_dlg_ext_len:
+    .string "Extension exceeds 3 characters"
+str_dlg_multi_dot:
+    .string "Multiple dots not allowed"
+str_dlg_empty_base:
+    .string "Missing base name"
+str_dlg_invalid_char:
+    .string "Invalid character in filename"
 
 str_paint_title:
     .string "Paint - TrueColor Studio 800x600"
@@ -5344,6 +9522,11 @@ hit_window:
     .word 0
 drawing_window:
     .word 0
+; Compact taskbar: displayed slot -> window id; count of visible buttons.
+taskbar_map:
+    .space 8
+taskbar_count:
+    .word 0
 start_menu_open:
     .word 0
 exit_requested:
@@ -5388,6 +9571,8 @@ one_char_buf:
     .space 8
 note_status_str:
     .space 64
+note_title_buf:
+    .space 96
 
 ; Paint state
 paint_color:
@@ -5486,3 +9671,89 @@ fat16_dir_buf:
     .align 4
 note_buf:
     .space 4096
+    .align 4
+note_staging_buf:
+    .space 4096
+
+; Explorer model: visible list built from FS_LIST on every draw, so the
+; first completed listing already carries validated sizes. No sleeps.
+    .align 4
+fm_cwd:
+    .space 64
+fm_count:
+    .word 0
+fm_sel:
+    .word 0
+fm_scroll:
+    .word 0
+fm_last_row:
+    .word -1
+fm_last_ms:
+    .word 0
+fm_status:
+    .space 96
+fm_list_buf:
+    .space 896
+fm_tmp_path:
+    .space 256
+fm_size_buf:
+    .space 32
+
+; Notepad document: absolute path (empty = untitled, no destination).
+note_path:
+    .space 256
+
+; Shared file-dialog state (modal; see dlg_* below).
+dlg_active:
+    .word 0
+dlg_owner:
+    .word 0
+dlg_mode:
+    .word 0
+dlg_filter:
+    .word 0
+dlg_focus:
+    .word 0
+dlg_path:
+    .space 256
+dlg_path_len:
+    .word 0
+dlg_path_caret:
+    .word 0
+dlg_path_scroll:
+    .word 0
+dlg_name:
+    .space 64
+dlg_name_len:
+    .word 0
+dlg_name_caret:
+    .word 0
+dlg_dir:
+    .space 256
+dlg_armed:
+    .word 0
+dlg_tmp:
+    .space 256
+dlg_count:
+    .word 0
+dlg_sel:
+    .word 0
+dlg_scroll:
+    .word 0
+dlg_last_row:
+    .word -1
+dlg_last_ms:
+    .word 0
+dlg_err:
+    .space 96
+dlg_list_buf:
+    .space 896
+dlg_tmp_path:
+    .space 256
+; Confirm dialog: pending destructive action + destination path.
+dlg_pending:
+    .word 0
+dlg_pending_path:
+    .space 256
+dlg_name_scroll_unused:
+    .word 0

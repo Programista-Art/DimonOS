@@ -13,6 +13,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/Xatom.h>
 #include <locale.h>
 
 #include "dimon64.h"
@@ -44,6 +45,7 @@ static const char *cursor_arrow[19] = {
 
 static const char *g_dump_vram_path = NULL;
 static const char *g_dump_state_path = NULL;
+static const char *g_dump_ram_path = NULL;
 static const char *g_input_log_path = NULL;
 static FILE *g_input_log = NULL;
 static int g_stop_when_idle = 0;
@@ -183,6 +185,9 @@ typedef struct {
     Atom     wm_delete_window;
     int      mouse_x;
     int      mouse_y;
+    int      fullscreen;
+    int      saved_win_w;
+    int      saved_win_h;
 
     /* TUI state */
     int tui_initialized;
@@ -577,6 +582,101 @@ static void tui_poll_events(VM *vm) {
 }
 
 /* --- X11 Backend --- */
+static void x11_update_title(void) {
+    if (!g_app.dpy || !g_app.win) return;
+    const char *title = g_app.fullscreen
+        ? "DimonOS-64 Modern TrueColor GUI [F11: Windowed]"
+        : "DimonOS-64 Modern TrueColor GUI [F11: Fullscreen]";
+    XStoreName(g_app.dpy, g_app.win, title);
+}
+
+static void x11_get_viewport(int *vp_x, int *vp_y, int *vp_w, int *vp_h) {
+    int win_w = g_app.win_w;
+    int win_h = g_app.win_h;
+    int w = win_w;
+    int h = (win_w * 3) / 4;
+    if (h > win_h) {
+        h = win_h;
+        w = (win_h * 4) / 3;
+    }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    *vp_w = w;
+    *vp_h = h;
+    *vp_x = (win_w - w) / 2;
+    *vp_y = (win_h - h) / 2;
+}
+
+static void x11_resize_buffer(int new_w, int new_h) {
+    if (new_w <= 0 || new_h <= 0) return;
+    if (new_w == g_app.win_w && new_h == g_app.win_h && g_app.pixels && g_app.ximage) return;
+
+    g_app.win_w = new_w;
+    g_app.win_h = new_h;
+
+    if (g_app.ximage) {
+        XDestroyImage(g_app.ximage); /* frees g_app.pixels */
+        g_app.ximage = NULL;
+        g_app.pixels = NULL;
+    }
+    g_app.pixels = (uint32_t *)calloc((size_t)g_app.win_w * g_app.win_h, sizeof(uint32_t));
+    if (!g_app.pixels) return;
+
+    int screen = DefaultScreen(g_app.dpy);
+    g_app.ximage = XCreateImage(
+        g_app.dpy, DefaultVisual(g_app.dpy, screen),
+        DefaultDepth(g_app.dpy, screen), ZPixmap, 0,
+        (char *)g_app.pixels, g_app.win_w, g_app.win_h, 32, 0
+    );
+}
+
+static void x11_set_fullscreen(int enable) {
+    if (!g_app.dpy || !g_app.win) return;
+    if (g_app.fullscreen == enable) return;
+    g_app.fullscreen = enable;
+
+    int screen = DefaultScreen(g_app.dpy);
+    Window root = RootWindow(g_app.dpy, screen);
+
+    Atom wm_state = XInternAtom(g_app.dpy, "_NET_WM_STATE", False);
+    Atom wm_fullscreen = XInternAtom(g_app.dpy, "_NET_WM_STATE_FULLSCREEN", False);
+
+    XSizeHints *hints = XAllocSizeHints();
+    if (hints) {
+        if (g_app.fullscreen) {
+            hints->flags = 0;
+        } else {
+            hints->flags = PMinSize | PMaxSize;
+            hints->min_width = hints->max_width = g_app.saved_win_w;
+            hints->min_height = hints->max_height = g_app.saved_win_h;
+        }
+        XSetWMNormalHints(g_app.dpy, g_app.win, hints);
+        XFree(hints);
+    }
+
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type = ClientMessage;
+    xev.xclient.window = g_app.win;
+    xev.xclient.message_type = wm_state;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = g_app.fullscreen ? 1 : 0;
+    xev.xclient.data.l[1] = (long)wm_fullscreen;
+    xev.xclient.data.l[2] = 0;
+    xev.xclient.data.l[3] = 1;
+    xev.xclient.data.l[4] = 0;
+
+    XSendEvent(g_app.dpy, root, False,
+               SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+
+    if (!g_app.fullscreen) {
+        XResizeWindow(g_app.dpy, g_app.win, g_app.saved_win_w, g_app.saved_win_h);
+    }
+
+    x11_update_title();
+    XFlush(g_app.dpy);
+}
+
 static int x11_init(void) {
     if (g_app.dpy) return 0;
     const char *disp_name = getenv("DISPLAY");
@@ -586,18 +686,27 @@ static int x11_init(void) {
     if (!g_app.dpy) return -1;
 
     int screen = DefaultScreen(g_app.dpy);
+    int scr_w = DisplayWidth(g_app.dpy, screen);
     int scr_h = DisplayHeight(g_app.dpy, screen);
 
     if (g_app.scale <= 0) {
         g_app.scale = (scr_h >= 1200) ? 2 : 1;
     }
 
-    g_app.win_w = DIMON64_LFB_WIDTH * g_app.scale;
-    g_app.win_h = DIMON64_LFB_HEIGHT * g_app.scale;
+    g_app.saved_win_w = DIMON64_LFB_WIDTH * g_app.scale;
+    g_app.saved_win_h = DIMON64_LFB_HEIGHT * g_app.scale;
+
+    if (g_app.fullscreen) {
+        g_app.win_w = scr_w;
+        g_app.win_h = scr_h;
+    } else {
+        g_app.win_w = g_app.saved_win_w;
+        g_app.win_h = g_app.saved_win_h;
+    }
     g_app.mouse_x = DIMON64_LFB_WIDTH / 2;
     g_app.mouse_y = DIMON64_LFB_HEIGHT / 2;
 
-    g_app.pixels = (uint32_t *)calloc(g_app.win_w * g_app.win_h, sizeof(uint32_t));
+    g_app.pixels = (uint32_t *)calloc((size_t)g_app.win_w * g_app.win_h, sizeof(uint32_t));
     if (!g_app.pixels) {
         XCloseDisplay(g_app.dpy);
         g_app.dpy = NULL;
@@ -606,19 +715,25 @@ static int x11_init(void) {
 
     g_app.win = XCreateSimpleWindow(
         g_app.dpy, RootWindow(g_app.dpy, screen),
-        100, 100, g_app.win_w, g_app.win_h, 1,
+        g_app.fullscreen ? 0 : 100,
+        g_app.fullscreen ? 0 : 100,
+        g_app.win_w, g_app.win_h, 0,
         BlackPixel(g_app.dpy, screen),
         BlackPixel(g_app.dpy, screen)
     );
 
-    XStoreName(g_app.dpy, g_app.win, "DimonOS-64 Modern TrueColor GUI");
+    x11_update_title();
 
-    /* Prevent window resize */
+    /* Window size hints */
     XSizeHints *hints = XAllocSizeHints();
     if (hints) {
-        hints->flags = PMinSize | PMaxSize;
-        hints->min_width = hints->max_width = g_app.win_w;
-        hints->min_height = hints->max_height = g_app.win_h;
+        if (!g_app.fullscreen) {
+            hints->flags = PMinSize | PMaxSize;
+            hints->min_width = hints->max_width = g_app.win_w;
+            hints->min_height = hints->max_height = g_app.win_h;
+        } else {
+            hints->flags = 0;
+        }
         XSetWMNormalHints(g_app.dpy, g_app.win, hints);
         XFree(hints);
     }
@@ -626,9 +741,24 @@ static int x11_init(void) {
     g_app.wm_delete_window = XInternAtom(g_app.dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(g_app.dpy, g_app.win, &g_app.wm_delete_window, 1);
 
+    XWMHints *wm_hints = XAllocWMHints();
+    if (wm_hints) {
+        wm_hints->flags = InputHint;
+        wm_hints->input = True;
+        XSetWMHints(g_app.dpy, g_app.win, wm_hints);
+        XFree(wm_hints);
+    }
+
+    if (g_app.fullscreen) {
+        Atom wm_state = XInternAtom(g_app.dpy, "_NET_WM_STATE", False);
+        Atom wm_fullscreen = XInternAtom(g_app.dpy, "_NET_WM_STATE_FULLSCREEN", False);
+        XChangeProperty(g_app.dpy, g_app.win, wm_state, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)&wm_fullscreen, 1);
+    }
+
     long event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask |
                       ButtonReleaseMask | PointerMotionMask | ExposureMask |
-                      StructureNotifyMask;
+                      StructureNotifyMask | FocusChangeMask;
     XSelectInput(g_app.dpy, g_app.win, event_mask);
 
     g_app.gc = XCreateGC(g_app.dpy, g_app.win, 0, NULL);
@@ -673,39 +803,73 @@ static void x11_cleanup(void) {
 static void x11_flush_screen(VM *vm) {
     if (!g_app.dpy || !g_app.pixels || !vm || !vm->mem) return;
 
-    int scale = g_app.scale;
     int win_w = g_app.win_w;
     int win_h = g_app.win_h;
     uint32_t *lfb = (uint32_t *)(vm->mem + DIMON64_VRAM_BASE);
 
-    if (scale == 1) {
-        memcpy(g_app.pixels, lfb, (size_t)DIMON64_LFB_WIDTH * DIMON64_LFB_HEIGHT * sizeof(uint32_t));
-    } else {
-        for (int y = 0; y < DIMON64_LFB_HEIGHT; y++) {
-            uint32_t *src_row = &lfb[y * DIMON64_LFB_WIDTH];
-            for (int sy = 0; sy < scale; sy++) {
-                uint32_t *dst_row = &g_app.pixels[(y * scale + sy) * win_w];
-                for (int x = 0; x < DIMON64_LFB_WIDTH; x++) {
-                    uint32_t c = src_row[x];
-                    for (int sx = 0; sx < scale; sx++) {
-                        dst_row[x * scale + sx] = c;
-                    }
-                }
+    int vp_x, vp_y, vp_w, vp_h;
+    x11_get_viewport(&vp_x, &vp_y, &vp_w, &vp_h);
+
+    /* Clear letterbox / pillarbox regions outside 4:3 viewport to black */
+    if (vp_y > 0) {
+        memset(g_app.pixels, 0, (size_t)vp_y * win_w * sizeof(uint32_t));
+        int bottom_y = vp_y + vp_h;
+        if (bottom_y < win_h) {
+            memset(&g_app.pixels[bottom_y * win_w], 0, (size_t)(win_h - bottom_y) * win_w * sizeof(uint32_t));
+        }
+    }
+    if (vp_x > 0) {
+        for (int y = vp_y; y < vp_y + vp_h; y++) {
+            memset(&g_app.pixels[y * win_w], 0, (size_t)vp_x * sizeof(uint32_t));
+            int right_x = vp_x + vp_w;
+            if (right_x < win_w) {
+                memset(&g_app.pixels[y * win_w + right_x], 0, (size_t)(win_w - right_x) * sizeof(uint32_t));
             }
         }
     }
 
-    /* Composite hardware/32-bit mouse pointer cursor arrow */
-    int mx = g_app.mouse_x * scale;
-    int my = g_app.mouse_y * scale;
-    for (int cy = 0; cy < 19 * scale; cy++) {
+    /* Scale guest 800x600 framebuffer into 4:3 viewport */
+    if (vp_w == DIMON64_LFB_WIDTH && vp_h == DIMON64_LFB_HEIGHT && vp_x == 0 && vp_y == 0) {
+        memcpy(g_app.pixels, lfb, (size_t)DIMON64_LFB_WIDTH * DIMON64_LFB_HEIGHT * sizeof(uint32_t));
+    } else if (vp_w == DIMON64_LFB_WIDTH * 2 && vp_h == DIMON64_LFB_HEIGHT * 2 && vp_x == 0 && vp_y == 0) {
+        for (int y = 0; y < DIMON64_LFB_HEIGHT; y++) {
+            uint32_t *src_row = &lfb[y * DIMON64_LFB_WIDTH];
+            uint32_t *dst0 = &g_app.pixels[(y * 2) * win_w];
+            uint32_t *dst1 = &g_app.pixels[(y * 2 + 1) * win_w];
+            for (int x = 0; x < DIMON64_LFB_WIDTH; x++) {
+                uint32_t c = src_row[x];
+                dst0[x * 2] = c;
+                dst0[x * 2 + 1] = c;
+                dst1[x * 2] = c;
+                dst1[x * 2 + 1] = c;
+            }
+        }
+    } else {
+        /* Nearest-neighbor scaling for crisp bitmap text */
+        for (int y = 0; y < vp_h; y++) {
+            int gy = (y * DIMON64_LFB_HEIGHT) / vp_h;
+            uint32_t *src_row = &lfb[gy * DIMON64_LFB_WIDTH];
+            uint32_t *dst_row = &g_app.pixels[(vp_y + y) * win_w + vp_x];
+            for (int x = 0; x < vp_w; x++) {
+                int gx = (x * DIMON64_LFB_WIDTH) / vp_w;
+                dst_row[x] = src_row[gx];
+            }
+        }
+    }
+
+    /* Composite hardware/32-bit mouse pointer cursor arrow inside viewport */
+    int cursor_scale = vp_w / DIMON64_LFB_WIDTH;
+    if (cursor_scale < 1) cursor_scale = 1;
+    int mx = vp_x + (g_app.mouse_x * vp_w) / DIMON64_LFB_WIDTH;
+    int my = vp_y + (g_app.mouse_y * vp_h) / DIMON64_LFB_HEIGHT;
+    for (int cy = 0; cy < 19 * cursor_scale; cy++) {
         int py = my + cy;
-        if (py < 0 || py >= win_h) continue;
-        int row = cy / scale;
-        for (int cx = 0; cx < 12 * scale; cx++) {
+        if (py < vp_y || py >= vp_y + vp_h) continue;
+        int row = cy / cursor_scale;
+        for (int cx = 0; cx < 12 * cursor_scale; cx++) {
             int px = mx + cx;
-            if (px < 0 || px >= win_w) continue;
-            int col = cx / scale;
+            if (px < vp_x || px >= vp_x + vp_w) continue;
+            int col = cx / cursor_scale;
             char ch = cursor_arrow[row][col];
             if (ch == 'X') {
                 g_app.pixels[py * win_w + px] = 0xFF000000;
@@ -731,6 +895,9 @@ static void x11_poll_events(VM *vm) {
     gettimeofday(&tv, NULL);
     uint32_t now = (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 
+    int vp_x, vp_y, vp_w, vp_h;
+    x11_get_viewport(&vp_x, &vp_y, &vp_w, &vp_h);
+
     while (XPending(g_app.dpy) > 0) {
         XEvent ev;
         XNextEvent(g_app.dpy, &ev);
@@ -740,36 +907,80 @@ static void x11_poll_events(VM *vm) {
                 vm->halted = 1;
                 return;
             }
+        } else if (ev.type == ConfigureNotify) {
+            if (ev.xconfigure.width != g_app.win_w || ev.xconfigure.height != g_app.win_h) {
+                x11_resize_buffer(ev.xconfigure.width, ev.xconfigure.height);
+                x11_get_viewport(&vp_x, &vp_y, &vp_w, &vp_h);
+                if (g_app.vm) {
+                    x11_flush_screen(g_app.vm);
+                }
+            }
+        } else if (ev.type == FocusOut) {
+            if (s_last_motion_btn != 0 && s_last_motion_btn != 0xFF) {
+                s_last_motion_btn = 0;
+                vm_event_push_ext(vm, EVT_MOUSE_RELEASE, (uint16_t)g_app.mouse_x, (uint16_t)g_app.mouse_y, 1);
+            }
         } else if (ev.type == ButtonPress) {
-            int cx = ev.xbutton.x / g_app.scale;
-            int cy = ev.xbutton.y / g_app.scale;
-            if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT) {
-                g_app.mouse_x = cx;
-                g_app.mouse_y = cy;
-                uint8_t btn = (ev.xbutton.button == Button3) ? 2 : 1;
-                s_last_motion_x = cx;
-                s_last_motion_y = cy;
-                s_last_motion_btn = btn;
-                s_last_motion_time = now;
-                input_log("x11", "press", cx, cy, btn);
-                vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy, btn);
+            int hx = ev.xbutton.x;
+            int hy = ev.xbutton.y;
+            if (hx >= vp_x && hx < vp_x + vp_w && hy >= vp_y && hy < vp_y + vp_h) {
+                int cx = ((hx - vp_x) * DIMON64_LFB_WIDTH) / vp_w;
+                int cy = ((hy - vp_y) * DIMON64_LFB_HEIGHT) / vp_h;
+                if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT) {
+                    g_app.mouse_x = cx;
+                    g_app.mouse_y = cy;
+                    uint8_t btn = (ev.xbutton.button == Button3) ? 2 : 1;
+                    s_last_motion_x = cx;
+                    s_last_motion_y = cy;
+                    s_last_motion_btn = btn;
+                    s_last_motion_time = now;
+                    input_log("x11", "press", cx, cy, btn);
+                    vm_event_push_ext(vm, EVT_MOUSE_CLICK, (uint16_t)cx, (uint16_t)cy, btn);
+                }
             }
         } else if (ev.type == ButtonRelease) {
             s_last_motion_btn = 0;
-            int cx = ev.xbutton.x / g_app.scale, cy = ev.xbutton.y / g_app.scale;
+            int hx = ev.xbutton.x;
+            int hy = ev.xbutton.y;
+            int cx = ((hx - vp_x) * DIMON64_LFB_WIDTH) / vp_w;
+            int cy = ((hy - vp_y) * DIMON64_LFB_HEIGHT) / vp_h;
+            if (cx < 0) cx = 0;
+            if (cx >= DIMON64_LFB_WIDTH) cx = DIMON64_LFB_WIDTH - 1;
+            if (cy < 0) cy = 0;
+            if (cy >= DIMON64_LFB_HEIGHT) cy = DIMON64_LFB_HEIGHT - 1;
+            g_app.mouse_x = cx;
+            g_app.mouse_y = cy;
             uint8_t btn = (ev.xbutton.button == Button3) ? 2 : 1;
             input_log("x11", "release", cx, cy, btn);
-            if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT)
-                vm_event_push_ext(vm, EVT_MOUSE_RELEASE, (uint16_t)cx, (uint16_t)cy, btn);
+            vm_event_push_ext(vm, EVT_MOUSE_RELEASE, (uint16_t)cx, (uint16_t)cy, btn);
         } else if (ev.type == MotionNotify) {
-            int cx = ev.xmotion.x / g_app.scale;
-            int cy = ev.xmotion.y / g_app.scale;
+            int hx = ev.xmotion.x;
+            int hy = ev.xmotion.y;
+            uint8_t btn = 0;
+            if (ev.xmotion.state & Button1Mask) btn = 1;
+            else if (ev.xmotion.state & Button3Mask) btn = 2;
+
+            int in_vp = (hx >= vp_x && hx < vp_x + vp_w && hy >= vp_y && hy < vp_y + vp_h);
+            int cx, cy;
+            if (in_vp) {
+                cx = ((hx - vp_x) * DIMON64_LFB_WIDTH) / vp_w;
+                cy = ((hy - vp_y) * DIMON64_LFB_HEIGHT) / vp_h;
+            } else {
+                if (btn != 0) {
+                    cx = ((hx - vp_x) * DIMON64_LFB_WIDTH) / vp_w;
+                    cy = ((hy - vp_y) * DIMON64_LFB_HEIGHT) / vp_h;
+                    if (cx < 0) cx = 0;
+                    if (cx >= DIMON64_LFB_WIDTH) cx = DIMON64_LFB_WIDTH - 1;
+                    if (cy < 0) cy = 0;
+                    if (cy >= DIMON64_LFB_HEIGHT) cy = DIMON64_LFB_HEIGHT - 1;
+                } else {
+                    continue;
+                }
+            }
+
             if (cx >= 0 && cx < DIMON64_LFB_WIDTH && cy >= 0 && cy < DIMON64_LFB_HEIGHT) {
                 g_app.mouse_x = cx;
                 g_app.mouse_y = cy;
-                uint8_t btn = 0;
-                if (ev.xmotion.state & Button1Mask) btn = 1;
-                else if (ev.xmotion.state & Button3Mask) btn = 2;
 
                 /* Throttle redundant motion coordinates */
                 if (cx == s_last_motion_x && cy == s_last_motion_y && btn == s_last_motion_btn) {
@@ -796,6 +1007,10 @@ static void x11_poll_events(VM *vm) {
             KeySym ks;
             char str[32];
             int n = XLookupString(&ev.xkey, str, sizeof(str) - 1, &ks, NULL);
+            if (ks == XK_F11) {
+                x11_set_fullscreen(!g_app.fullscreen);
+                continue;
+            }
             uint16_t code = 0;
             uint8_t modifiers = 0;
             if (ev.xkey.state & ShiftMask) modifiers |= KEYMOD_SHIFT;
@@ -928,6 +1143,7 @@ static void usage(const char *p) {
         "  %s program.bin --iso image.iso       Program + attached disk\n"
         "Options:\n"
         "  -g, --gui             Force X11 graphical window (also: 'gui' positional)\n"
+        "  -f, --fullscreen      Start in X11 fullscreen mode (F11 toggles)\n"
         "  -tui, --tui           Force ANSI terminal console mode (TUI) (also: 'tui' positional)\n"
         "  -H, --headless        Memory-only GUI (no display output, for automated tests)\n"
         "  --dump-vram FILE      Write 800x600x4 ARGB VRAM to FILE on exit\n"
@@ -1088,10 +1304,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-t")) trace = 1;
         else if (!strcmp(argv[i], "-r")) dumpregs = 1;
         else if (!strcmp(argv[i], "-g") || !strcmp(argv[i], "--gui")) g_app.req_mode = 1;
+        else if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fullscreen")) { g_app.fullscreen = 1; g_app.req_mode = 1; }
         else if (!strcmp(argv[i], "-tui") || !strcmp(argv[i], "--tui")) g_app.req_mode = 2;
         else if (!strcmp(argv[i], "-H") || !strcmp(argv[i], "--headless")) g_app.req_mode = 3;
         else if (!strcmp(argv[i], "--dump-vram") && i + 1 < argc) g_dump_vram_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-state") && i + 1 < argc) g_dump_state_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-ram") && i + 1 < argc) g_dump_ram_path = argv[++i];
         else if (!strcmp(argv[i], "--input-log") && i + 1 < argc) g_input_log_path = argv[++i];
         else if (!strcmp(argv[i], "--stop-when-idle")) g_stop_when_idle = 1;
         else if (!strcmp(argv[i], "--inject-keys") && i + 1 < argc) g_inject_keys = argv[++i];
@@ -1235,6 +1453,17 @@ int main(int argc, char **argv) {
             size_t wn = fwrite(vm.mem + DIMON64_VRAM_BASE, 1, (size_t)DIMON64_VRAM_SIZE, df);
             if (wn != (size_t)DIMON64_VRAM_SIZE) perror("fwrite --dump-vram");
             fclose(df);
+        }
+    }
+
+    if (g_dump_ram_path) {
+        FILE *rf = fopen(g_dump_ram_path, "wb");
+        if (!rf) {
+            perror("fopen --dump-ram");
+        } else {
+            size_t wn = fwrite(vm.mem, 1, (size_t)(1024 * 1024), rf);
+            if (wn != (size_t)(1024 * 1024)) perror("fwrite --dump-ram");
+            fclose(rf);
         }
     }
 

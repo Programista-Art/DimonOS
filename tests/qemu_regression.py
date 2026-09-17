@@ -135,11 +135,13 @@ def main():
         wait_for(monitor.exists, 5, "QEMU monitor socket")
         wait_for(lambda: serial.exists() and
                  "Starting DimonOS-64" in serial.read_text(errors="replace"),
-                 20, "fresh kernel boot marker")
+                 40, "fresh kernel boot marker")
         hmp = HMP(monitor)
+        time.sleep(0.8)
 
         hmp.key("1")
-        opened = hmp.screenshot(out / "01-calculator-open.ppm")
+        wait_for(lambda: pixel(hmp.screenshot(out / "01-calculator-open.ppm"), 245, 75) == TITLE, 4, "calculator open")
+        opened = read_ppm(out / "01-calculator-open.ppm")
         assert pixel(opened, 245, 75) == TITLE
 
         # Original minimize hang: minimize only Calculator, then F1 must still

@@ -49,21 +49,42 @@ bare-metal FAT16 test disk is read-only, so no pending write is abandoned.
 ## Desktop Controls
 
 - Mouse: click `[ START ]`, menu items, top-bar shortcuts, desktop
-  icons, calculator keypad and paint canvas. Drag a title bar to move its
+  icons, calculator keypad, paint canvas, and file dialog controls. Drag a title bar to move its
   window; `-` minimizes and `X` closes it. Dragging remains captured until the
   mouse button is released.
 - Keyboard: `F1` Start menu, `F2`-`F7` / `1`-`7` open apps,
-  `Alt+Tab` cycles and restores windows, `Esc` closes the focused window/menu.
-- Each open app has a fixed taskbar slot. Clicking an inactive/minimized slot
-  focuses or restores it; clicking the active slot minimizes it. All seven
-  slots fit between Start and the clock without overlap.
+  `Alt+Tab` cycles and restores windows, `Esc` closes the focused window/menu/dialog.
+  `F11` toggles fullscreen mode with 4:3 centered letterboxing in the hosted emulator.
+- Compact taskbar: only active/minimized applications occupy taskbar buttons, packed
+  tightly starting at x=100 (8px after Start) with stride 78. Clicking an inactive/minimized slot
+  focuses or restores it; clicking the active slot minimizes it.
 - Apps: Calculator (mouse + keys), Notepad, File Explorer
-  (Up/Down), Paint (arrows/Space, `1`-`6`, `R G B Y W`, `C`),
+  (Up/Down, Enter/Click navigation, per-type actions), Paint (arrows/Space, `1`-`6`, `R G B Y W`, `C`),
   System Info, Snake (arrows, `R`), Terminal
   (`help info pwd ls run PATH clear exit`).
-- Notepad: arrows, Home/End, Backspace/Delete, F9 or Ctrl+S to save,
-  F10 to open. The current editor limit is 4000 bytes; larger files are
-  rejected without truncation.
+- Notepad: full document lifecycle with untitled support, dirty mark `*`, Save/Discard/Cancel
+  prompt on New, Open, Close and Shutdown.
+  - Shortcuts: `Ctrl+S`, `F9`, or `F2` to Save; `F3` for Save As; `Ctrl+O` or `F10` to Open; `Ctrl+N` for New document; `Esc` to dismiss dialogs.
+  - Open & Save As Dialogs: Native modal Delphi-style dialogs browsing FAT16 directories with text filter (*.TXT), editable path and filename fields, list scrolling (mouse or Up/Down), single-click to select, Enter or Open button or double-click to load/save, and complete modal isolation.
+  - 8.3 Shortname Validation: Filenames are validated with informative, truthful error strings:
+    - Base name up to 8 characters (`Name exceeds 8 characters`)
+    - Extension up to 3 characters (`Extension exceeds 3 characters`)
+    - At most one dot (`Multiple dots not allowed`)
+    - Base name required before dot (`Missing base name`)
+    - No slashes in filename field (`No path separators in filename`)
+    - Valid FAT characters only: letters, digits, `! # $ % & ' ( ) - @ ^ _ \` { } ~` (`Invalid character in filename`)
+  - Overwrite Confirmation: Attempting to Save As over an existing file opens an overwrite confirmation modal:
+    - `[Yes]` overwrites the target file and marks document clean.
+    - `[No]` preserves both the Save As dialog and current document unsaved.
+    - `[Cancel]` dismisses the dialog and returns to editing.
+  - Document Protection: 4000 byte buffer limit and UTF-8 pre-validation check the file before loading; invalid UTF-8 or oversized files are rejected with dedicated error messages and never corrupt or clobber current buffer content.
+  - Filesystem & Persistence Semantics:
+    - Hosted emulator: Run with `--disk <image.iso> --disk-writable` to enable persistent writes to FAT16 clusters and directory entries. On read-only media (`--disk-readonly` or unwritable file), Notepad truthfully displays `Save failed: read-only disk` and keeps the document dirty marker `*`.
+    - Bare-metal ISO: The standalone bootable CD-ROM embeds a read-only root image (`vm.disk_writable = 0`); attempts to save report read-only media failure without claiming false persistence across reboots.
+- File Explorer: displays FAT16 directories with decimal sizes (B/KB/MB) and `<DIR>` indicators
+  on the initial draw using `SYS_FS_LIST`. Double-clicking or clicking action buttons invokes
+  the type dispatcher: directories navigate into subfolders, `.TXT` files open in Notepad,
+  `.APP` binaries launch via `SYS_APP_EXEC` (e.g. `snake.app`), and unsupported files report status.
 - `run SNAKE.APP` starts the packaged isolated app. Esc exits Snake.
 
 ## Expected Output

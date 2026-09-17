@@ -70,10 +70,32 @@ static const char *base_name(const char *p) {
     return s ? s + 1 : p;
 }
 
+static int mkdir_in_iso(const char *image_path, const char *dir_path) {
+    size_t image_len = 0;
+    uint8_t *image = read_file(image_path, &image_len);
+    if (!image) { fprintf(stderr, "Cannot read image.\n"); return 1; }
+    if (image_len % 512u || image_len / 512u > DISK_MAX_SECTORS) {
+        fprintf(stderr, "Invalid image.\n"); free(image); return 1;
+    }
+    VM vm; memset(&vm, 0, sizeof(vm)); vm.disk_data = image;
+    vm.disk_sectors = (uint32_t)(image_len / 512u); vm.disk_writable = 1;
+    snprintf(vm.disk_path, sizeof(vm.disk_path), "%s", image_path);
+    char path[128];
+    if (dir_path[0] == '/') snprintf(path, sizeof(path), "%s", dir_path);
+    else snprintf(path, sizeof(path), "/%s", dir_path);
+    int rc = dimonfs_mkdir(&vm, path);
+    if (rc != DFS_OK && rc != DFS_ERR_EXISTS) {
+        fprintf(stderr, "mkdir failed: %s (%d)\n", dimonfs_error(rc), rc);
+        free(image); return 1;
+    }
+    printf("Created directory %s in %s\n", path, image_path);
+    free(image); return 0;
+}
+
 static int add_to_iso(const char *image_path, char *spec, int replace) {
     char *sep = strrchr(spec, ':');
     const char *name = base_name(spec);
-    if (sep && !strchr(sep + 1, '/') && !strchr(sep + 1, '\\')) {
+    if (sep) {
         *sep = 0; name = sep + 1;
     }
     size_t image_len = 0, file_len = 0;
@@ -86,7 +108,9 @@ static int add_to_iso(const char *image_path, char *spec, int replace) {
     VM vm; memset(&vm, 0, sizeof(vm)); vm.disk_data = image;
     vm.disk_sectors = (uint32_t)(image_len / 512u); vm.disk_writable = 1;
     snprintf(vm.disk_path, sizeof(vm.disk_path), "%s", image_path);
-    char path[32]; snprintf(path, sizeof(path), "/%s", name);
+    char path[128];
+    if (name[0] == '/') snprintf(path, sizeof(path), "%s", name);
+    else snprintf(path, sizeof(path), "/%s", name);
     Dimon64DirEnt ent;
     if (!replace && dimonfs_stat(&vm, path, &ent) == DFS_OK) {
         fprintf(stderr, "Refusing to replace existing '%s' (use --force).\n", path);
@@ -95,7 +119,7 @@ static int add_to_iso(const char *image_path, char *spec, int replace) {
     int rc = dimonfs_write(&vm, path, file, (uint32_t)file_len, 1, 1);
     if (rc != DFS_OK) { fprintf(stderr, "Add failed: %s (%d)\n", dimonfs_error(rc), rc); free(image); free(file); return 1; }
     printf("Added %s as %s to %s (%zu bytes)\n", spec, path, image_path, file_len);
-    free(image); free(file); return 0;
+    free(image); return 0;
 }
 
 static void put16(uint8_t *b, int off, uint16_t v) {
@@ -224,6 +248,10 @@ int main(int argc, char **argv) {
         int replace = 0;
         for (int i = 4; i < argc; i++) if (!strcmp(argv[i], "--force")) replace = 1;
         return add_to_iso(argv[2], argv[3], replace);
+    }
+    if (!strcmp(argv[1], "--mkdir")) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return mkdir_in_iso(argv[2], argv[3]);
     }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list") && i + 1 < argc) {
