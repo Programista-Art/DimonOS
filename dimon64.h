@@ -299,7 +299,7 @@ typedef struct {
 typedef struct {
     char name[13];
     uint8_t attributes;
-    uint8_t reserved[3];
+    uint8_t reserved[6];
     uint32_t size;
     uint32_t first_cluster;
 } Dimon64DirEnt;
@@ -337,7 +337,31 @@ typedef struct {
     char name[16];
 } Dimon64ExecHeader;
 
-/* Disk / ISO image (DIMON-ISO): 512B sectors */
+_Static_assert(sizeof(Dimon64DirEnt) == 28, "Dimon64DirEnt ABI size must be 28");
+_Static_assert(sizeof(Dimon64ProcInfo) == 72, "Dimon64ProcInfo ABI size must be 72");
+_Static_assert(sizeof(Dimon64ExecHeader) == 56, "Dimon64ExecHeader ABI size must be 56");
+
+/* Persistent block-device abstraction (bare-metal ATA PIO or hosted file).
+ * The FAT16 service operates on vm->disk_data as a sector cache; when
+ * vm->block_device is bound, writes are written through to the device and
+ * dimonfs_sync flushes the full cached volume. The boot ISO is never bound
+ * as writable: only an explicitly validated external FAT16 data disk is. */
+typedef struct {
+    void *context;
+    uint32_t sectors;
+    int (*read)(void *, uint32_t, uint32_t, void *);
+    int (*write)(void *, uint32_t, uint32_t, const void *);
+    int (*flush)(void *);
+} Dimon64BlockDevice;
+
+/* Desktop-visible storage modes. */
+enum {
+    DIMON_STORAGE_UNKNOWN = 0,
+    DIMON_STORAGE_WRITABLE = 1,
+    DIMON_STORAGE_READONLY = 2,
+    DIMON_STORAGE_NODISK = 3,
+    DIMON_STORAGE_ERROR = 4
+};
 #define DISK_SECTOR_SIZE 512
 #define DISK_MAX_SECTORS 8192
 #define DISK_BOOT_MAGIC0 0x55
@@ -414,10 +438,14 @@ typedef struct {
     uint64_t    next_pid;
     uint64_t    switches; /* Context switch counter */
 
-    /* Virtual disk */
+    /* Virtual disk: disk_data is the sector cache (512 B sectors).
+     * When block_device is bound (bare-metal ATA data disk), sector writes
+     * are written through to the device; the boot ISO is never bound. */
     uint8_t  *disk_data;
     uint32_t disk_sectors;
     uint8_t  disk_writable;
+    uint8_t  storage_mode;
+    Dimon64BlockDevice *block_device;
     char     disk_path[256];
 
     /* GUI subsystem */
@@ -474,9 +502,12 @@ int  vm_load_buf(VM *vm, const uint8_t *buf, size_t len, uint64_t load_addr);
 void vm_reset(VM *vm, uint64_t start_pc);
 
 void vm_disk_detach(VM *vm);
+void vm_block_bind(VM *vm, Dimon64BlockDevice *device);
+void vm_block_unbind(VM *vm);
 int  vm_disk_boot(VM *vm, uint64_t load_addr);
 int  vm_disk_read(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count);
 int  vm_disk_write(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count);
+int  vm_disk_sync(VM *vm);
 
 int  vm_step(VM *vm);
 int  vm_run(VM *vm);

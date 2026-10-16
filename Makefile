@@ -115,8 +115,11 @@ BM_LD = ld -m elf_i386 -z noexecstack
 arch/x86/boot.o: arch/x86/boot.S os.bin dimon.iso
 	$(BM_CC) -c -o arch/x86/boot.o arch/x86/boot.S
 
-arch/x86/kernel.o: arch/x86/kernel.c arch/x86/io.h dimon64.h
+arch/x86/kernel.o: arch/x86/kernel.c arch/x86/io.h arch/x86/ata.c arch/x86/ata.h dimon64.h
 	$(BM_CC) $(BM_CFLAGS) -c -o arch/x86/kernel.o arch/x86/kernel.c
+
+arch/x86/ata.o: arch/x86/ata.c arch/x86/ata.h arch/x86/io.h dimon64.h
+	$(BM_CC) $(BM_CFLAGS) -c -o arch/x86/ata.o arch/x86/ata.c
 
 vm_baremetal.o: vm.c dimon64.h dimonfs.h font8x16.h
 	$(BM_CC) $(BM_CFLAGS) -c -o vm_baremetal.o vm.c
@@ -124,8 +127,8 @@ vm_baremetal.o: vm.c dimon64.h dimonfs.h font8x16.h
 dimonfs_baremetal.o: dimonfs.c dimonfs.h dimon64.h
 	$(BM_CC) $(BM_CFLAGS) -c -o dimonfs_baremetal.o dimonfs.c
 
-dimon-kernel.elf: arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o dimonfs_baremetal.o arch/x86/linker.ld
-	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o dimon-kernel.elf arch/x86/boot.o arch/x86/kernel.o vm_baremetal.o dimonfs_baremetal.o
+dimon-kernel.elf: arch/x86/boot.o arch/x86/kernel.o arch/x86/ata.o vm_baremetal.o dimonfs_baremetal.o arch/x86/linker.ld
+	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o dimon-kernel.elf arch/x86/boot.o arch/x86/kernel.o arch/x86/ata.o vm_baremetal.o dimonfs_baremetal.o
 
 baremetal: dimon-kernel.elf
 
@@ -139,6 +142,44 @@ baremetal-iso: dimon-baremetal.iso
 
 qemu: dimon-baremetal.iso
 	qemu-system-i386 -cdrom dimon-baremetal.iso -boot d -m 256M -serial stdio -vga std
+
+# Persistent writable FAT16 data disk (raw image for QEMU IDE and VirtualBox IDE).
+# The boot ISO stays read-only; only this image is ever written by the guest.
+# Creation refuses to overwrite; recreation requires explicit FORCE=1.
+DATA_DISK ?= dimon-data.img
+
+data-disk-new: dimon-mkiso apps
+	./dimon-mkiso -o $(DATA_DISK) apps/snake.app:SNAKE.APP
+
+data-disk-new-force: dimon-mkiso apps
+	./dimon-mkiso -o $(DATA_DISK) apps/snake.app:SNAKE.APP --force
+
+data-disk-install-apps: dimon-mkiso apps
+	./dimon-mkiso --mkdir $(DATA_DISK) /DOCS
+	./dimon-mkiso --add $(DATA_DISK) apps/snake.app:SNAKE.APP
+
+data-disk-install-apps-force: dimon-mkiso apps
+	./dimon-mkiso --mkdir $(DATA_DISK) /DOCS
+	./dimon-mkiso --add $(DATA_DISK) apps/snake.app:SNAKE.APP --force
+
+data-disk-list: dimon-mkiso
+	./dimon-mkiso --list $(DATA_DISK)
+
+run-qemu-persistent: dimon-baremetal.iso
+	@if [ ! -f "$(DATA_DISK)" ]; then echo "Missing $(DATA_DISK); run 'make data-disk-new' first." >&2; exit 1; fi
+	qemu-system-i386 -cdrom dimon-baremetal.iso -drive file=$(DATA_DISK),format=raw,if=ide -boot d -m 256M -serial stdio -vga std
+
+help:
+	@echo "Targets:"
+	@echo "  make all os.bin apps        compile/assemble (never touches data disks)"
+	@echo "  make disk-new               explicit new hosted disk dimon.iso (refuses overwrite)"
+	@echo "  make data-disk-new          explicit new writable data disk $(DATA_DISK) (refuses overwrite)"
+	@echo "  make data-disk-new-force    recreate $(DATA_DISK) (explicit, erases documents; back up first)"
+	@echo "  make data-disk-install-apps install SNAKE.APP into $(DATA_DISK) preserving documents"
+	@echo "  make run-qemu-persistent    boot ISO + IDE raw data disk (persistent saves)"
+	@echo "  make regression             hosted/headless, X11, isolated QEMU checks"
+	@echo "  make regression-persistent  QEMU save/reboot persistence on disposable images"
+	@echo "  make clean                  preserves dimon.iso and $(DATA_DISK)"
 
 qemu-multiboot: dimon-kernel.elf
 	qemu-system-i386 -kernel dimon-kernel.elf -m 256M -serial stdio -vga std
@@ -161,8 +202,11 @@ $(REG_DISK): dimon-mkiso apps/snake.app | $(REG_BUILD)
 $(REG_BUILD)/boot.o: arch/x86/boot.S $(REG_OS) $(REG_DISK) | $(REG_BUILD)
 	$(BM_CC) -DOS_IMAGE_PATH='"$(abspath $(REG_OS))"' -DDISK_IMAGE_PATH='"$(abspath $(REG_DISK))"' -c -o $@ arch/x86/boot.S
 
-$(REG_BUILD)/kernel.o: arch/x86/kernel.c arch/x86/io.h dimon64.h | $(REG_BUILD)
+$(REG_BUILD)/kernel.o: arch/x86/kernel.c arch/x86/io.h arch/x86/ata.c arch/x86/ata.h dimon64.h | $(REG_BUILD)
 	$(BM_CC) $(BM_CFLAGS) -c -o $@ arch/x86/kernel.c
+
+$(REG_BUILD)/ata.o: arch/x86/ata.c arch/x86/ata.h arch/x86/io.h dimon64.h | $(REG_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c -o $@ arch/x86/ata.c
 
 $(REG_BUILD)/vm.o: vm.c dimon64.h dimonfs.h font8x16.h | $(REG_BUILD)
 	$(BM_CC) $(BM_CFLAGS) -c -o $@ vm.c
@@ -170,8 +214,8 @@ $(REG_BUILD)/vm.o: vm.c dimon64.h dimonfs.h font8x16.h | $(REG_BUILD)
 $(REG_BUILD)/dimonfs.o: dimonfs.c dimonfs.h dimon64.h | $(REG_BUILD)
 	$(BM_CC) $(BM_CFLAGS) -c -o $@ dimonfs.c
 
-$(REG_KERNEL): $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o arch/x86/linker.ld
-	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o $@ $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o
+$(REG_KERNEL): $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/ata.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o arch/x86/linker.ld
+	$(BM_LD) -T arch/x86/linker.ld -nostdlib -o $@ $(REG_BUILD)/boot.o $(REG_BUILD)/kernel.o $(REG_BUILD)/ata.o $(REG_BUILD)/vm.o $(REG_BUILD)/dimonfs.o
 
 $(REG_ISO): $(REG_KERNEL) arch/x86/grub.cfg
 	mkdir -p $(REG_BUILD)/iso/boot/grub
@@ -190,10 +234,13 @@ regression-x11: all $(REG_OS)
 regression-qemu: regression-artifacts
 	python3 tests/qemu_regression.py --build-dir $(REG_BUILD)
 
-regression: regression-hosted regression-x11 regression-qemu
+regression-persistent: regression-artifacts
+	python3 tests/qemu_persistent_regression.py --build-dir $(REG_BUILD)
+
+regression: regression-hosted regression-x11 regression-qemu regression-persistent
 
 # Remove generated programs, objects, boot ISOs, and test artifacts in one step.
-# dimon.iso is the persistent user disk and is intentionally preserved.
+# dimon.iso and dimon-data.img are persistent user data and are preserved.
 clean:
 	@reg_dir="$(abspath $(REG_BUILD))"; \
 	case "$(CURDIR)/" in "$${reg_dir%/}/"*) \
@@ -204,4 +251,4 @@ clean:
 	rm -f -- *.ppm *.log /tmp/dimon_*.bin /tmp/snake_*.bin /tmp/dimon_psg_test.out
 	rm -rf -- build "$(REG_BUILD)" tests/__pycache__
 
-.PHONY: all apps disk-new disk-install-apps progs test clean baremetal baremetal-iso qemu qemu-multiboot regression-artifacts regression-hosted regression-x11 regression-qemu regression
+.PHONY: all apps disk-new disk-install-apps data-disk-new data-disk-new-force data-disk-install-apps data-disk-install-apps-force data-disk-list run-qemu-persistent help progs test clean baremetal baremetal-iso qemu qemu-multiboot regression-artifacts regression-hosted regression-x11 regression-qemu regression-persistent regression

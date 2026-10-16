@@ -219,7 +219,18 @@ static pthread_mutex_t g_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_audio_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t g_audio_th;
 static int g_audio_running = 0;
+static int g_audio_th_alive = 0;
 static FILE *g_aplay_pipe = NULL;
+
+/* Deterministic xorshift32 PRNG (thread-safe: state is local to the caller). */
+static uint32_t xorshift32(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x ? x : 0x9E3779B9u;
+    return *state;
+}
 
 static void synth_waveform(uint8_t *buf, size_t n_samples, uint32_t freq, uint8_t wave, uint8_t vol) {
     if (!buf || n_samples == 0) return;
@@ -266,9 +277,11 @@ static void synth_waveform(uint8_t *buf, size_t n_samples, uint32_t freq, uint8_
             uint32_t step = (freq > 0) ? (rate / freq) : 1;
             if (step < 1) step = 1;
             int cur_noise = 0;
+            uint32_t rng = 0xA5A5A5A5u ^ (freq * 2654435761u) ^ (uint32_t)n_samples;
             for (size_t i = 0; i < n_samples; i++) {
                 if (i % step == 0) {
-                    cur_noise = (rand() % (2 * amp + 1)) - amp;
+                    uint32_t r = xorshift32(&rng);
+                    cur_noise = (int)(r % (uint32_t)(2 * amp + 1)) - amp;
                 }
                 buf[i] = (uint8_t)(128 + cur_noise);
             }
@@ -342,12 +355,21 @@ static void *audio_worker_thread(void *arg) {
 }
 
 static void audio_cleanup(void) {
-    if (g_audio_running) {
-        pthread_mutex_lock(&g_audio_mutex);
+    int need_join = 0;
+    pthread_mutex_lock(&g_audio_mutex);
+    if (g_audio_th_alive) {
         g_audio_running = 0;
         pthread_cond_signal(&g_audio_cond);
+        need_join = 1;
+    }
+    pthread_mutex_unlock(&g_audio_mutex);
+    if (need_join) {
+        pthread_join(g_audio_th, NULL);
+        pthread_mutex_lock(&g_audio_mutex);
+        g_audio_th_alive = 0;
         pthread_mutex_unlock(&g_audio_mutex);
     }
+    /* Only close the pipe once the worker thread has finished. */
     if (g_aplay_pipe) {
         pclose(g_aplay_pipe);
         g_aplay_pipe = NULL;
@@ -362,9 +384,12 @@ static void on_psg_play(void *userdata, uint32_t freq, uint32_t duration_ms, uin
     if (freq == 0 && wave != DIMON64_PSG_WAVE_NOISE) return;
 
     pthread_mutex_lock(&g_audio_mutex);
-    if (!g_audio_running) {
+    if (!g_audio_th_alive) {
         g_audio_running = 1;
-        pthread_create(&g_audio_th, NULL, audio_worker_thread, NULL);
+        if (pthread_create(&g_audio_th, NULL, audio_worker_thread, NULL) == 0)
+            g_audio_th_alive = 1;
+        else
+            g_audio_running = 0;
     }
     int next_tail = (g_audio_q_tail + 1) % AUDIO_QUEUE_SIZE;
     if (next_tail != g_audio_q_head) {
@@ -530,20 +555,71 @@ static void tui_poll_events(VM *vm) {
                             i += 3 + consumed;
                             continue;
                         }
-                    } else if (i + 2 < n) {
-                        /* Arrow keys */
-                        if (buf[i + 2] == 'A') { vm_event_push(vm, EVT_KEY, KEY_UP, 0); i += 3; continue; }
-                        if (buf[i + 2] == 'B') { vm_event_push(vm, EVT_KEY, KEY_DOWN, 0); i += 3; continue; }
-                        if (buf[i + 2] == 'C') { vm_event_push(vm, EVT_KEY, KEY_RIGHT, 0); i += 3; continue; }
-                        if (buf[i + 2] == 'D') { vm_event_push(vm, EVT_KEY, KEY_LEFT, 0); i += 3; continue; }
+                        /* Malformed SGR mouse: discard through final byte */
+                        int j = i + 3;
+                        while (j < n && (buf[j] < 0x40 || buf[j] > 0x7E)) j++;
+                        if (j < n) j++;
+                        i = j;
+                        continue;
                     }
+                    /* CSI sequence: \033[ params final  (final in 0x40..0x7E) */
+                    int j = i + 2;
+                    int param = 0, has_param = 0;
+                    while (j < n && buf[j] >= '0' && buf[j] <= '9') {
+                        param = param * 10 + (buf[j] - '0');
+                        if (param > 9999) param = 9999;
+                        has_param = 1;
+                        j++;
+                    }
+                    if (j >= n) {
+                        /* Incomplete CSI in this buffer: consume without emitting ESC */
+                        i = n;
+                        break;
+                    }
+                    char final = (char)buf[j];
+                    if (!has_param) {
+                        if (final == 'A') { vm_event_push(vm, EVT_KEY, KEY_UP, 0); i = j + 1; continue; }
+                        if (final == 'B') { vm_event_push(vm, EVT_KEY, KEY_DOWN, 0); i = j + 1; continue; }
+                        if (final == 'C') { vm_event_push(vm, EVT_KEY, KEY_RIGHT, 0); i = j + 1; continue; }
+                        if (final == 'D') { vm_event_push(vm, EVT_KEY, KEY_LEFT, 0); i = j + 1; continue; }
+                        if (final == 'H') { vm_event_push(vm, EVT_KEY, KEY_HOME, 0); i = j + 1; continue; }
+                        if (final == 'F') { vm_event_push(vm, EVT_KEY, KEY_END, 0); i = j + 1; continue; }
+                    } else if (final == '~') {
+                        int code = 0;
+                        switch (param) {
+                            case 1:  code = KEY_HOME; break;
+                            case 3:  code = KEY_DELETE; break;
+                            case 4:  code = KEY_END; break;
+                            case 5:  code = KEY_PGUP; break;
+                            case 6:  code = KEY_PGDN; break;
+                            case 15: code = KEY_F5; break;
+                            case 16: code = KEY_F6; break;
+                            case 17: code = KEY_F6; break;
+                            case 18: code = KEY_F7; break;
+                            case 19: code = KEY_F8; break;
+                            case 20: code = KEY_F9; break;
+                            case 21: code = KEY_F10; break;
+                            default: break;
+                        }
+                        if (code) { vm_event_push(vm, EVT_KEY, (uint16_t)code, 0); i = j + 1; continue; }
+                    }
+                    /* Unknown CSI: discard through terminating byte 0x40..0x7E */
+                    while (j < n && (buf[j] < 0x40 || buf[j] > 0x7E)) j++;
+                    if (j < n) j++;
+                    i = j;
+                    continue;
                 } else if (buf[i + 1] == 'O' && i + 2 < n) {
-                    /* F1..F4 */
+                    /* SS3: F1..F4 (P..S), Home (H), End (F) */
                     if (buf[i + 2] >= 'P' && buf[i + 2] <= 'S') {
                         vm_event_push(vm, EVT_KEY, KEY_F1 + (buf[i + 2] - 'P'), 0);
                         i += 3;
                         continue;
                     }
+                    if (buf[i + 2] == 'H') { vm_event_push(vm, EVT_KEY, KEY_HOME, 0); i += 3; continue; }
+                    if (buf[i + 2] == 'F') { vm_event_push(vm, EVT_KEY, KEY_END, 0); i += 3; continue; }
+                    /* Unknown SS3: discard the three bytes */
+                    i += 3;
+                    continue;
                 }
                 /* Lone ESC key */
                 vm_event_push(vm, EVT_KEY, 27, 0);
@@ -1172,13 +1248,21 @@ static uint64_t parse_u64(const char *s) {
 }
 
 static void hexdump(VM *vm, uint64_t addr, int n) {
+    if (!vm || !vm->mem || n <= 0) return;
     for (int i = 0; i < n; i += 16) {
-        printf("%08" PRIX64 ": ", (uint64_t)(addr + (uint64_t)i));
-        for (int j = 0; j < 16 && i + j < n; j++)
-            printf("%02X ", vm->mem[addr + (uint64_t)i + (uint64_t)j]);
+        uint64_t row = addr + (uint64_t)i;
+        if (row >= vm->memsize) break;
+        printf("%08" PRIX64 ": ", row);
+        for (int j = 0; j < 16 && i + j < n; j++) {
+            uint64_t a = addr + (uint64_t)i + (uint64_t)j;
+            if (a >= vm->memsize) break;
+            printf("%02X ", vm->mem[a]);
+        }
         printf(" | ");
         for (int j = 0; j < 16 && i + j < n; j++) {
-            uint8_t c = vm->mem[addr + (uint64_t)i + (uint64_t)j];
+            uint64_t a = addr + (uint64_t)i + (uint64_t)j;
+            if (a >= vm->memsize) break;
+            uint8_t c = vm->mem[a];
             putchar(c >= 32 && c < 127 ? c : '.');
         }
         putchar('\n');
@@ -1259,9 +1343,15 @@ static void debugger(VM *vm) {
                 }
             }
             for (int i = 0; i < n; i++) {
+                if (p >= vm->memsize) { printf("  (out of range)\n"); break; }
                 int len = dimon64_disasm(vm, p, dasm, sizeof(dasm));
+                if (len <= 0) len = 4;
                 printf("  %08" PRIX64 ": %-28s |", p, dasm);
-                for (int k = 0; k < len; k++) printf(" %02X", vm->mem[p + (uint64_t)k]);
+                for (int k = 0; k < len; k++) {
+                    uint64_t a = p + (uint64_t)k;
+                    if (a >= vm->memsize) break;
+                    printf(" %02X", vm->mem[a]);
+                }
                 printf("\n");
                 p += (uint64_t)len;
             }

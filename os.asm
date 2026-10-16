@@ -29,9 +29,6 @@ boot:
     LI a7, 17
     ECALL                    ; SYS_SPAWN
 
-    ; Initialize FAT16 on virtual disk if available
-    CALL fat16_init
-
     ; Initialize fm_cwd to "/"
     LA t0, fm_cwd
     LI t1, 47
@@ -1180,6 +1177,7 @@ ev_click_not_dlg:
 chk_taskbar_tab:
     ; Compacted buttons: walk taskbar_map slots from x=100, stride 78.
     ; Clicks in the 4px inter-button gap or past the last button do nothing.
+    CALL taskbar_rebuild
     LI t0, 100
     BLT s0, t0, ev_next
     LA t0, taskbar_count
@@ -1564,7 +1562,7 @@ t_snake:
     J ev_next
 
 ev_next:
-    J ev_done
+    J ev_poll_loop
 
 ev_done:
     LD s3, 8(sp)
@@ -1868,6 +1866,34 @@ flag_redraw:
     SW t1, 0(t0)
     RET
 
+; Rebuild taskbar_map/taskbar_count from win_flags without drawing.
+; Needed because clicks can arrive several per poll cycle before a repaint
+; refreshes the map in desktop_draw_taskbar.
+taskbar_rebuild:
+    LI t0, 1
+    LI t1, 0
+tb_re_loop:
+    LI t2, 8
+    BGE t0, t2, tb_re_done
+    ADDI t3, t0, -1
+    SLLI t3, t3, 2
+    LA t4, win_flags
+    ADD t4, t4, t3
+    LW t3, 0(t4)
+    ANDI t3, t3, 1
+    BEQ t3, zero, tb_re_next
+    LA t3, taskbar_map
+    ADD t3, t3, t1
+    SB t0, 0(t3)
+    ADDI t1, t1, 1
+tb_re_next:
+    ADDI t0, t0, 1
+    J tb_re_loop
+tb_re_done:
+    LA t0, taskbar_count
+    SW t1, 0(t0)
+    RET
+
 ; ==============================================================================
 ; Application 1: Calculator (64-bit TrueColor)
 ; ==============================================================================
@@ -2105,6 +2131,8 @@ calc_chk_op:
     BEQ a1, t0, cop_eq
     LI t0, 13                ; Enter
     BEQ a1, t0, cop_eq
+    LI t0, 8                 ; Backspace
+    BEQ a1, t0, cop_bksp
     LI t0, 99                ; 'c'
     BEQ a1, t0, cop_c
     LI t0, 67                ; 'C'
@@ -2129,6 +2157,18 @@ calc_input_digit:
 cop_add:
     LI a0, 1
     J set_op
+cop_bksp:
+    ; Backspace: drop the last decimal digit of calc_cur
+    LA t0, calc_cur
+    LD t1, 0(t0)
+    LI t2, 10
+    DIV t1, t1, t2
+    SD t1, 0(t0)
+    MV a0, t1
+    LA a1, calc_buf
+    CALL num_to_dec
+    CALL flag_redraw
+    J calc_ret
 cop_sub:
     LI a0, 2
     J set_op
@@ -2351,573 +2391,6 @@ mcb_loop:
 mcb_done:
     RET
 
-; --- Helper: Format 8.3 Directory Entry Name ---
-; a0 = entry ptr (32 bytes), a1 = dst buffer (at least 16 bytes)
-fat16_format_name:
-    MV t0, a0
-    MV t1, a1
-
-    LI t2, 8
-fn_len_l:
-    BEQ t2, zero, fn_copy_n
-    ADDI t3, t2, -1
-    ADD t3, t0, t3
-    LBU t3, 0(t3)
-    LI t4, 32
-    BNE t3, t4, fn_copy_n
-    ADDI t2, t2, -1
-    J fn_len_l
-
-fn_copy_n:
-    LI t3, 0
-fn_cn_l:
-    BGE t3, t2, fn_chk_e
-    ADD t4, t0, t3
-    LBU t4, 0(t4)
-    LI t5, 65
-    BLT t4, t5, fn_cn_p
-    LI t5, 90
-    BGT t4, t5, fn_cn_p
-    ADDI t4, t4, 32
-fn_cn_p:
-    SB t4, 0(t1)
-    ADDI t1, t1, 1
-    ADDI t3, t3, 1
-    J fn_cn_l
-
-fn_chk_e:
-    LBU t3, 8(t0)
-    LI t4, 32
-    BEQ t3, t4, fn_fin
-
-    LI t4, 46
-    SB t4, 0(t1)
-    ADDI t1, t1, 1
-
-    LI t3, 8
-fn_ext_l:
-    LI t4, 11
-    BGE t3, t4, fn_fin
-    ADD t4, t0, t3
-    LBU t4, 0(t4)
-    LI t5, 32
-    BEQ t4, t5, fn_fin
-    LI t5, 65
-    BLT t4, t5, fn_ext_p
-    LI t5, 90
-    BGT t4, t5, fn_ext_p
-    ADDI t4, t4, 32
-fn_ext_p:
-    SB t4, 0(t1)
-    ADDI t1, t1, 1
-    ADDI t3, t3, 1
-    J fn_ext_l
-
-fn_fin:
-    SB zero, 0(t1)
-    RET
-
-; ==============================================================================
-; fat16_init: Mount FAT16 volume by reading BPB and calculating offsets
-; ==============================================================================
-fat16_init:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
-
-    ; Read Sector 0 (BPB)
-    LI a0, 0
-    LA a1, fat16_sec_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL                    ; SYS_DISK_READ
-    BNE a0, zero, f16_init_err
-
-    ; Check boot signature (0x55, 0xAA)
-    LA t0, fat16_sec_buf
-    LBU t1, 510(t0)
-    LI t2, 0x55
-    BNE t1, t2, f16_init_err
-    LBU t1, 511(t0)
-    LI t2, 0xAA
-    BNE t1, t2, f16_init_err
-
-    ; Bytes per sector == 512
-    LHU t1, 11(t0)
-    LI t2, 512
-    BNE t1, t2, f16_init_err
-
-    ; Sectors per cluster
-    LBU t1, 13(t0)
-    BEQ t1, zero, f16_init_err
-    LA t2, fat16_sec_per_clus
-    SW t1, 0(t2)
-
-    ; Reserved sectors
-    LHU t3, 14(t0)
-    LA t2, fat16_fat_start
-    SW t3, 0(t2)
-
-    ; Number of FATs
-    LBU t4, 16(t0)
-
-    ; Root entries
-    LHU t5, 17(t0)
-
-    ; Sectors per FAT
-    LHU t6, 22(t0)
-    LA t2, fat16_sec_per_fat
-    SW t6, 0(t2)
-
-    ; Root Directory Start = reserved_sectors + (num_fats * sec_per_fat)
-    MUL t1, t4, t6
-    ADD t1, t3, t1
-    LA t2, fat16_root_start
-    SW t1, 0(t2)
-
-    ; Root Directory Sectors = (root_entries * 32 + 511) / 512
-    SLLI t2, t5, 5
-    ADDI t2, t2, 511
-    SRLI t2, t2, 9
-    LA a3, fat16_root_secs
-    SW t2, 0(a3)
-
-    ; Data Start = root_start + root_secs
-    ADD t2, t1, t2
-    LA a3, fat16_data_start
-    SW t2, 0(a3)
-
-    ; Mounted flag = 1
-    LA t0, fat16_mounted
-    LI t1, 1
-    SW t1, 0(t0)
-
-    ; Read initial root directory
-    CALL fat16_read_dir
-
-    LI a0, 0
-    J f16_init_done
-
-f16_init_err:
-    LA t0, fat16_mounted
-    SW zero, 0(t0)
-    LI a0, -1
-
-f16_init_done:
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
-    RET
-
-; ==============================================================================
-; fat16_read_dir: Read root directory sectors & count valid files
-; ==============================================================================
-fat16_read_dir:
-    ADDI sp, sp, -16
-    SD ra, 8(sp)
-
-    LA t0, fat16_mounted
-    LW t0, 0(t0)
-    BEQ t0, zero, f16_rd_err
-
-    ; Read first 2 sectors of Root Directory into fat16_dir_buf
-    LA t0, fat16_root_start
-    LW a0, 0(t0)
-    LA a1, fat16_dir_buf
-    LI a2, 2
-    LI a7, 6
-    ECALL
-    BNE a0, zero, f16_rd_err
-
-    ; Scan entries
-    LI t0, 0
-    LI t1, 0
-    LA t2, fat16_dir_buf
-
-f16_cnt_loop:
-    LI t3, 32
-    BGE t0, t3, f16_cnt_done
-    SLLI t3, t0, 5
-    ADD t3, t2, t3
-    LBU t4, 0(t3)
-    BEQ t4, zero, f16_cnt_done
-    LI t5, 0xE5
-    BEQ t4, t5, f16_cnt_next
-    LBU t4, 11(t3)
-    LI t5, 0x0F
-    BEQ t4, t5, f16_cnt_next
-    ANDI t5, t4, 0x08
-    BNE t5, zero, f16_cnt_next
-
-    ADDI t1, t1, 1
-
-f16_cnt_next:
-    ADDI t0, t0, 1
-    J f16_cnt_loop
-
-f16_cnt_done:
-    LA t0, fat16_file_count
-    SW t1, 0(t0)
-    MV a0, t1
-    J f16_rd_done
-
-f16_rd_err:
-    LI a0, -1
-
-f16_rd_done:
-    LD ra, 8(sp)
-    ADDI sp, sp, 16
-    RET
-
-; ==============================================================================
-; fat16_find_file: Find directory entry by filename
-; a0 = pointer to filename string -> returns a0 = pointer to entry or 0
-; ==============================================================================
-fat16_find_file:
-    ADDI sp, sp, -32
-    SD ra, 24(sp)
-    SD s0, 16(sp)
-    SD s1, 8(sp)
-
-    MV s0, a0
-    LI s1, 0
-
-f16_ff_loop:
-    LI t0, 32
-    BGE s1, t0, f16_ff_fail
-
-    SLLI t0, s1, 5
-    LA t1, fat16_dir_buf
-    ADD t1, t1, t0
-
-    LBU t2, 0(t1)
-    BEQ t2, zero, f16_ff_fail
-    LI t3, 0xE5
-    BEQ t2, t3, f16_ff_nxt
-    LBU t2, 11(t1)
-    LI t3, 0x0F
-    BEQ t2, t3, f16_ff_nxt
-    ANDI t3, t2, 0x08
-    BNE t3, zero, f16_ff_nxt
-
-    MV a0, t1
-    LA a1, fm_name_buf
-    CALL fat16_format_name
-
-    LA a0, fm_name_buf
-    MV a1, s0
-    CALL str_case_cmp
-    BEQ a0, zero, f16_ff_match
-
-f16_ff_nxt:
-    ADDI s1, s1, 1
-    J f16_ff_loop
-
-f16_ff_match:
-    SLLI t0, s1, 5
-    LA t1, fat16_dir_buf
-    ADD a0, t1, t0
-    J f16_ff_ret
-
-f16_ff_fail:
-    LI a0, 0
-
-f16_ff_ret:
-    LD s1, 8(sp)
-    LD s0, 16(sp)
-    LD ra, 24(sp)
-    ADDI sp, sp, 32
-    RET
-
-; ==============================================================================
-; fat16_read_file: Traverse FAT cluster chain to load file contents into RAM
-; a0 = start cluster, a1 = RAM dst, a2 = max bytes, a3 = file size
-; returns a0 = total bytes read
-; ==============================================================================
-fat16_read_file:
-    ADDI sp, sp, -48
-    SD ra, 40(sp)
-    SD s0, 32(sp)
-    SD s1, 24(sp)
-    SD s2, 16(sp)
-    SD s3, 8(sp)
-    SD s4, 0(sp)
-
-    MV s0, a0
-    MV s1, a1
-    MV s2, a2
-    MV s4, a3
-    LI s3, 0
-
-    LI t0, 2
-    BLT s0, t0, f16_rf_done
-    LI t0, 0xFFF8
-    BGE s0, t0, f16_rf_done
-
-f16_rf_loop:
-    BGE s3, s4, f16_rf_done
-    BGE s3, s2, f16_rf_done
-
-    ; LBA = fat16_data_start + (cur_cluster - 2) * fat16_sec_per_clus
-    LA t0, fat16_data_start
-    LW t1, 0(t0)
-    ADDI t2, s0, -2
-    LA t0, fat16_sec_per_clus
-    LW t3, 0(t0)
-    MUL t2, t2, t3
-    ADD a0, t1, t2
-
-    SUB t0, s4, s3
-    SUB t1, s2, s3
-    BLE t0, t1, f16_rf_lim
-    MV t0, t1
-f16_rf_lim:
-    LI t1, 512
-    BLT t0, t1, f16_rf_part
-
-    ADD a1, s1, s3
-    LI a2, 1
-    LI a7, 6
-    ECALL
-    BNE a0, zero, f16_rf_done
-    ADDI s3, s3, 512
-    J f16_rf_next_c
-
-f16_rf_part:
-    BEQ t0, zero, f16_rf_done
-    LA a1, fat16_sec_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
-    BNE a0, zero, f16_rf_done
-
-    LA a0, fat16_sec_buf
-    ADD a1, s1, s3
-    ADD s3, s3, t0
-    MV a2, t0
-    CALL memcpy_bytes
-    J f16_rf_done
-
-f16_rf_next_c:
-    SLLI t0, s0, 1
-    SRLI t1, t0, 9
-    ANDI t2, t0, 511
-
-    LA t3, fat16_fat_start
-    LW a0, 0(t3)
-    ADD a0, a0, t1
-    LA a1, fat16_fat_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
-    BNE a0, zero, f16_rf_done
-
-    LA t0, fat16_fat_buf
-    ADD t0, t0, t2
-    LHU s0, 0(t0)
-
-    LI t0, 2
-    BLT s0, t0, f16_rf_done
-    LI t0, 0xFFF8
-    BGE s0, t0, f16_rf_done
-
-    J f16_rf_loop
-
-f16_rf_done:
-    MV a0, s3
-    LD s4, 0(sp)
-    LD s3, 8(sp)
-    LD s2, 16(sp)
-    LD s1, 24(sp)
-    LD s0, 32(sp)
-    LD ra, 40(sp)
-    ADDI sp, sp, 48
-    RET
-
-; ==============================================================================
-; fat16_write_file: Write buffer to file clusters & update root dir entry
-; a0 = entry ptr, a1 = src buffer, a2 = byte length
-; returns a0 = 0 on success, -1 on failure
-; ==============================================================================
-fat16_write_file:
-    ADDI sp, sp, -64
-    SD ra, 56(sp)
-    SD s0, 48(sp)
-    SD s1, 40(sp)
-    SD s2, 32(sp)
-    SD s3, 24(sp)
-    SD s4, 16(sp)
-    SD s5, 8(sp)
-
-    MV s0, a0
-    MV s1, a1
-    MV s2, a2
-    LI s4, 0
-
-    LA t0, fat16_mounted
-    LW t0, 0(t0)
-    BEQ t0, zero, f16_wf_fail
-
-    ; Read FAT Sector 0 into fat16_fat_buf
-    LA t0, fat16_fat_start
-    LW a0, 0(t0)
-    LA a1, fat16_fat_buf
-    LI a2, 1
-    LI a7, 6
-    ECALL
-    BNE a0, zero, f16_wf_fail
-
-    ; Get cluster from entry
-    LHU s3, 26(s0)
-    LI t0, 2
-    BGE s3, t0, f16_wf_alloc_ok
-
-    ; Allocate free cluster in fat16_fat_buf
-    LI t0, 2
-f16_wf_find_free:
-    LI t1, 256
-    BGE t0, t1, f16_wf_fail
-    SLLI t1, t0, 1
-    LA t2, fat16_fat_buf
-    ADD t2, t2, t1
-    LHU t3, 0(t2)
-    BEQ t3, zero, f16_wf_got_free
-    ADDI t0, t0, 1
-    J f16_wf_find_free
-
-f16_wf_got_free:
-    MV s3, t0
-    SH s3, 26(s0)
-
-f16_wf_alloc_ok:
-f16_wf_write_loop:
-    LA t0, fat16_data_start
-    LW t1, 0(t0)
-    ADDI t2, s3, -2
-    LA t0, fat16_sec_per_clus
-    LW t3, 0(t0)
-    MUL t2, t2, t3
-    ADD s5, t1, t2
-
-    SUB t0, s2, s4
-    LI t1, 512
-    BLT t0, t1, f16_wf_part_sec
-
-    MV a0, s5
-    ADD a1, s1, s4
-    LI a2, 1
-    LI a7, 8
-    ECALL
-    ADDI s4, s4, 512
-    J f16_wf_check_done
-
-f16_wf_part_sec:
-    LA t1, fat16_sec_buf
-    LI t2, 512
-f16_wf_clr_l:
-    BEQ t2, zero, f16_wf_clr_d
-    SB zero, 0(t1)
-    ADDI t1, t1, 1
-    ADDI t2, t2, -1
-    J f16_wf_clr_l
-f16_wf_clr_d:
-    ADD a0, s1, s4
-    LA a1, fat16_sec_buf
-    ADD s4, s4, t0
-    MV a2, t0
-    CALL memcpy_bytes
-
-    MV a0, s5
-    LA a1, fat16_sec_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL
-
-f16_wf_check_done:
-    BGE s4, s2, f16_wf_end_chain
-
-    SLLI t0, s3, 1
-    LA t1, fat16_fat_buf
-    ADD t1, t1, t0
-    LHU t2, 0(t1)
-    LI t3, 2
-    BLT t2, t3, f16_wf_alloc_next
-    LI t3, 0xFFF8
-    BLT t2, t3, f16_wf_reuse_next
-
-f16_wf_alloc_next:
-    LI t0, 2
-f16_wf_alloc_l:
-    LI t1, 256
-    BGE t0, t1, f16_wf_fail
-    SLLI t1, t0, 1
-    LA t2, fat16_fat_buf
-    ADD t2, t2, t1
-    LHU t3, 0(t2)
-    BEQ t3, zero, f16_wf_alloc_found
-    ADDI t0, t0, 1
-    J f16_wf_alloc_l
-
-f16_wf_alloc_found:
-    SLLI t1, s3, 1
-    LA t2, fat16_fat_buf
-    ADD t2, t2, t1
-    SH t0, 0(t2)
-    MV s3, t0
-    J f16_wf_write_loop
-
-f16_wf_reuse_next:
-    MV s3, t2
-    J f16_wf_write_loop
-
-f16_wf_end_chain:
-    SLLI t0, s3, 1
-    LA t1, fat16_fat_buf
-    ADD t1, t1, t0
-    LI t2, 0xFFFF
-    SH t2, 0(t1)
-
-    LA t0, fat16_fat_start
-    LW a0, 0(t0)
-    LA a1, fat16_fat_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL
-
-    LA t0, fat16_fat_start
-    LW a0, 0(t0)
-    LA t1, fat16_sec_per_fat
-    LW t1, 0(t1)
-    ADD a0, a0, t1
-    LA a1, fat16_fat_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL
-
-    SW s2, 28(s0)
-
-    LA t0, fat16_root_start
-    LW a0, 0(t0)
-    LA a1, fat16_dir_buf
-    LI a2, 1
-    LI a7, 8
-    ECALL
-
-    LI a0, 0
-    J f16_wf_ret
-
-f16_wf_fail:
-    LI a0, -1
-
-f16_wf_ret:
-    LD s5, 8(sp)
-    LD s4, 16(sp)
-    LD s3, 24(sp)
-    LD s2, 32(sp)
-    LD s1, 40(sp)
-    LD s0, 48(sp)
-    LD ra, 56(sp)
-    ADDI sp, sp, 64
-    RET
-
 ; ==============================================================================
 ; Application 2: Notepad (FAT16 Text Editor)
 ; ==============================================================================
@@ -3104,13 +2577,35 @@ np_not_cursor_pos:
     SB zero, 1(t4)
     LI t5, 0xC0
     BLT t3, t5, np_char_ready
-    ADDI t6, t2, 1
-    BGE t6, s1, np_char_ready
-    ADD t6, s0, t6
-    LBU t6, 0(t6)
-    SB t6, 1(t4)
-    SB zero, 2(t4)
-    ADDI t2, t2, 1
+    ; UTF-8 lead byte: determine full sequence length (2, 3 or 4 bytes)
+    LI t5, 2
+    LI t6, 0xE0
+    BLT t3, t6, np_u8_have_len   ; 0xC0..0xDF -> 2 bytes
+    LI t5, 3
+    LI t6, 0xF0
+    BLT t3, t6, np_u8_have_len   ; 0xE0..0xEF -> 3 bytes
+    LI t5, 4
+    LI t6, 0xF8
+    BLT t3, t6, np_u8_have_len   ; 0xF0..0xF7 -> 4 bytes
+    J np_char_ready              ; invalid lead: keep single byte
+np_u8_have_len:
+    ; Need t2 + t5 <= s1 (enough bytes remaining in note_buf)
+    ADD t6, t2, t5
+    BGT t6, s1, np_char_ready    ; truncated at EOF: emit lead alone
+    LI t6, 1                     ; continuation index
+np_u8_cp:
+    BGE t6, t5, np_u8_adv
+    ADD a2, s0, t2
+    ADD a2, a2, t6
+    LBU a3, 0(a2)
+    ADD a2, t4, t6
+    SB a3, 0(a2)
+    SB zero, 1(a2)               ; keep NUL terminator after last byte
+    ADDI t6, t6, 1
+    J np_u8_cp
+np_u8_adv:
+    ADD t2, t2, t5
+    ADDI t2, t2, -1              ; np_next_char will advance by 1
 np_char_ready:
     MV a0, t0
     MV a1, t1
@@ -3214,6 +2709,22 @@ np_insert_byte:
     LW t1, 0(t0)
     LI t2, 4000
     BGE t1, t2, np_key_ret
+    ; If a1 is a UTF-8 lead byte (0xC0..0xF7), require room for the whole char
+    LI t3, 0xC0
+    BLT a1, t3, np_ins_room_ok
+    LI t3, 0xF8
+    BGE a1, t3, np_ins_room_ok
+    LI t3, 2
+    LI t4, 0xE0
+    BLT a1, t4, np_ins_have_len
+    LI t3, 3
+    LI t4, 0xF0
+    BLT a1, t4, np_ins_have_len
+    LI t3, 4
+np_ins_have_len:
+    ADD t4, t1, t3
+    BGT t4, t2, np_key_ret       ; no room for full sequence: reject lead byte
+np_ins_room_ok:
     LA t2, note_cursor
     LW t3, 0(t2)
     LA t4, note_buf
@@ -3746,6 +3257,48 @@ fm_draw_status:
     LI a1, 414
     LA a2, str_fm_hint
     LI a3, 0xFF64748B
+    LI a4, 0x00000000
+    LI a5, 560
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    ; Active volume indicator (queried live so Explorer refreshes after saves).
+    LI a0, 0
+    LI a1, 0
+    LI a2, 0
+    LI a7, 7
+    ECALL
+    MV t0, a0
+    MV t1, a2
+    BEQ t0, zero, fm_vol_none
+    LI t2, 1
+    BEQ t1, t2, fm_vol_rw
+    LI a0, 120
+    LI a1, 436
+    LA a2, str_fm_vol_ro
+    LI a3, 0xFFFBBF24
+    LI a4, 0x00000000
+    LI a5, 560
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    J fm_draw_done
+fm_vol_rw:
+    LI a0, 120
+    LI a1, 436
+    LA a2, str_fm_vol_rw
+    LI a3, 0xFF34C759
+    LI a4, 0x00000000
+    LI a5, 560
+    LI a6, 16
+    LI a7, 43
+    ECALL
+    J fm_draw_done
+fm_vol_none:
+    LI a0, 120
+    LI a1, 436
+    LA a2, str_fm_vol_none
+    LI a3, 0xFFEF4444
     LI a4, 0x00000000
     LI a5, 560
     LI a6, 16
@@ -4571,8 +4124,7 @@ p_chk_canvas:
     BGT a1, t0, p_click_ret
 
     CALL paint_apply_brush
-    LI a7, 12
-    ECALL                    ; SYS_GUI_FLUSH
+    CALL flag_redraw
 p_click_ret:
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -4591,8 +4143,7 @@ paint_on_drag:
     LI t0, 525
     BGT a1, t0, p_drag_ret
     CALL paint_apply_brush
-    LI a7, 12
-    ECALL                    ; SYS_GUI_FLUSH
+    CALL flag_redraw
 p_drag_ret:
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -4681,16 +4232,9 @@ paint_clear_canvas_white:
     SD ra, 8(sp)
     CALL paint_clear_canvas
 
-    LI a0, 80
-    LI a1, 125
-    LI a2, 640
-    LI a3, 400
-    LI a4, 0xFFFFFFFF
-    LI a7, 14
-    ECALL                    ; fast white fill of canvas in LFB
-
-    LI a7, 12
-    ECALL                    ; SYS_GUI_FLUSH
+    ; Only touch the canvas backing buffer (0x02400000); the next composed
+    ; frame blits it through the window context. Never write the LFB directly.
+    CALL flag_redraw
     LD ra, 8(sp)
     ADDI sp, sp, 16
     RET
@@ -4746,19 +4290,6 @@ p_dx_loop:
     ADD a3, a3, a2
     SW t2, 0(a3)
 
-    ; Store directly to LFB at 0x02000000 + ((125 + s1 + dy) * 800 + (80 + s0 + dx)) * 4
-    ADDI a4, s1, 125
-    ADD a4, a4, t4
-    LI a2, 800
-    MUL a4, a4, a2
-    ADDI a5, s0, 80
-    ADD a4, a4, a5
-    ADD a4, a4, t5
-    SLLI a4, a4, 2
-    LI a2, 0x02000000
-    ADD a4, a4, a2
-    SW t2, 0(a4)
-
 p_next_dx:
     ADDI t5, t5, 1
     J p_dx_loop
@@ -4768,6 +4299,8 @@ p_next_dy:
     J p_dy_loop
 
 p_brush_done:
+    ; Canvas updated; request a composed redraw (respects window Z-order).
+    CALL flag_redraw
     LD s1, 8(sp)
     LD s0, 16(sp)
     LD ra, 24(sp)
@@ -4817,6 +4350,58 @@ sysinfo_draw:
     LI a4, 0
     LI a7, 15
     ECALL
+
+    ; Active storage mode via DISK_INFO (a2: 1=writable,2=read-only,else error).
+    ; Never claims persistence unless the writable ATA data disk is mounted.
+    LI a0, 0
+    LI a1, 0
+    LI a2, 0
+    LI a7, 7
+    ECALL
+    MV t0, a0
+    MV t1, a2
+    BEQ t0, zero, sysinfo_st_nodisk
+    LI t2, 1
+    BEQ t1, t2, sysinfo_st_writable
+    LI t2, 2
+    BEQ t1, t2, sysinfo_st_readonly
+    J sysinfo_st_error
+sysinfo_st_writable:
+    LI a0, 150
+    LI a1, 228
+    LA a2, str_info_storage_rw
+    LI a3, 0xFF34C759
+    LI a4, 0
+    LI a7, 15
+    ECALL
+    J sysinfo_st_done
+sysinfo_st_readonly:
+    LI a0, 150
+    LI a1, 228
+    LA a2, str_info_storage_ro
+    LI a3, 0xFFFBBF24
+    LI a4, 0
+    LI a7, 15
+    ECALL
+    J sysinfo_st_done
+sysinfo_st_nodisk:
+    LI a0, 150
+    LI a1, 228
+    LA a2, str_info_storage_none
+    LI a3, 0xFFEF4444
+    LI a4, 0
+    LI a7, 15
+    ECALL
+    J sysinfo_st_done
+sysinfo_st_error:
+    LI a0, 150
+    LI a1, 228
+    LA a2, str_info_storage_err
+    LI a3, 0xFFEF4444
+    LI a4, 0
+    LI a7, 15
+    ECALL
+sysinfo_st_done:
 
     ; Monotonic ticks
     LI a0, 150
@@ -5603,20 +5188,63 @@ tcmd_pwd:
     CALL str_copy
     J tcmd_done
 tcmd_ls:
+    ADDI sp, sp, -32
+    SD s0, 16(sp)
+    SD s1, 8(sp)
+    LA s0, term_out_buf
+    SB zero, 0(s0)               ; start with empty output
+    LI s1, 0                     ; directory index
+tcmd_ls_loop:
+    LI t0, 512
+    BGE s1, t0, tcmd_ls_finish   ; safety cap on entries
     LA a0, str_root_path
-    LI a1, 0
+    MV a1, s1
     LA a2, term_dirent
-    LI a7, 35
+    LI a7, 35                    ; SYS_FS_LIST
     ECALL
-    BLT a0, zero, tcmd_ls_empty
-    LA a0, term_out_buf
-    LA a1, term_dirent
-    CALL str_copy
-    J tcmd_done
-tcmd_ls_empty:
+    BLT a0, zero, tcmd_ls_finish
+    ; find end of term_out_buf
+    MV t0, s0
+tcmd_ls_find:
+    LBU t1, 0(t0)
+    BEQ t1, zero, tcmd_ls_at_end
+    ADDI t0, t0, 1
+    J tcmd_ls_find
+tcmd_ls_at_end:
+    ; space separator between names
+    BEQ t0, s0, tcmd_ls_copy
+    LI t1, 32
+    SB t1, 0(t0)
+    ADDI t0, t0, 1
+tcmd_ls_copy:
+    LA a1, term_dirent           ; name[13] at offset 0
+    LI t2, 127                   ; leave room for NUL in 128-byte buffer
+tcmd_ls_cp:
+    LBU t1, 0(a1)
+    BEQ t1, zero, tcmd_ls_named
+    SUB t3, t0, s0
+    BGE t3, t2, tcmd_ls_trunc
+    SB t1, 0(t0)
+    ADDI t0, t0, 1
+    ADDI a1, a1, 1
+    J tcmd_ls_cp
+tcmd_ls_named:
+    SB zero, 0(t0)
+    ADDI s1, s1, 1
+    J tcmd_ls_loop
+tcmd_ls_trunc:
+    SB zero, 0(t0)
+tcmd_ls_finish:
+    LBU t0, 0(s0)
+    BNE t0, zero, tcmd_ls_have
     LA a0, term_out_buf
     LA a1, str_term_ls_empty
     CALL str_copy
+tcmd_ls_have:
+    LD s1, 8(sp)
+    LD s0, 16(sp)
+    ADDI sp, sp, 32
+    J tcmd_done
 tcmd_done:
     LD ra, 8(sp)
     ADDI sp, sp, 16
@@ -5666,8 +5294,10 @@ n2d_pos:
 n2d_loop:
     BEQ a0, zero, n2d_rev
     LI t2, 10
-    REM t3, a0, t2
-    DIVU a0, a0, t2
+    MV t5, a0                ; save dividend
+    DIVU a0, a0, t2          ; unsigned quotient
+    MUL t3, a0, t2           ; quot * 10
+    SUB t3, t5, t3           ; unsigned remainder = dividend - quot*10
     ADDI t3, t3, 48
     ADD t4, t0, t1
     SB t3, 0(t4)
@@ -7921,6 +7551,18 @@ dokc_ret:
 dlg_on_click_confirm:
     ADDI sp, sp, -16
     SD ra, 8(sp)
+    ; Title-bar [X] button: X: 572..592, Y: 226..246
+    LI t0, 572
+    BLT a0, t0, docc_chk_btns
+    LI t0, 592
+    BGT a0, t0, docc_chk_btns
+    LI t0, 226
+    BLT a1, t0, docc_chk_btns
+    LI t0, 246
+    BGT a1, t0, docc_chk_btns
+    CALL dlg_cancel
+    J docc_ret
+docc_chk_btns:
     LI t0, 320
     BLT a1, t0, docc_ret
     LI t0, 348
@@ -8178,12 +7820,24 @@ doko_ret:
 dlg_on_click_overwrite:
     ADDI sp, sp, -16
     SD ra, 8(sp)
-    LI t0, 320
-    BLT a1, t0, dco_chk_frame
-    LI t0, 348
-    BGT a1, t0, dco_chk_frame
-    LI t0, 212
+    ; Title-bar [X] button: X: 572..592, Y: 226..246
+    LI t0, 572
     BLT a0, t0, dco_chk_frame
+    LI t0, 592
+    BGT a0, t0, dco_chk_frame
+    LI t0, 226
+    BLT a1, t0, dco_chk_frame
+    LI t0, 246
+    BGT a1, t0, dco_chk_frame
+    CALL dlg_cancel
+    J dco_ret
+dco_chk_frame:
+    LI t0, 320
+    BLT a1, t0, dco_chk_frame2
+    LI t0, 348
+    BGT a1, t0, dco_chk_frame2
+    LI t0, 212
+    BLT a0, t0, dco_chk_frame2
     LI t0, 322
     BGT a0, t0, dco_chk_b1
     LI a0, 0
@@ -8191,7 +7845,7 @@ dlg_on_click_overwrite:
     J dco_ret
 dco_chk_b1:
     LI t0, 334
-    BLT a0, t0, dco_chk_frame
+    BLT a0, t0, dco_chk_frame2
     LI t0, 444
     BGT a0, t0, dco_chk_b2
     LI a0, 1
@@ -8199,13 +7853,13 @@ dco_chk_b1:
     J dco_ret
 dco_chk_b2:
     LI t0, 456
-    BLT a0, t0, dco_chk_frame
+    BLT a0, t0, dco_chk_frame2
     LI t0, 566
-    BGT a0, t0, dco_chk_frame
+    BGT a0, t0, dco_chk_frame2
     LI a0, 2
     CALL dlg_overwrite_action
     J dco_ret
-dco_chk_frame:
+dco_chk_frame2:
     CALL flag_redraw
 dco_ret:
     LD ra, 8(sp)
@@ -8870,6 +8524,19 @@ dlg_on_click:
     BEQ t1, t2, doc_confirm
     LI t2, 4
     BEQ t1, t2, doc_overwrite
+    ; Title-bar [X] button: X: 652..672, Y: 86..106
+    LI t0, 652
+    BLT s0, t0, doc_chk_prim
+    LI t0, 672
+    BGT s0, t0, doc_chk_prim
+    LI t0, 86
+    BLT s1, t0, doc_chk_prim
+    LI t0, 106
+    BGT s1, t0, doc_chk_prim
+    CALL dlg_cancel
+    J doc_done
+
+doc_chk_prim:
     ; Primary button: X: 548..660, Y: 366..390
     LI t0, 548
     BLT s0, t0, doc_chk_cancel
@@ -9317,6 +8984,12 @@ str_fm_up_tag:
     .string "<UP>"
 str_fm_hint:
     .string "Enter open  Bksp up  F5 refresh"
+str_fm_vol_rw:
+    .string "Volume: WRITABLE data disk"
+str_fm_vol_ro:
+    .string "Volume: READ-ONLY embedded disk"
+str_fm_vol_none:
+    .string "Volume: NO DISK"
 str_fm_unsupported:
     .string "Unsupported file type"
 str_fm_launch_err:
@@ -9429,6 +9102,14 @@ str_info_gpu:
     .string "Display: 800x600 TrueColor LFB @ 0x02000000"
 str_info_fs:
     .string "Filesystem: Standard FAT16 (800x600 LFB)"
+str_info_storage_rw:
+    .string "Storage: WRITABLE data disk (saves persist)"
+str_info_storage_ro:
+    .string "Storage: READ-ONLY embedded disk (attach data disk)"
+str_info_storage_none:
+    .string "Storage: NO DISK (files unavailable)"
+str_info_storage_err:
+    .string "Storage: DISK ERROR (save may fail)"
 str_info_ticks:
     .string "Interrupt Ticks: "
 str_info_worker:
@@ -9637,35 +9318,6 @@ snake_x:
 snake_y:
     .space 128
 
-; FAT16 State & Variables
-    .align 4
-fat16_mounted:
-    .word 0
-fat16_fat_start:
-    .word 4
-fat16_sec_per_fat:
-    .word 16
-fat16_root_start:
-    .word 36
-fat16_root_secs:
-    .word 32
-fat16_data_start:
-    .word 68
-fat16_sec_per_clus:
-    .word 1
-fat16_file_count:
-    .word 0
-note_cur_filename:
-    .space 32
-
-; FAT16 Buffers
-    .align 4
-fat16_sec_buf:
-    .space 512
-fat16_fat_buf:
-    .space 512
-fat16_dir_buf:
-    .space 1024
 
 ; Notepad text buffer (4 KB = 4096 bytes)
     .align 4

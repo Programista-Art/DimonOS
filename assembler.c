@@ -17,7 +17,7 @@
 #define MAX_LINE_LEN 2048
 #define MAX_RELOCS 32768
 
-typedef struct { char name[96]; uint64_t addr; } Label;
+typedef struct { char name[96]; uint64_t addr; int is_equ; } Label;
 static Label labels[MAX_LABELS];
 static int nlabels = 0;
 
@@ -53,6 +53,10 @@ static void strupper(char *s) {
 static void strip_comment(char *s) {
     int in_s = 0, in_d = 0;
     for (char *p = s; *p; p++) {
+        if ((in_s || in_d) && *p == '\\' && *(p + 1)) {
+            p++;
+            continue;
+        }
         if (*p == '\'' && !in_d) in_s = !in_s;
         else if (*p == '"' && !in_s) in_d = !in_d;
         else if (!in_s && !in_d) {
@@ -161,7 +165,7 @@ static Label *find_label(const char *name) {
     return NULL;
 }
 
-static void add_label(const char *name, uint64_t addr, int lineno) {
+static void add_symbol(const char *name, uint64_t addr, int is_equ, int lineno) {
     char tmp[96];
     strncpy(tmp, name, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
     /* labels are case-sensitive; strip trailing colon if present */
@@ -176,7 +180,12 @@ static void add_label(const char *name, uint64_t addr, int lineno) {
     if (nlabels >= MAX_LABELS) { err(lineno, "too many labels"); return; }
     snprintf(labels[nlabels].name, sizeof(labels[nlabels].name), "%s", tmp);
     labels[nlabels].addr = addr;
+    labels[nlabels].is_equ = is_equ;
     nlabels++;
+}
+
+static void add_label(const char *name, uint64_t addr, int lineno) {
+    add_symbol(name, addr, 0, lineno);
 }
 
 /* Split line into label, mnemonic, rest */
@@ -193,7 +202,7 @@ static void split_line(char *line, char *lab, char *mnem, char *rest) {
             strncpy(tmp, line, n); tmp[n] = 0; trim(tmp);
             /* label must be single token (no spaces) */
             if (tmp[0] && !strchr(tmp, ' ') && !strchr(tmp, '\t') && valid_label(tmp)) {
-                strcpy(lab, tmp);
+                snprintf(lab, 128, "%s", tmp);
                 memmove(line, colon + 1, strlen(colon + 1) + 1);
                 trim(line);
             }
@@ -206,7 +215,7 @@ static void split_line(char *line, char *lab, char *mnem, char *rest) {
     size_t n = (size_t)(p - line);
     if (n >= 127) n = 127;
     strncpy(mnem, line, n); mnem[n] = 0;
-    if (*p) strcpy(rest, p + 1);
+    if (*p) snprintf(rest, MAX_LINE_LEN, "%s", p + 1);
     trim(rest);
     /* bare label without colon? e.g. "loop ADD ..." is not supported; require colon. */
 }
@@ -237,8 +246,11 @@ static int split_operands(char *rest, char ops[4][512]) {
     return n;
 }
 
-/* Resolve symbol expression: number | label | label+offset | label-offset */
-static int resolve_expr(const char *s, uint64_t pc, int64_t *out_val, int lineno) {
+/* Resolve symbol expression: number | label | label+offset | label-offset.
+ * When out_reloc is non-NULL, it is set to 1 if the expression depends on a
+ * relocatable address label (is_equ == 0), or 0 for a pure numeric / .equ constant. */
+static int resolve_expr(const char *s, uint64_t pc, int64_t *out_val, int lineno, int *out_reloc) {
+    if (out_reloc) *out_reloc = 0;
     char b[512];
     strncpy(b, s, sizeof(b) - 1); b[sizeof(b) - 1] = 0;
     trim(b);
@@ -292,12 +304,21 @@ static int resolve_expr(const char *s, uint64_t pc, int64_t *out_val, int lineno
             return 0;
         }
         *out_val = (op == '+') ? ((int64_t)l->addr + off) : ((int64_t)l->addr - off);
+        if (out_reloc) *out_reloc = !l->is_equ;
         return 1;
     }
     /* plain label? also handle '.' (current pc)? */
-    if (!strcmp(b, ".")) { *out_val = (int64_t)pc; return 1; }
+    if (!strcmp(b, ".")) {
+        *out_val = (int64_t)pc;
+        if (out_reloc) *out_reloc = 1;
+        return 1;
+    }
     Label *l = find_label(b);
-    if (l) { *out_val = (int64_t)l->addr; return 1; }
+    if (l) {
+        *out_val = (int64_t)l->addr;
+        if (out_reloc) *out_reloc = !l->is_equ;
+        return 1;
+    }
     /* PC-relative? no */
     if (lineno > 0) {
         char m[300]; snprintf(m, sizeof(m), "unknown symbol '%.100s'", b);
@@ -327,7 +348,7 @@ static int parse_mem(const char *s, int *rs1_out, int64_t *off_out, uint64_t pc,
     else if (parse_number64(offs, &off)) { }
     else {
         if (!need_label_ok) return 0;
-        if (!resolve_expr(offs, pc, &off, lineno)) return 0;
+        if (!resolve_expr(offs, pc, &off, lineno, NULL)) return 0;
     }
     *rs1_out = rs1;
     *off_out = off;
@@ -387,7 +408,7 @@ static int li_size_for(int64_t v) {
 static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, int lineno) {
     char m[64];
     strncpy(m, mnem_raw, sizeof(m) - 1); m[sizeof(m) - 1] = 0; strupper(m);
-    char rest[1024];
+    char rest[MAX_LINE_LEN];
     strncpy(rest, rest_raw, sizeof(rest) - 1); rest[sizeof(rest) - 1] = 0;
 
     if (!m[0]) return 0;
@@ -416,7 +437,7 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
         !strcmp(m, "DS") || !strcmp(m, "RESB")) {
         int64_t v = 0;
         /* allow "N, fill"? take first number */
-        char tmp[512]; strcpy(tmp, rest);
+        char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         char *c = strchr(tmp, ','); if (c) *c = 0;
         if (!parse_number64(tmp, &v) || v < 0) { err(lineno, ".space requires a non-negative size"); return -1; }
         return (int)v;
@@ -432,7 +453,7 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
         int count = 0;
         int in_s = 0, in_d = 0;
         char cur[1024]; int ci = 0;
-        char tmp[2048]; snprintf(tmp, sizeof(tmp), "%s,", rest);
+        char tmp[MAX_LINE_LEN + 2]; snprintf(tmp, sizeof(tmp), "%s,", rest);
         for (char *p = tmp; ; p++) {
             char c = *p; int end = (c == 0);
             if (c == '\'' && !in_d) in_s = !in_s;
@@ -457,7 +478,12 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
     if (!strcmp(m, ".HALF") || !strcmp(m, ".SHORT")) {
         if (!rest[0]) return 0;
         int n = 1;
-        for (const char *p = rest; *p; p++) if (*p == ',') n++;
+        int in_s = 0, in_d = 0;
+        for (const char *p = rest; *p; p++) {
+            if (*p == '\'' && !in_d) in_s = !in_s;
+            else if (*p == '"' && !in_s) in_d = !in_d;
+            else if (*p == ',' && !in_s && !in_d) n++;
+        }
         return n * 2;
     }
     if (!strcmp(m, ".WORD") || !strcmp(m, "DW")) {
@@ -465,8 +491,8 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
         int n = 1;
         int in_s = 0, in_d = 0;
         for (const char *p = rest; *p; p++) {
-            if (*p == '\'') in_s = !in_s;
-            else if (*p == '"') in_d = !in_d;
+            if (*p == '\'' && !in_d) in_s = !in_s;
+            else if (*p == '"' && !in_s) in_d = !in_d;
             else if (*p == ',' && !in_s && !in_d) n++;
         }
         return n * 4;
@@ -474,7 +500,12 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
     if (!strcmp(m, ".DWORD") || !strcmp(m, ".QUAD")) {
         if (!rest[0]) return 0;
         int n = 1;
-        for (const char *p = rest; *p; p++) if (*p == ',') n++;
+        int in_s = 0, in_d = 0;
+        for (const char *p = rest; *p; p++) {
+            if (*p == '\'' && !in_d) in_s = !in_s;
+            else if (*p == '"' && !in_s) in_d = !in_d;
+            else if (*p == ',' && !in_s && !in_d) n++;
+        }
         return n * 8;
     }
     if (!strcmp(m, ".STRING") || !strcmp(m, ".ASCIZ") || !strcmp(m, ".ASCII")) {
@@ -525,11 +556,18 @@ static int instr_size(const char *mnem_raw, const char *rest_raw, uint64_t pc, i
                  !strcmp(m, "MRET") || !strcmp(m, "INT")) return 4;
     }
     if (!strcmp(m, "LI")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "LI requires 2 operands"); return -1; }
         int64_t v = 0;
-        char immb[512]; strcpy(immb, ops[1]); trim(immb);
+        char immb[512]; snprintf(immb, sizeof(immb), "%s", ops[1]); trim(immb);
         if (parse_number64(immb, &v)) return li_size_for(v) * 4;
+        /* .equ / pure constant: exact emit_li_seq size; address label: LUI+ADDI */
+        int64_t ev = 0;
+        int is_reloc = 1;
+        if (resolve_expr(immb, pc, &ev, 0, &is_reloc)) {
+            if (!is_reloc) return li_size_for(ev) * 4;
+            return 8;
+        }
         /* label: assume worst case 8 bytes (LUI+ADDI) for 32-bit addresses,
            but if 64-bit label? addresses < 64MB so 8 is enough. */
         return 8;
@@ -714,7 +752,7 @@ static int unescape(const char *src, size_t slen, char *dst, size_t cap) {
 static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, int lineno) {
     char m[64];
     strncpy(m, mnem_raw, sizeof(m) - 1); m[sizeof(m) - 1] = 0; strupper(m);
-    char rest[2048];
+    char rest[MAX_LINE_LEN];
     strncpy(rest, rest_raw, sizeof(rest) - 1); rest[sizeof(rest) - 1] = 0;
     if (!m[0]) return;
 
@@ -730,7 +768,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
             if ((uint64_t)v > himark) himark = (uint64_t)v;
         } else {
             int64_t ev = 0;
-            if (resolve_expr(rest, pc, &ev, lineno)) {
+            if (resolve_expr(rest, pc, &ev, lineno, NULL)) {
                 ensure_cap((uint64_t)ev);
                 while (cur < (uint64_t)ev) emit8(0);
             } else err(lineno, ".org requires an address");
@@ -741,15 +779,15 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
     if (!strcmp(m, ".GLOBL") || !strcmp(m, ".GLOBAL") || !strcmp(m, ".OPTION")) return;
     if (!strcmp(m, ".EQU") || !strcmp(m, ".SET")) {
         /* .equ name, value : define label as absolute value */
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, ".equ requires name and value"); return; }
         trim(ops[0]); trim(ops[1]);
         int64_t v = 0;
         if (parse_number64(ops[1], &v)) {
-            add_label(ops[0], (uint64_t)v, lineno);
+            add_symbol(ops[0], (uint64_t)v, 1, lineno);
         } else {
             int64_t ev = 0;
-            if (resolve_expr(ops[1], pc, &ev, 0)) add_label(ops[0], (uint64_t)ev, lineno);
+            if (resolve_expr(ops[1], pc, &ev, 0, NULL)) add_symbol(ops[0], (uint64_t)ev, 1, lineno);
             else err(lineno, ".equ invalid value");
         }
         return;
@@ -757,7 +795,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
     if (!strcmp(m, ".ALIGN") || !strcmp(m, ".BALIGN") || !strcmp(m, ".P2ALIGN")) {
         int64_t v = 4;
         if (rest[0]) {
-            char tmp[512]; strcpy(tmp, rest);
+            char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
             char *c = strchr(tmp, ','); if (c) *c = 0;
             trim(tmp);
             if (!parse_number64(tmp, &v)) { err(lineno, ".align requires a number"); return; }
@@ -775,7 +813,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
     }
     if (!strcmp(m, ".SPACE") || !strcmp(m, ".ZERO") || !strcmp(m, ".SKIP") ||
         !strcmp(m, "DS") || !strcmp(m, "RESB")) {
-        char tmp[512]; strcpy(tmp, rest);
+        char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         char *c = strchr(tmp, ','); int fill = 0;
         if (c) { *c = 0; parse_number64(c + 1, &(int64_t){0}); fill = 0; }
         trim(tmp);
@@ -809,7 +847,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
                     if (parse_number64(curtok, &v)) emit8((uint8_t)(v & 0xFF));
                     else {
                         int64_t ev = 0;
-                        if (resolve_expr(curtok, pc, &ev, lineno)) emit8((uint8_t)(ev & 0xFF));
+                        if (resolve_expr(curtok, pc, &ev, lineno, NULL)) emit8((uint8_t)(ev & 0xFF));
                         else err(lineno, "invalid .byte item");
                     }
                 }
@@ -820,21 +858,27 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (!strcmp(m, ".HALF") || !strcmp(m, ".SHORT")) {
-        char tmp[2048]; strcpy(tmp, rest);
-        /* manual split by comma */
-        char *tok = strtok(tmp, ",");
-        while (tok) {
-            trim(tok);
-            if (tok[0]) {
-                int64_t v = 0;
-                if (parse_number64(tok, &v)) emit16le((uint16_t)(v & 0xFFFF));
-                else {
-                    int64_t ev = 0;
-                    if (resolve_expr(tok, pc, &ev, lineno)) emit16le((uint16_t)(ev & 0xFFFF));
-                    else err(lineno, "invalid .half item");
+        int in_s = 0, in_d = 0;
+        char curtok[1024]; int ci = 0;
+        char tmp[MAX_LINE_LEN + 2]; snprintf(tmp, sizeof(tmp), "%s,", rest);
+        for (char *p = tmp; ; p++) {
+            char c = *p; int end = (c == 0);
+            if (c == '\'' && !in_d) in_s = !in_s;
+            else if (c == '"' && !in_s) in_d = !in_d;
+            if ((c == ',' && !in_s && !in_d) || end) {
+                curtok[ci] = 0; trim(curtok);
+                if (curtok[0]) {
+                    int64_t v = 0;
+                    if (parse_number64(curtok, &v)) emit16le((uint16_t)(v & 0xFFFF));
+                    else {
+                        int64_t ev = 0;
+                        if (resolve_expr(curtok, pc, &ev, lineno, NULL)) emit16le((uint16_t)(ev & 0xFFFF));
+                        else err(lineno, "invalid .half item");
+                    }
                 }
-            }
-            tok = strtok(NULL, ",");
+                ci = 0;
+                if (end) break;
+            } else { if (ci < 1000) curtok[ci++] = c; }
         }
         return;
     }
@@ -856,7 +900,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
                         emit8((uint8_t)((w >> 16) & 0xFF)); emit8((uint8_t)((w >> 24) & 0xFF));
                     } else {
                         int64_t ev = 0;
-                        if (resolve_expr(curtok, pc, &ev, lineno)) {
+                        if (resolve_expr(curtok, pc, &ev, lineno, NULL)) {
                             uint32_t w = (uint32_t)(ev & 0xFFFFFFFF);
                             emit8((uint8_t)(w & 0xFF)); emit8((uint8_t)((w >> 8) & 0xFF));
                             emit8((uint8_t)((w >> 16) & 0xFF)); emit8((uint8_t)((w >> 24) & 0xFF));
@@ -884,7 +928,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
                     if (parse_number64(curtok, &v)) emit64le((uint64_t)v);
                     else {
                         int64_t ev = 0;
-                        if (resolve_expr(curtok, pc, &ev, lineno)) emit64le((uint64_t)ev);
+                        if (resolve_expr(curtok, pc, &ev, lineno, NULL)) emit64le((uint64_t)ev);
                         else err(lineno, "invalid .quad item");
                     }
                 }
@@ -944,12 +988,12 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
     }
     if (!strcmp(m, "INT")) {
         int64_t v = 0;
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 1) { err(lineno, "INT requires 1 operand"); return; }
         trim(ops[0]);
         if (!parse_number64(ops[0], &v)) {
             int64_t ev = 0;
-            if (!resolve_expr(ops[0], pc, &ev, lineno)) return;
+            if (!resolve_expr(ops[0], pc, &ev, lineno, NULL)) return;
             v = ev;
         }
         if (v < 0 || v > 0xFFF) { err(lineno, "INT immediate range 0..4095"); return; }
@@ -958,7 +1002,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
     }
     if (!strcmp(m, "MV") || !strcmp(m, "NOT") || !strcmp(m, "NEG") ||
         !strcmp(m, "SEQZ") || !strcmp(m, "SNEZ")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2 && strcmp(m, "MV") != 0) {
             /* SEQZ/SNEZ have 2 ops too */
             if (split_operands(tmp, ops) != 2) { err(lineno, "pseudo requires 2 operands"); return; }
@@ -998,7 +1042,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         }
     }
     if (!strcmp(m, "LI")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "LI requires 2 operands"); return; }
         int rd = 0;
         if (!parse_reg(ops[0], &rd)) { err(lineno, "LI: invalid destination register"); return; }
@@ -1006,8 +1050,14 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         int64_t v = 0;
         if (parse_number64(ops[1], &v)) { emit_li_seq(rd, v); return; }
         int64_t ev = 0;
-        if (resolve_expr(ops[1], pc, &ev, lineno)) {
-            /* label address: force 2-word LUI+ADDI */
+        int is_reloc = 1;
+        if (resolve_expr(ops[1], pc, &ev, lineno, &is_reloc)) {
+            if (!is_reloc) {
+                /* .equ / pure constant: exact emit_li_seq, no DEXE relocation */
+                emit_li_seq(rd, ev);
+                return;
+            }
+            /* relocatable address label: force 2-word LUI+ADDI */
             if (emit_dexe) {
                 if (nrelocations >= MAX_RELOCS) { err(lineno, "too many DEXE relocations"); return; }
                 relocations[nrelocations++] = (uint32_t)cur;
@@ -1021,13 +1071,14 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (!strcmp(m, "LA")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "LA requires 2 operands"); return; }
         int rd = 0;
         if (!parse_reg(ops[0], &rd)) { err(lineno, "LA: invalid register"); return; }
         int64_t ev = 0;
-        if (!resolve_expr(ops[1], pc, &ev, lineno)) return;
-        if (emit_dexe) {
+        int is_reloc = 1;
+        if (!resolve_expr(ops[1], pc, &ev, lineno, &is_reloc)) return;
+        if (emit_dexe && is_reloc) {
             if (nrelocations >= MAX_RELOCS) { err(lineno, "too many DEXE relocations"); return; }
             relocations[nrelocations++] = (uint32_t)cur;
         }
@@ -1044,7 +1095,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
             return;
         }
         if (!strcmp(m, "JR")) {
-            char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+            char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
             if (split_operands(tmp, ops) != 1) { err(lineno, "JR requires 1 operand"); return; }
             int rs = 0;
             if (!parse_reg(ops[0], &rs)) { err(lineno, "invalid register"); return; }
@@ -1052,10 +1103,10 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
             return;
         }
         /* J label / CALL label / TAIL label */
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 1) { err(lineno, "jump requires 1 operand"); return; }
         int64_t target = 0;
-        if (!resolve_expr(ops[0], pc, &target, lineno)) return;
+        if (!resolve_expr(ops[0], pc, &target, lineno, NULL)) return;
         int64_t off = target - (int64_t)pc;
         if ((off & 1) || off < -(1 << 20) || off > ((1 << 20) - 2)) {
             char msg[160]; snprintf(msg, sizeof(msg), "jump target out of range (+/-1MB): '%.80s'", ops[0]);
@@ -1068,7 +1119,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
 
     /* real R-type */
     if (is_rtype(m)) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 3) { err(lineno, "R-type requires 3 operands (rd, rs1, rs2)"); return; }
         int rd = 0, rs1 = 0, rs2 = 0;
         if (!parse_reg(ops[0], &rd) || !parse_reg(ops[1], &rs1) || !parse_reg(ops[2], &rs2)) {
@@ -1078,7 +1129,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (is_itype_imm(m)) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 3) { err(lineno, "I-type requires 3 operands (rd, rs1, imm)"); return; }
         int rd = 0, rs1 = 0;
         if (!parse_reg(ops[0], &rd) || !parse_reg(ops[1], &rs1)) { err(lineno, "invalid register"); return; }
@@ -1092,13 +1143,13 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         int64_t imm = 0;
         trim(ops[2]);
         if (parse_number64(ops[2], &imm)) { }
-        else if (!resolve_expr(ops[2], pc, &imm, lineno)) return;
+        else if (!resolve_expr(ops[2], pc, &imm, lineno, NULL)) return;
         if (imm < -2048 || imm > 2047) { err(lineno, "immediate range -2048..2047"); return; }
         emit_i_alu(rd, rs1, imm, (uint8_t)i_f3(m));
         return;
     }
     if (is_load(m)) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "load requires 2 operands (rd, offset(rs1))"); return; }
         int rd = 0, rs1 = 0; int64_t off = 0;
         if (!parse_reg(ops[0], &rd)) { err(lineno, "invalid destination register"); return; }
@@ -1109,7 +1160,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (is_store(m)) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "store requires 2 operands (rs2, offset(rs1))"); return; }
         int rs2 = 0, rs1 = 0; int64_t off = 0;
         if (!parse_reg(ops[0], &rs2)) { err(lineno, "invalid source register"); return; }
@@ -1120,7 +1171,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (is_branch(m)) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 3) { err(lineno, "branch requires 3 operands (rs1, rs2, label)"); return; }
         int rs1 = 0, rs2 = 0;
         if (!parse_reg(ops[0], &rs1) || !parse_reg(ops[1], &rs2)) { err(lineno, "invalid register"); return; }
@@ -1130,7 +1181,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
             rs2 = tmp_r;
         }
         int64_t target = 0;
-        if (!resolve_expr(ops[2], pc, &target, lineno)) return;
+        if (!resolve_expr(ops[2], pc, &target, lineno, NULL)) return;
         int64_t off = target - (int64_t)pc;
         if ((off & 1) || off < -4096 || off > 4094) {
             err(lineno, "branch target out of range (+/-4KB)");
@@ -1141,14 +1192,14 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (!strcmp(m, "LUI") || !strcmp(m, "AUIPC")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         if (split_operands(tmp, ops) != 2) { err(lineno, "U-type requires 2 operands (rd, imm)"); return; }
         int rd = 0;
         if (!parse_reg(ops[0], &rd)) { err(lineno, "invalid register"); return; }
         int64_t imm = 0;
         trim(ops[1]);
         if (parse_number64(ops[1], &imm)) { }
-        else if (!resolve_expr(ops[1], pc, &imm, lineno)) return;
+        else if (!resolve_expr(ops[1], pc, &imm, lineno, NULL)) return;
         /* accept 20-bit or full address upper */
         int32_t imm20;
         if (imm >= -524288 && imm <= 524287) imm20 = (int32_t)(imm & 0xFFFFF);
@@ -1162,7 +1213,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (!strcmp(m, "JAL")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         int n = split_operands(tmp, ops);
         int rd = 1; char *targ = NULL;
         if (n == 1) { rd = 1; targ = ops[0]; }
@@ -1171,7 +1222,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
             targ = ops[1];
         } else { err(lineno, "JAL requires 1 or 2 operands"); return; }
         int64_t target = 0;
-        if (!resolve_expr(targ, pc, &target, lineno)) return;
+        if (!resolve_expr(targ, pc, &target, lineno, NULL)) return;
         int64_t off = target - (int64_t)pc;
         if ((off & 1) || off < -(1 << 20) || off > ((1 << 20) - 2)) {
             err(lineno, "JAL target out of range (+/-1MB)"); return;
@@ -1180,7 +1231,7 @@ static void pass2_emit(const char *mnem_raw, const char *rest_raw, uint64_t pc, 
         return;
     }
     if (!strcmp(m, "JALR")) {
-        char ops[4][512]; char tmp[1024]; strcpy(tmp, rest);
+        char ops[4][512]; char tmp[MAX_LINE_LEN]; snprintf(tmp, sizeof(tmp), "%s", rest);
         int n = split_operands(tmp, ops);
         if (n == 2) {
             /* JALR rd, offset(rs1) */
@@ -1279,9 +1330,9 @@ int main(int argc, char **argv) {
     /* per-line address cache for pass2 */
     static uint64_t line_addr[MAX_LINES];
     for (int i = 0; i < nlines; i++) {
-        char tmp[MAX_LINE_LEN]; strcpy(tmp, lines[i].text);
+        char tmp[MAX_LINE_LEN]; strncpy(tmp, lines[i].text, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
         strip_comment(tmp);
-        char lab[128], mnem[128], rest[1024];
+        char lab[128], mnem[128], rest[MAX_LINE_LEN];
         split_line(tmp, lab, mnem, rest);
         /* .org handling */
         if (mnem[0]) {
@@ -1303,11 +1354,11 @@ int main(int argc, char **argv) {
         char up[128]; strcpy(up, mnem); strupper(up);
         if (!strcmp(up, ".EQU") || !strcmp(up, ".SET")) {
             /* .equ defines absolute symbol; pass1: try parse number */
-            char ops[4][512]; char t2[1024]; strcpy(t2, rest);
+            char ops[4][512]; char t2[MAX_LINE_LEN]; snprintf(t2, sizeof(t2), "%s", rest);
             if (split_operands(t2, ops) == 2) {
                 trim(ops[0]); trim(ops[1]);
                 int64_t v = 0;
-                if (parse_number64(ops[1], &v)) add_label(ops[0], (uint64_t)v, lines[i].lineno);
+                if (parse_number64(ops[1], &v)) add_symbol(ops[0], (uint64_t)v, 1, lines[i].lineno);
                 /* else defer to pass2 */
             }
             line_addr[i] = addr;
@@ -1337,21 +1388,21 @@ int main(int argc, char **argv) {
     img = NULL; img_cap = 0; cur = 0; himark = 0; errors = 0;
     ensure_cap(4096);
     for (int i = 0; i < nlines; i++) {
-        char tmp[MAX_LINE_LEN]; strcpy(tmp, lines[i].text);
+        char tmp[MAX_LINE_LEN]; strncpy(tmp, lines[i].text, sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = 0;
         strip_comment(tmp);
-        char lab[128], mnem[128], rest[1024];
+        char lab[128], mnem[128], rest[MAX_LINE_LEN];
         split_line(tmp, lab, mnem, rest);
         if (!mnem[0]) continue;
         char up[128]; strcpy(up, mnem); strupper(up);
         if (!strcmp(up, ".EQU") || !strcmp(up, ".SET")) {
             /* define if not already (label expr) */
-            char ops[4][512]; char t2[1024]; strcpy(t2, rest);
+            char ops[4][512]; char t2[MAX_LINE_LEN]; snprintf(t2, sizeof(t2), "%s", rest);
             if (split_operands(t2, ops) == 2) {
                 trim(ops[0]); trim(ops[1]);
                 if (!find_label(ops[0])) {
                     int64_t ev = 0;
-                    if (resolve_expr(ops[1], line_addr[i], &ev, 0))
-                        add_label(ops[0], (uint64_t)ev, lines[i].lineno);
+                    if (resolve_expr(ops[1], line_addr[i], &ev, 0, NULL))
+                        add_symbol(ops[0], (uint64_t)ev, 1, lines[i].lineno);
                 }
             }
             continue;

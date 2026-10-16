@@ -207,6 +207,10 @@ static int split_parent(Fat *f, const char *path, Dir *parent, uint8_t leaf[11])
         strcpy(name, clean);
         strcpy(clean, "/");
     }
+    /* Reject physical dot entries so mutating operations (remove/write/
+     * mkdir/rename) can never delete or overwrite "." or ".." inside a
+     * directory. resolve_dir still accepts them for navigation. */
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return DFS_ERR_NAME;
     int rc = name83(name, leaf); if (rc) return rc;
     return resolve_dir(f, clean, parent);
 }
@@ -377,6 +381,26 @@ int dimonfs_rename(VM *vm, const char *oldp, const char *newp) {
     rc = resolve_entry(&f, oldp, &olddir, &old); if (rc) return rc;
     rc = split_parent(&f, newp, &newdir, nn); if (rc) return rc;
     if (!find_in_dir(&f, newdir, nn, &exists)) return DFS_ERR_EXISTS;
+    /* Refuse to move a directory into itself or one of its descendants. */
+    if (old[11] & ATTR_DIR) {
+        uint16_t move_clus = rd16(old + 26);
+        Dir up = newdir;
+        uint32_t guard = 0;
+        for (;;) {
+            if (!up.root && up.cluster == move_clus) return DFS_ERR_INVALID;
+            if (up.root) break;
+            uint8_t dotdot[11], *pe;
+            if (name83("..", dotdot)) return DFS_ERR_INVALID;
+            if (find_in_dir(&f, up, dotdot, &pe)) return DFS_ERR_INVALID;
+            uint16_t c = rd16(pe + 26);
+            if (c == 0) up = (Dir){1, 0};
+            else {
+                if (!cluster_ptr(&f, c)) return DFS_ERR_INVALID;
+                up = (Dir){0, c};
+            }
+            if (++guard > f.clusters) return DFS_ERR_INVALID;
+        }
+    }
     uint8_t copy[32]; memcpy(copy, old, 32); memcpy(copy, nn, 11);
     if (olddir.root == newdir.root && olddir.cluster == newdir.cluster) memcpy(old, copy, 32);
     else {
@@ -391,10 +415,29 @@ int dimonfs_rename(VM *vm, const char *oldp, const char *newp) {
 }
 
 int dimonfs_copy(VM *vm, const char *src, const char *dst) {
-    Fat f; Dir d; uint8_t *e; int rc = mount_fs(vm, &f); if (rc) return rc;
-    rc = resolve_entry(&f, src, &d, &e); if (rc) return rc;
+    Fat f; Dir sd, dd; uint8_t sn[11], dn[11];
+    int rc = mount_fs(vm, &f); if (rc) return rc;
+    rc = split_parent(&f, src, &sd, sn); if (rc) return rc;
+    rc = split_parent(&f, dst, &dd, dn); if (rc) return rc;
+    /* Identical source and destination: nothing to copy, leave the disk alone. */
+    if (sd.root == dd.root && sd.cluster == dd.cluster && !memcmp(sn, dn, 11))
+        return DFS_OK;
+    uint8_t *e;
+    rc = find_in_dir(&f, sd, sn, &e); if (rc) return rc;
     if (e[11] & ATTR_DIR) return DFS_ERR_IS_DIR;
     uint32_t len = rd32(e + 28);
+#ifndef BAREMETAL
+    /* Host build: stage through a heap buffer instead of guest RAM. */
+    if (len > 0x00800000u) return DFS_ERR_TOO_LARGE;
+    uint8_t *buf = (uint8_t *)malloc(len ? len : 1u);
+    if (!buf) return DFS_ERR_NO_SPACE;
+    uint32_t size = 0;
+    rc = dimonfs_read(vm, src, 0, buf, len, &size);
+    if (rc < 0) { free(buf); return rc; }
+    rc = dimonfs_write(vm, dst, buf, size, 1, 1);
+    free(buf);
+    return rc;
+#else
     /* The advertised disk is at most 4 MiB. Use free guest-independent RAM as a
        bounded staging area, never silently truncating. */
     const uint32_t staging = 0x03000000u, limit = 0x00800000u;
@@ -402,13 +445,51 @@ int dimonfs_copy(VM *vm, const char *src, const char *dst) {
     uint32_t size = 0; rc = dimonfs_read(vm, src, 0, vm->mem + staging, len, &size);
     if (rc < 0) return rc;
     return dimonfs_write(vm, dst, vm->mem + staging, size, 1, 1);
+#endif
 }
 
 int dimonfs_sync(VM *vm) {
 #ifdef BAREMETAL
-    (void)vm; return DFS_OK;
+    /* Bare-metal write-back: the in-memory sector cache holds the updated
+     * clusters/FAT copies/directory entries. Push the full cached volume to
+     * the validated ATA data disk and flush. Never report success until the
+     * sector writes and flush all succeed. Embedded read-only fallback has
+     * no block device and needs no write-back. */
+    if (!vm || !vm->disk_data || !vm->disk_sectors) return DFS_ERR_NODISK;
+    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
+    if (!vm->block_device || !vm->block_device->write) return DFS_OK;
+    uint32_t remaining = vm->disk_sectors, lba = 0;
+    while (remaining > 0) {
+        uint32_t chunk = remaining > 32u ? 32u : remaining;
+        int rc = vm->block_device->write(vm->block_device->context, lba, chunk,
+                                         vm->disk_data + (size_t)lba * 512u);
+        if (rc != 0) return DFS_ERR_IO;
+        lba += chunk;
+        remaining -= chunk;
+    }
+    if (vm->block_device->flush) {
+        if (vm->block_device->flush(vm->block_device->context) != 0) return DFS_ERR_IO;
+    }
+    return DFS_OK;
 #else
-    if (!vm || !vm->disk_path[0]) return DFS_OK;
+    if (!vm || !vm->disk_path[0]) {
+        /* Hosted block-device backend (tests): same write-back contract. */
+        if (!vm || !vm->disk_data || !vm->disk_sectors) return DFS_ERR_NODISK;
+        if (vm->block_device && vm->block_device->write) {
+            uint32_t remaining = vm->disk_sectors, lba = 0;
+            while (remaining > 0) {
+                uint32_t chunk = remaining > 32u ? 32u : remaining;
+                if (vm->block_device->write(vm->block_device->context, lba, chunk,
+                                            vm->disk_data + (size_t)lba * 512u) != 0)
+                    return DFS_ERR_IO;
+                lba += chunk;
+                remaining -= chunk;
+            }
+            if (vm->block_device->flush &&
+                vm->block_device->flush(vm->block_device->context) != 0) return DFS_ERR_IO;
+        }
+        return DFS_OK;
+    }
     FILE *fp = fopen(vm->disk_path, "r+b"); if (!fp) return DFS_ERR_IO;
     size_t bytes = (size_t)vm->disk_sectors * 512u;
     int ok = fwrite(vm->disk_data, 1, bytes, fp) == bytes && fflush(fp) == 0;

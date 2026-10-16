@@ -119,7 +119,7 @@ static int add_to_iso(const char *image_path, char *spec, int replace) {
     int rc = dimonfs_write(&vm, path, file, (uint32_t)file_len, 1, 1);
     if (rc != DFS_OK) { fprintf(stderr, "Add failed: %s (%d)\n", dimonfs_error(rc), rc); free(image); free(file); return 1; }
     printf("Added %s as %s to %s (%zu bytes)\n", spec, path, image_path, file_len);
-    free(image); return 0;
+    free(image); free(file); return 0;
 }
 
 static void put16(uint8_t *b, int off, uint16_t v) {
@@ -140,26 +140,39 @@ static uint32_t get32(const uint8_t *b, int off) {
     return (uint32_t)get16(b, off) | ((uint32_t)get16(b, off + 2) << 16);
 }
 
-static void to_83_name(const char *name, uint8_t *out83) {
+static int valid_83_char(unsigned char c) {
+    if (c >= 'a' && c <= 'z') return 1;
+    if (c >= 'A' && c <= 'Z') return 1;
+    if (c >= '0' && c <= '9') return 1;
+    return c == '$' || c == '%' || c == '\'' || c == '-' || c == '_' ||
+           c == '@' || c == '~' || c == '`' || c == '!' || c == '(' ||
+           c == ')' || c == '{' || c == '}' || c == '^' || c == '#';
+}
+
+/* Convert and validate an 8.3 name using the same rules as dimonfs.c name83:
+ * 1-8 base chars, optional 1-3 extension, single dot, valid charset only.
+ * Returns 0 on success, -1 if the name is rejected. */
+static int to_83_name(const char *name, uint8_t *out83) {
+    if (!name || !*name) return -1;
+    while (*name == ' ' || *name == '\t') name++;
+    if (!*name) return -1;
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return -1;
     memset(out83, ' ', 11);
-    const char *dot = strrchr(name, '.');
-    int nlen = dot ? (int)(dot - name) : (int)strlen(name);
-    if (nlen > 8) nlen = 8;
-    for (int i = 0; i < nlen; i++) {
-        char c = name[i];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        out83[i] = (uint8_t)c;
-    }
-    if (dot) {
-        dot++;
-        int elen = (int)strlen(dot);
-        if (elen > 3) elen = 3;
-        for (int i = 0; i < elen; i++) {
-            char c = dot[i];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            out83[8 + i] = (uint8_t)c;
+    size_t slen = strlen(name);
+    while (slen > 0 && (name[slen - 1] == ' ' || name[slen - 1] == '\t')) slen--;
+    int base = 0, ext = 0, seen_dot = 0;
+    for (size_t i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '.') {
+            if (seen_dot || base == 0) return -1;
+            seen_dot = 1; continue;
         }
+        if (c >= 0x80 || !valid_83_char(c)) return -1;
+        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+        if (!seen_dot) { if (base >= 8) return -1; out83[base++] = c; }
+        else { if (ext >= 3) return -1; out83[8 + ext++] = c; }
     }
+    return (base && (!seen_dot || ext)) ? 0 : -1;
 }
 
 static void format_83_to_str(const uint8_t *e, char *out) {
@@ -225,7 +238,7 @@ static int list_iso(const char *path) {
         format_83_to_str(e, fname);
         uint16_t clus = get16(e, 26);
         uint32_t sz = get32(e, 28);
-        uint32_t f_lba = data_lba + (clus - 2) * spc;
+        uint32_t f_lba = (clus >= 2) ? data_lba + (uint32_t)(clus - 2) * spc : 0;
         printf("  %-13s %-8u %-10u %u\n", fname, clus, sz, f_lba);
         nfiles++;
     }
@@ -335,7 +348,11 @@ int main(int argc, char **argv) {
     }
 
     uint8_t *img = calloc(total, DISK_SECTOR_SIZE);
-    if (!img) { perror("calloc"); return 1; }
+    if (!img) {
+        perror("calloc");
+        for (int k = 0; k < ninputs; k++) free(fdata[k]);
+        free(boot_data); return 1;
+    }
 
     /* Sector 0: MBR / Boot Sector & FAT16 BPB */
     img[0] = 0xEB; img[1] = 0x3C; img[2] = 0x90; /* JMP short 0x3C; NOP */
@@ -395,7 +412,11 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < 3; i++) {
         uint8_t *entry = root_dir + (root_entry_idx++ * 32);
-        to_83_name(sample_files[i], entry);
+        if (to_83_name(sample_files[i], entry) != 0) {
+            fprintf(stderr, "Invalid sample filename: %s\n", sample_files[i]);
+            for (int k = 0; k < ninputs; k++) free(fdata[k]);
+            free(boot_data); free(img); return 1;
+        }
         entry[11] = 0x20; /* Archive attribute */
 
         uint32_t file_len = (uint32_t)strlen(sample_texts[i]);
@@ -419,7 +440,11 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ninputs; i++) {
         if (root_entry_idx >= FAT16_ROOT_ENTRIES) break;
         uint8_t *entry = root_dir + (root_entry_idx++ * 32);
-        to_83_name(names[i], entry);
+        if (to_83_name(names[i], entry) != 0) {
+            fprintf(stderr, "Invalid 8.3 filename: %s\n", names[i]);
+            for (int k = 0; k < ninputs; k++) free(fdata[k]);
+            free(boot_data); free(img); return 1;
+        }
         entry[11] = 0x20;
 
         uint16_t start_clus = next_cluster;

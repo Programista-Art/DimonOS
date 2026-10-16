@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include "io.h"
+#include "ata.h"
 #include "../../dimon64.h"
 
 /* --- Standard Memory Functions (Freestanding) --- */
@@ -231,7 +232,8 @@ static void serial_puts(const char *s) {
     while (*s) baremetal_putchar(*s++);
 }
 
-static void serial_printf(const char *fmt, ...) {
+void serial_printf(const char *fmt, ...) __attribute__((used));
+void serial_printf(const char *fmt, ...) {
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
@@ -847,6 +849,101 @@ static void on_baremetal_gui_poll(void *userdata) {
     }
 }
 
+/* --- Persistent writable FAT16 data disk (separate IDE raw image) ---
+ * The boot ISO stays read-only. Only the explicitly configured legacy IDE
+ * primary-master PIO device is ever considered, and only when sector 0
+ * carries a valid DimonOS FAT16 BPB/signature plus the recognizable
+ * "DIMONOS FAT" volume label / serial. No write is issued until every check
+ * passes; otherwise the desktop falls back to the embedded read-only volume.
+ * Sector cache: g_data_disk mirrors the validated volume; guest reads/writes
+ * go through the cache and are written through to ATA before success. */
+static uint8_t g_data_disk[(size_t)DISK_MAX_SECTORS * DISK_SECTOR_SIZE] __attribute__((aligned(4)));
+static uint8_t g_probe_sector[DISK_SECTOR_SIZE] __attribute__((aligned(2)));
+
+static uint16_t st_rd16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
+static uint32_t st_rd32(const uint8_t *p) { return (uint32_t)st_rd16(p) | ((uint32_t)st_rd16(p + 2) << 16); }
+
+static int storage_bpb_valid(const uint8_t *b, uint32_t device_sectors, uint32_t *out_total) {
+    if (!b || !out_total) return -1;
+    if (b[510] != 0x55 || b[511] != 0xAA) return -2;
+    if (st_rd16(b + 11) != 512) return -3;
+    uint8_t spc = b[13];
+    if (!spc || (spc & (spc - 1)) != 0) return -4;
+    uint16_t reserved = st_rd16(b + 14);
+    uint8_t fats = b[16];
+    uint16_t root_entries = st_rd16(b + 17);
+    uint16_t spf = st_rd16(b + 22);
+    if (!reserved || !fats || !root_entries || !spf) return -5;
+    uint32_t total = st_rd16(b + 19);
+    if (!total) total = st_rd32(b + 32);
+    if (!total || total > device_sectors || total > DISK_MAX_SECTORS) return -6;
+    /* Recognizable DimonOS identifier: OEM + FAT16 type + volume label/serial.
+     * This prevents mounting an unrelated disk that merely responds to ATA. */
+    static const char want_oem[8] = { 'D','I','M','O','N','6','4',' ' };
+    static const char want_fs[8] = { 'F','A','T','1','6',' ',' ',' ' };
+    static const char want_label[11] = { 'D','I','M','O','N','O','S',' ','F','A','T' };
+    for (int i = 0; i < 8; i++) if (b[3 + i] != (uint8_t)want_oem[i]) return -7;
+    for (int i = 0; i < 8; i++) if (b[54 + i] != (uint8_t)want_fs[i]) return -8;
+    int label_ok = 1;
+    for (int i = 0; i < 11; i++) if (b[43 + i] != (uint8_t)want_label[i]) { label_ok = 0; break; }
+    uint32_t serial = st_rd32(b + 39);
+    if (!label_ok && serial != 0x19980808u) return -9;
+    uint32_t root_sectors = ((uint32_t)root_entries * 32u + 511u) / 512u;
+    uint32_t root_lba = (uint32_t)reserved + (uint32_t)fats * spf;
+    uint32_t data_lba = root_lba + root_sectors;
+    if (data_lba >= total) return -10;
+    uint32_t clusters = (total - data_lba) / spc;
+    if (!clusters || (uint32_t)spf * 256u < clusters + 2u) return -11;
+    *out_total = total;
+    return 0;
+}
+
+/* Try to promote the ATA primary-master raw image to the desktop's primary
+ * FAT16 volume. Returns 1 on success (vm now writable), 0 on fallback. */
+static int storage_try_mount_writable(VM *vm, Dimon64BlockDevice *dev) {
+    if (!vm || !dev || !dev->read) return 0;
+    if (dev->sectors == 0 || dev->sectors > 0x0FFFFFFFu) {
+        serial_puts("[STORAGE] ATA device reports unsupported capacity; ignoring.\n");
+        return 0;
+    }
+    int probe_rc = dev->read(dev->context, 0, 1, g_probe_sector);
+    if (probe_rc != 0) {
+        serial_printf("[STORAGE] ATA sector 0 unreadable (rc=%d); falling back to embedded ISO.\n", probe_rc);
+        return 0;
+    }
+    uint32_t total = 0;
+    int valid = storage_bpb_valid(g_probe_sector, dev->sectors, &total);
+    if (valid != 0) {
+        serial_printf("[STORAGE] ATA data disk rejected (check %d); no writes issued.\n", valid);
+        serial_puts("[STORAGE] Expected DimonOS FAT16 BPB + \"DIMONOS FAT\" label.\n");
+        return 0;
+    }
+    /* Copy the whole validated volume into the RAM cache in bounded chunks.
+     * No guest write has occurred yet, so a copy failure simply falls back. */
+    uint32_t lba = 0, remaining = total;
+    while (remaining > 0) {
+        uint32_t chunk = remaining > 32u ? 32u : remaining;
+        if (dev->read(dev->context, lba, chunk, g_data_disk + (size_t)lba * DISK_SECTOR_SIZE) != 0) {
+            serial_printf("[STORAGE] ATA copy failed at LBA %u; falling back.\n", lba);
+            return 0;
+        }
+        lba += chunk;
+        remaining -= chunk;
+    }
+    vm->disk_data = g_data_disk;
+    vm->disk_sectors = total;
+    vm->disk_writable = 1;
+    vm->storage_mode = DIMON_STORAGE_WRITABLE;
+    vm_block_bind(vm, dev);
+    char label[12];
+    for (int i = 0; i < 11; i++) label[i] = (char)g_probe_sector[43 + i];
+    label[11] = '\0';
+    serial_printf("[STORAGE] Mounted writable ATA data disk: %u sectors, label \"%s\".\n",
+                  total, label);
+    serial_puts("[STORAGE] Desktop primary volume is now WRITABLE (fallback: embedded read-only).\n");
+    return 1;
+}
+
 /* --- Embedded Assets from boot.S --- */
 extern uint8_t _os_bin_start[];
 extern uint8_t _os_bin_end[];
@@ -889,15 +986,45 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     vm.gui_flush_cb = on_baremetal_gui_flush;
     vm.gui_poll_cb  = on_baremetal_gui_poll;
 
-    /* Attach embedded ISO virtual disk if present */
+    /* Attach embedded ISO virtual disk first (read-only fallback). */
     size_t iso_size = (size_t)(_dimon_iso_end - _dimon_iso_start);
     if (iso_size >= 512) {
         vm.disk_data = _dimon_iso_start;
         vm.disk_sectors = (uint32_t)(iso_size / 512);
         vm.disk_writable = 0;
-        serial_printf("[DimonOS] Attached embedded ISO disk: %u sectors (%u KB).\n",
+        vm.storage_mode = DIMON_STORAGE_READONLY;
+        vm_block_unbind(&vm);
+        serial_printf("[DimonOS] Attached embedded ISO disk: %u sectors (%u KB, read-only).\n",
                       vm.disk_sectors, (unsigned)(iso_size / 1024));
+    } else {
+        vm.storage_mode = DIMON_STORAGE_NODISK;
+        serial_puts("[STORAGE] No embedded ISO disk present.\n");
     }
+
+    /* Probe legacy ATA PRIMARY MASTER (the only supported writable device)
+     * and promote it to the primary FAT16 volume when it passes all safety
+     * checks. The CD-ROM / secondary / slave devices are never probed. */
+    static Dimon64BlockDevice ata_device;
+    int ata_rc = ata_detect(&ata_device);
+    if (ata_rc == 0) {
+        if (!storage_try_mount_writable(&vm, &ata_device)) {
+            serial_puts("[STORAGE] Active volume: READ-ONLY embedded disk.\n");
+            if (vm.storage_mode != DIMON_STORAGE_READONLY && vm.storage_mode != DIMON_STORAGE_NODISK)
+                vm.storage_mode = DIMON_STORAGE_ERROR;
+            else if (vm.disk_data)
+                vm.storage_mode = DIMON_STORAGE_READONLY;
+        }
+    } else {
+        serial_puts("[STORAGE] No ATA data disk; desktop uses embedded read-only volume.\n");
+        if (vm.disk_data) vm.storage_mode = DIMON_STORAGE_READONLY;
+        else vm.storage_mode = DIMON_STORAGE_NODISK;
+    }
+    if (vm.storage_mode == DIMON_STORAGE_WRITABLE)
+        serial_puts("[STORAGE] Mode=WRITABLE disk | Save persists across reboot.\n");
+    else if (vm.storage_mode == DIMON_STORAGE_READONLY)
+        serial_puts("[STORAGE] Mode=READ-ONLY embedded | Save reports no writable disk.\n");
+    else
+        serial_puts("[STORAGE] Mode=DISK UNAVAILABLE/ERROR | Open may fail.\n");
 
     /* Load and launch DimonOS-64 binary */
     size_t os_size = (size_t)(_os_bin_end - _os_bin_start);

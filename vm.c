@@ -320,6 +320,8 @@ void vm_init(VM *vm) {
     vm->procs[0].stack_base = DIMON64_STACK_BASE;
     vm->procs[0].stack_size = DIMON64_STACK_SIZE;
     snprintf(vm->procs[0].name, sizeof(vm->procs[0].name), "init");
+    vm->storage_mode = DIMON_STORAGE_NODISK;
+    vm->block_device = NULL;
 }
 
 void vm_free(VM *vm) {
@@ -347,7 +349,19 @@ void vm_disk_detach(VM *vm) {
 #endif
     vm->disk_sectors = 0;
     vm->disk_writable = 0;
+    vm->storage_mode = DIMON_STORAGE_NODISK;
+    vm->block_device = NULL;
     vm->disk_path[0] = 0;
+}
+
+void vm_block_bind(VM *vm, Dimon64BlockDevice *device) {
+    if (!vm) return;
+    vm->block_device = device;
+}
+
+void vm_block_unbind(VM *vm) {
+    if (!vm) return;
+    vm->block_device = NULL;
 }
 
 #ifndef BAREMETAL
@@ -375,6 +389,7 @@ int vm_disk_attach(VM *vm, const char *path, int writable) {
     } else {
         vm->disk_writable = 0;
     }
+    vm->storage_mode = vm->disk_writable ? DIMON_STORAGE_WRITABLE : DIMON_STORAGE_READONLY;
     strncpy(vm->disk_path, path, sizeof(vm->disk_path) - 1);
     return 0;
 }
@@ -407,7 +422,21 @@ int vm_disk_write(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count) {
     uint64_t bytes = count * DISK_SECTOR_SIZE;
     if (ram_addr + bytes > vm->memsize) return DISK_ERR_RAM;
     memcpy(vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE, vm->mem + ram_addr, (size_t)bytes);
-#ifndef BAREMETAL
+#ifdef BAREMETAL
+    /* Bare-metal write-through: the sector cache is authoritative for the
+     * guest, but the validated ATA data disk must observe every write before
+     * success is reported. Embedded ISO fallback has no block device. */
+    if (vm->block_device && vm->block_device->write) {
+        int rc = vm->block_device->write(vm->block_device->context, lba,
+                                         (uint32_t)count,
+                                         vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE);
+        if (rc != DISK_ERR_NONE) return rc;
+        if (vm->block_device->flush) {
+            rc = vm->block_device->flush(vm->block_device->context);
+            if (rc != DISK_ERR_NONE) return rc;
+        }
+    }
+#else
     if (vm->disk_path[0]) {
         FILE *f = fopen(vm->disk_path, "r+b");
         if (!f) return DISK_ERR_IO;
@@ -415,8 +444,40 @@ int vm_disk_write(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count) {
             fwrite(vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE, 1, (size_t)bytes, f) != (size_t)bytes ||
             fflush(f) != 0) { fclose(f); return DISK_ERR_IO; }
         if (fclose(f) != 0) return DISK_ERR_IO;
+    } else if (vm->block_device && vm->block_device->write) {
+        int rc = vm->block_device->write(vm->block_device->context, lba,
+                                         (uint32_t)count,
+                                         vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE);
+        if (rc != DISK_ERR_NONE) return rc;
     }
 #endif
+    return DISK_ERR_NONE;
+}
+
+int vm_disk_sync(VM *vm) {
+    if (!vm || !vm->disk_data || vm->disk_sectors == 0) return DISK_ERR_NODISK;
+    if (!vm->disk_writable) return DISK_ERR_READONLY;
+    if (!vm->block_device || !vm->block_device->write) {
+#ifndef BAREMETAL
+        return DISK_ERR_NONE;
+#else
+        return DISK_ERR_NONE;
+#endif
+    }
+    /* Full-volume write-back used by the FAT16 service, whose updates touch
+     * the cache directly (data clusters, FAT copies, directory entries).
+     * Bounded: at most DISK_MAX_SECTORS sectors. */
+    uint32_t remaining = vm->disk_sectors;
+    uint32_t lba = 0;
+    while (remaining > 0) {
+        uint32_t chunk = remaining > 32u ? 32u : remaining;
+        int rc = vm->block_device->write(vm->block_device->context, lba, chunk,
+                                         vm->disk_data + (size_t)lba * DISK_SECTOR_SIZE);
+        if (rc != DISK_ERR_NONE) return rc;
+        lba += chunk;
+        remaining -= chunk;
+    }
+    if (vm->block_device->flush) return vm->block_device->flush(vm->block_device->context);
     return DISK_ERR_NONE;
 }
 
@@ -1092,7 +1153,11 @@ static void do_syscall(VM *vm, uint64_t id) {
                 vm->flags &= ~DIMON64_FLAG_C;
                 vm->regs[10] = (uint64_t)vm->disk_sectors;
                 vm->regs[11] = DISK_SECTOR_SIZE;
-                vm->regs[12] = 0;
+                /* a2 carries the storage mode for the System Info / Explorer
+                 * status line: 1=writable data disk, 2=read-only embedded,
+                 * 3=no disk, 4=error. Legacy guests ignore it. */
+                vm->regs[12] = (uint64_t)(vm->disk_writable ? DIMON_STORAGE_WRITABLE
+                    : (vm->storage_mode ? vm->storage_mode : DIMON_STORAGE_READONLY));
             }
             break;
         }
