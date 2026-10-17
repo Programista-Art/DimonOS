@@ -1303,17 +1303,74 @@ static void debugger(VM *vm) {
         } else if (cmd == 'r') {
             vm_dump_regs(vm, stdout);
         } else if (cmd == 's') {
+                int use_color = isatty(STDOUT_FILENO);
+		const char *reset = use_color ? "\033[0m" : "";
+		const char *heading = use_color ? "\033[1;36m" : "";
+		const char *address = use_color ? "\033[36m" : "";
+		const char *instruction = use_color ? "\033[1;33m" : "";
+		const char *value = use_color ? "\033[32m" : "";
             int n = 1;
             sscanf(line + 1, "%d", &n);
             if (n < 1) n = 1;
+
             for (int i = 0; i < n; i++) {
-                dimon64_disasm(vm, vm->pc, dasm, sizeof(dasm));
-                printf("  %08" PRIX64 ": %s\n", vm->pc, dasm);
+                uint64_t step_pc = vm->pc;
+                uint64_t step_number = vm->steps + 1;
+                uint64_t old_flags = vm->flags;
+                uint64_t old_regs[DIMON64_NUM_REGS];
+
+                memcpy(old_regs, vm->regs, sizeof(old_regs));
+                dimon64_disasm(vm, step_pc, dasm, sizeof(dasm));
+
+                printf("\n%sSTEP #%" PRIu64 "%s | PC %s0x%08" PRIX64 "%s\n",
+                       heading, step_number, reset,
+                       address, step_pc, reset);
+                printf("  %s%s%s\n", instruction, dasm, reset);
+
                 int rc = vm_step(vm);
-                if (rc == 1) { printf("[HLT]\n"); vm_dump_regs(vm, stdout); return; }
-                if (rc != 0) { printf("[ERROR %d]\n", rc); return; }
+
+                printf("\n%sAFTER STEP%s  PC=0x%08" PRIX64
+                       "  FLAGS=0x%016" PRIX64
+                       "  STEPS=%" PRIu64 "\n",
+                       heading, reset, vm->pc, vm->flags, vm->steps);
+
+                if (old_flags != vm->flags) {
+                    printf("  FLAGS changed: 0x%016" PRIX64
+                           " -> 0x%016" PRIX64 "\n",
+                           old_flags, vm->flags);
+                }
+
+                int changed = 0;
+                for (int r = 0; r < DIMON64_NUM_REGS; r++) {
+                    if (old_regs[r] != vm->regs[r]) {
+                        if (!changed) {
+                            printf("  %sREGISTER CHANGES%s\n", heading, reset);
+                            changed = 1;
+                        }
+                        printf("    %-4s (R%-2d) %s0x%016" PRIX64
+                               "%s -> %s0x%016" PRIX64 "%s\n",
+                               dimon64_reg_abi(r), r,
+                               value, old_regs[r], reset,
+                               value, vm->regs[r], reset);
+                    }
+                }
+
+                if (!changed) {
+                    printf("  REGISTER CHANGES: none\n");
+                }
+
+                if (rc == 1) {
+                    printf("\n%s[HALT]%s\n", heading, reset);
+                    vm_dump_regs(vm, stdout);
+                    return;
+                }
+
+                if (rc != 0) {
+                    printf("\n%s[ERROR %d]%s\n", heading, rc, reset);
+                    vm_dump_regs(vm, stdout);
+                    return;
+                }
             }
-            vm_dump_regs(vm, stdout);
         } else if (cmd == 'c') {
             for (;;) {
                 if (at_bp(vm->pc)) { printf("[BREAK @ %08" PRIX64 "]\n", vm->pc); break; }

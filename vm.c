@@ -1,6 +1,10 @@
 /* DimonVirtualCPU-64: 64-bit RISC-V style virtual machine.
  * All code, comments and identifiers are in English.
  */
+#ifndef BAREMETAL
+#define _DEFAULT_SOURCE
+#endif
+
 #include "dimon64.h"
 #include "font8x16.h"
 #include "dimonfs.h"
@@ -9,6 +13,7 @@
 #include <inttypes.h>
 #include <time.h>
 #include <sys/time.h>
+#include <unistd.h>
 #else
 extern uint32_t kernel_get_ticks_ms(void);
 extern void baremetal_putchar(char c);
@@ -554,17 +559,50 @@ void vm_reset(VM *vm, uint64_t start_pc) {
 }
 
 #ifndef BAREMETAL
+
 void vm_dump_regs(VM *vm, FILE *out) {
     if (!vm || !out) return;
-    fprintf(out, "PC=%016" PRIX64 " FLAGS=%016" PRIX64 " halted=%d steps=%" PRIu64
-            " ticks=%" PRIu64 " switches=%" PRIu64 " proc=%d\n",
-            vm->pc, vm->flags, vm->halted, vm->steps,
-            vm->timer_ticks, vm->switches, vm->cur_proc);
+
+    int use_color = isatty(fileno(out));
+    const char *reset   = use_color ? "\033[0m"     : "";
+    const char *heading = use_color ? "\033[1;36m"  : "";
+    const char *label   = use_color ? "\033[36m"     : "";
+    const char *value   = use_color ? "\033[32m"     : "";
+    const char *meta    = use_color ? "\033[33m"     : "";
+
+    fprintf(out, "\n%s=== MACHINE STATE ===%s\n", heading, reset);
+
+    fprintf(out,
+            "  %-7s %s0x%016" PRIX64 "%s    %-7s %s0x%016" PRIX64 "%s\n",
+            "PC", value, vm->pc, reset,
+            "FLAGS", value, vm->flags, reset);
+
+    fprintf(out,
+            "  %sHALTED%s=%d  %sSTEPS%s=%" PRIu64
+            "  %sTICKS%s=%" PRIu64
+            "  %sSWITCHES%s=%" PRIu64
+            "  %sPROC%s=%d\n",
+            meta, reset, vm->halted,
+            meta, reset, vm->steps,
+            meta, reset, vm->timer_ticks,
+            meta, reset, vm->switches,
+            meta, reset, vm->cur_proc);
+
+    fprintf(out, "\n%s=== REGISTERS (64-bit, hexadecimal) ===%s\n",
+            heading, reset);
+
     for (int i = 0; i < 32; i++) {
-        fprintf(out, "%-4s(R%-2d)=%016" PRIX64 "  ", dimon64_reg_abi(i), i, vm->regs[i]);
-        if (i % 4 == 3) fprintf(out, "\n");
+        fprintf(out, "  %s%-4s%s (R%-2d) %s0x%016" PRIX64 "%s",
+                label, dimon64_reg_abi(i), reset,
+                i, value, vm->regs[i], reset);
+
+        if (i % 2 == 0)
+            fputs("    | ", out);
+        else
+            fputc('\n', out);
     }
 }
+
 #endif
 
 void vm_stb(VM *vm, uint64_t addr, uint8_t v) {
