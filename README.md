@@ -71,4 +71,30 @@ make regression         # Runs automated QEMU bare-metal UI/UX integration tests
 make kill-qemu          # Kills any hanging background QEMU instances (Linux)
 
 ```
+## Dimon OS screenshots
+
+<p align="center">
+  <img src="img/1.jpg" width="49%" title="" />
+  <img src="img/2.jpg" width="49%" title="" />
+  <img src="img/3.jpg" width="49%" title="" />
+  <img src="img/4.jpg" width="49%" title="" />
+  <img src="img/5.jpg" width="49%" title="" />
+  <img src="img/6.jpg" width="49%" title="" />
+
+</p>
+
+## Community and Contact
+
+The **Dimon OS** system is being actively and continuously developed by me! If you have any questions, ideas for new features, have found a bug, or simply want to talk about the project, I warmly invite you to join our community and follow my channels:
+
+* 👾 **Discord:** [Join our server](https://discord.gg/aXuxvn7tzY)
+* 📘 **Facebook:** [Visit the Fan Page](https://www.facebook.com/profile.php?id=61563368962907)
+* 📺 **YouTube:** [Subscribe to the Channel](https://www.youtube.com/@programistaart)
+* 💼 **LinkedIn:**[Let’s get in touch](https://www.linkedin.com/in/dymitr-wygowski-bb707216b/) 
+
+I am always happy to hear your feedback and suggestions regarding the further development of the system!
+
+## License
+
+This project is licensed under the MIT License. You are free to use, modify, and distribute the code.This project is licensed under the MIT License. You are free to use, modify, and distribute the code.
 
