@@ -31,21 +31,52 @@ typedef struct {
 
 typedef struct { int root; uint16_t cluster; } Dir;
 
+/* Dirty-sector bitmap: only modified LBAs are written back on sync. */
+#define FS_MAX_SECTORS DISK_MAX_SECTORS
+static uint8_t g_dirty[(FS_MAX_SECTORS + 7) / 8];
+
+static void dirty_clear(void) {
+    memset(g_dirty, 0, sizeof(g_dirty));
+}
+
+static void dirty_set(uint32_t lba, uint32_t count) {
+    for (uint32_t i = 0; i < count && (lba + i) < FS_MAX_SECTORS; i++) {
+        uint32_t s = lba + i;
+        g_dirty[s >> 3] |= (uint8_t)(1u << (s & 7u));
+    }
+}
+
+static int dirty_get(uint32_t lba) {
+    if (lba >= FS_MAX_SECTORS) return 0;
+    return (g_dirty[lba >> 3] >> (lba & 7u)) & 1;
+}
+
+/* Mark every sector touched by [p, p+n) of the cached image as dirty. */
+static void dirty_ptr(Fat *f, const void *p, size_t n) {
+    if (!f || !f->image || !p || n == 0) return;
+    const uint8_t *b = (const uint8_t *)p;
+    if (b < f->image) return;
+    uint32_t off = (uint32_t)(b - f->image);
+    uint32_t lba = off / 512u;
+    uint32_t count = (uint32_t)((off % 512u + (uint32_t)n + 511u) / 512u);
+    dirty_set(lba, count);
+}
+
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)rd16(p) | ((uint32_t)rd16(p + 2) << 16); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void wr32(uint8_t *p, uint32_t v) { wr16(p, (uint16_t)v); wr16(p + 2, (uint16_t)(v >> 16)); }
 
-static int mount_fs(VM *vm, Fat *f) {
-    if (!vm || !vm->disk_data || !vm->disk_sectors) return DFS_ERR_NODISK;
-    uint8_t *b = vm->disk_data;
-    if (vm->disk_sectors > DISK_MAX_SECTORS || rd16(b + 11) != 512 ||
+static int mount_fs(DimonDisk *dk, Fat *f) {
+    if (!dk || !dk->disk_data || !dk->disk_sectors) return DFS_ERR_NODISK;
+    uint8_t *b = dk->disk_data;
+    if (dk->disk_sectors > DISK_MAX_SECTORS || rd16(b + 11) != 512 ||
         b[13] == 0 || (b[13] & (b[13] - 1)) != 0 || !rd16(b + 14) ||
         !b[16] || !rd16(b + 22) || b[510] != 0x55 || b[511] != 0xaa)
         return DFS_ERR_INVALID;
     uint32_t total = rd16(b + 19);
     if (!total) total = rd32(b + 32);
-    if (!total || total > vm->disk_sectors) return DFS_ERR_INVALID;
+    if (!total || total > dk->disk_sectors) return DFS_ERR_INVALID;
     memset(f, 0, sizeof(*f));
     f->image = b; f->sectors = total; f->reserved = rd16(b + 14);
     f->fats = b[16]; f->spc = b[13]; f->spf = rd16(b + 22);
@@ -57,6 +88,7 @@ static int mount_fs(VM *vm, Fat *f) {
     f->clusters = (total - f->data_lba) / f->spc;
     f->cluster_bytes = (uint32_t)f->spc * 512u;
     if (!f->clusters || (uint32_t)f->spf * 256u < f->clusters + 2u) return DFS_ERR_INVALID;
+    dirty_clear();
     return DFS_OK;
 }
 
@@ -69,6 +101,7 @@ static void fat_set(Fat *f, uint16_t c, uint16_t value) {
     for (uint8_t n = 0; n < f->fats; n++) {
         uint32_t off = ((uint32_t)f->reserved + (uint32_t)n * f->spf) * 512u + (uint32_t)c * 2u;
         wr16(f->image + off, value);
+        dirty_ptr(f, f->image + off, 2);
     }
 }
 
@@ -223,7 +256,7 @@ static int resolve_entry(Fat *f, const char *path, Dir *parent, uint8_t **entry)
 static int alloc_cluster(Fat *f, uint16_t *out) {
     for (uint32_t c = 2; c < f->clusters + 2u && c <= 0xffef; c++) {
         if (fat_get(f, (uint16_t)c) == 0) {
-            fat_set(f, (uint16_t)c, 0xffff); memset(cluster_ptr(f, (uint16_t)c), 0, f->cluster_bytes);
+            fat_set(f, (uint16_t)c, 0xffff); { uint8_t *cp = cluster_ptr(f, (uint16_t)c); memset(cp, 0, f->cluster_bytes); dirty_ptr(f, cp, f->cluster_bytes); }
             *out = (uint16_t)c; return DFS_OK;
         }
     }
@@ -264,8 +297,8 @@ static void fill_info(const uint8_t *e, Dimon64DirEnt *out) {
     out->attributes = e[11]; out->first_cluster = rd16(e + 26); out->size = rd32(e + 28);
 }
 
-int dimonfs_stat(VM *vm, const char *path, Dimon64DirEnt *out) {
-    Fat f; int rc = mount_fs(vm, &f); if (rc) return rc;
+int dimonfs_stat(DimonDisk *dk, const char *path, Dimon64DirEnt *out) {
+    Fat f; int rc = mount_fs(dk, &f); if (rc) return rc;
     if (!path || !out) return DFS_ERR_INVALID;
     if (!strcmp(path, "/") || !*path) {
         memset(out, 0, sizeof(*out)); strcpy(out->name, "/"); out->attributes = ATTR_DIR; return DFS_OK;
@@ -273,8 +306,8 @@ int dimonfs_stat(VM *vm, const char *path, Dimon64DirEnt *out) {
     Dir d; uint8_t *e; rc = resolve_entry(&f, path, &d, &e); if (!rc) fill_info(e, out); return rc;
 }
 
-int dimonfs_list(VM *vm, const char *path, uint32_t index, Dimon64DirEnt *out) {
-    Fat f; Dir d; int rc = mount_fs(vm, &f); if (rc) return rc;
+int dimonfs_list(DimonDisk *dk, const char *path, uint32_t index, Dimon64DirEnt *out) {
+    Fat f; Dir d; int rc = mount_fs(dk, &f); if (rc) return rc;
     if (!out) return DFS_ERR_INVALID;
     rc = resolve_dir(&f, path, &d);
     if (rc) return rc;
@@ -287,8 +320,8 @@ int dimonfs_list(VM *vm, const char *path, uint32_t index, Dimon64DirEnt *out) {
     return DFS_ERR_NOT_FOUND;
 }
 
-int dimonfs_read(VM *vm, const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *size) {
-    Fat f; Dir d; uint8_t *e; int rc = mount_fs(vm, &f); if (rc) return rc;
+int dimonfs_read(DimonDisk *dk, const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *size) {
+    Fat f; Dir d; uint8_t *e; int rc = mount_fs(dk, &f); if (rc) return rc;
     if ((!buf && cap) || !size) return DFS_ERR_INVALID;
     rc = resolve_entry(&f, path, &d, &e); if (rc) return rc;
     if (e[11] & ATTR_DIR) return DFS_ERR_IS_DIR;
@@ -308,9 +341,9 @@ int dimonfs_read(VM *vm, const char *path, uint32_t offset, void *buf, uint32_t 
     return (int)done;
 }
 
-int dimonfs_write(VM *vm, const char *path, const void *buf, uint32_t len, int create, int truncate) {
-    Fat f; Dir d; uint8_t *e = NULL; uint8_t n[11]; int rc = mount_fs(vm, &f); if (rc) return rc;
-    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
+int dimonfs_write(DimonDisk *dk, const char *path, const void *buf, uint32_t len, int create, int truncate) {
+    Fat f; Dir d; uint8_t *e = NULL; uint8_t n[11]; int rc = mount_fs(dk, &f); if (rc) return rc;
+    if (!dk->disk_writable) return DFS_ERR_READ_ONLY;
     if ((!buf && len) || !truncate) return DFS_ERR_INVALID;
     rc = split_parent(&f, path, &d, n); if (rc) return rc;
     rc = find_in_dir(&f, d, n, &e);
@@ -318,7 +351,7 @@ int dimonfs_write(VM *vm, const char *path, const void *buf, uint32_t len, int c
         if (!create) return rc;
         rc = new_entry(&f, d, &e);
         if (rc) return rc;
-        memset(e, 0, 32); memcpy(e, n, 11); e[11] = 0x20;
+        memset(e, 0, 32); memcpy(e, n, 11); e[11] = 0x20; dirty_ptr(&f, e, 32);
     } else if (rc) return rc;
     if (e[11] & ATTR_DIR) return DFS_ERR_IS_DIR;
     uint32_t need = len ? (len + f.cluster_bytes - 1u) / f.cluster_bytes : 0;
@@ -327,39 +360,40 @@ int dimonfs_write(VM *vm, const char *path, const void *buf, uint32_t len, int c
     for (uint16_t c = old; c >= 2 && c < FAT_EOC && guard++ <= f.clusters; c = fat_get(&f, c)) old_count++;
     if (need > free_count + old_count) return DFS_ERR_NO_SPACE;
     if (old >= 2) free_chain(&f, old);
-    wr16(e + 26, 0); wr32(e + 28, 0);
+    wr16(e + 26, 0); wr32(e + 28, 0); dirty_ptr(&f, e, 32);
     uint16_t first = 0, prev = 0; uint32_t done = 0;
     for (uint32_t i = 0; i < need; i++) {
         uint16_t c; rc = alloc_cluster(&f, &c);
-        if (rc) { if (first) free_chain(&f, first); e[0] = 0xe5; return rc; }
+        if (rc) { if (first) free_chain(&f, first); e[0] = 0xe5; dirty_ptr(&f, e, 32); return rc; }
         if (!first) first = c;
         if (prev) fat_set(&f, prev, c);
         prev = c;
         uint32_t chunk = len - done; if (chunk > f.cluster_bytes) chunk = f.cluster_bytes;
-        memcpy(cluster_ptr(&f, c), (const uint8_t *)buf + done, chunk); done += chunk;
+        { uint8_t *cp = cluster_ptr(&f, c); memcpy(cp, (const uint8_t *)buf + done, chunk); dirty_ptr(&f, cp, chunk); done += chunk; }
     }
-    wr16(e + 26, first); wr32(e + 28, len); return dimonfs_sync(vm);
+    wr16(e + 26, first); wr32(e + 28, len); dirty_ptr(&f, e, 32); return dimonfs_sync(dk);
 }
 
-int dimonfs_mkdir(VM *vm, const char *path) {
-    Fat f; Dir parent; uint8_t n[11], *e; int rc = mount_fs(vm, &f); if (rc) return rc;
-    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
+int dimonfs_mkdir(DimonDisk *dk, const char *path) {
+    Fat f; Dir parent; uint8_t n[11], *e; int rc = mount_fs(dk, &f); if (rc) return rc;
+    if (!dk->disk_writable) return DFS_ERR_READ_ONLY;
     rc = split_parent(&f, path, &parent, n); if (rc) return rc;
     if (!find_in_dir(&f, parent, n, &e)) return DFS_ERR_EXISTS;
     uint16_t c; rc = alloc_cluster(&f, &c); if (rc) return rc;
     rc = new_entry(&f, parent, &e); if (rc) { free_chain(&f, c); return rc; }
-    memset(e, 0, 32); memcpy(e, n, 11); e[11] = ATTR_DIR; wr16(e + 26, c);
+    memset(e, 0, 32); memcpy(e, n, 11); e[11] = ATTR_DIR; wr16(e + 26, c); dirty_ptr(&f, e, 32);
     uint8_t *p = cluster_ptr(&f, c);
-    if (!p) { free_chain(&f, c); e[0] = 0xe5; return DFS_ERR_INVALID; }
+    if (!p) { free_chain(&f, c); e[0] = 0xe5; dirty_ptr(&f, e, 32); return DFS_ERR_INVALID; }
     memset(p, 0, f.cluster_bytes);
     memset(p, ' ', 11); p[0] = '.'; p[11] = ATTR_DIR; wr16(p + 26, c);
     memset(p + 32, ' ', 11); p[32] = p[33] = '.'; p[43] = ATTR_DIR; wr16(p + 58, parent.root ? 0 : parent.cluster);
-    return dimonfs_sync(vm);
+    dirty_ptr(&f, p, f.cluster_bytes);
+    return dimonfs_sync(dk);
 }
 
-int dimonfs_remove(VM *vm, const char *path) {
-    Fat f; Dir d; uint8_t *e; int rc = mount_fs(vm, &f); if (rc) return rc;
-    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
+int dimonfs_remove(DimonDisk *dk, const char *path) {
+    Fat f; Dir d; uint8_t *e; int rc = mount_fs(dk, &f); if (rc) return rc;
+    if (!dk->disk_writable) return DFS_ERR_READ_ONLY;
     rc = resolve_entry(&f, path, &d, &e); if (rc) return rc;
     uint16_t c = rd16(e + 26);
     if (e[11] & ATTR_DIR) {
@@ -371,13 +405,13 @@ int dimonfs_remove(VM *vm, const char *path) {
         }
     }
     if (c >= 2) free_chain(&f, c);
-    e[0] = 0xe5;
-    return dimonfs_sync(vm);
+    e[0] = 0xe5; dirty_ptr(&f, e, 32);
+    return dimonfs_sync(dk);
 }
 
-int dimonfs_rename(VM *vm, const char *oldp, const char *newp) {
-    Fat f; Dir olddir, newdir; uint8_t *old, *exists, nn[11]; int rc = mount_fs(vm, &f); if (rc) return rc;
-    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
+int dimonfs_rename(DimonDisk *dk, const char *oldp, const char *newp) {
+    Fat f; Dir olddir, newdir; uint8_t *old, *exists, nn[11]; int rc = mount_fs(dk, &f); if (rc) return rc;
+    if (!dk->disk_writable) return DFS_ERR_READ_ONLY;
     rc = resolve_entry(&f, oldp, &olddir, &old); if (rc) return rc;
     rc = split_parent(&f, newp, &newdir, nn); if (rc) return rc;
     if (!find_in_dir(&f, newdir, nn, &exists)) return DFS_ERR_EXISTS;
@@ -402,21 +436,21 @@ int dimonfs_rename(VM *vm, const char *oldp, const char *newp) {
         }
     }
     uint8_t copy[32]; memcpy(copy, old, 32); memcpy(copy, nn, 11);
-    if (olddir.root == newdir.root && olddir.cluster == newdir.cluster) memcpy(old, copy, 32);
+    if (olddir.root == newdir.root && olddir.cluster == newdir.cluster) { memcpy(old, copy, 32); dirty_ptr(&f, old, 32); }
     else {
         uint8_t *ne; rc = new_entry(&f, newdir, &ne); if (rc) return rc;
-        memcpy(ne, copy, 32); old[0] = 0xe5;
+        memcpy(ne, copy, 32); dirty_ptr(&f, ne, 32); old[0] = 0xe5; dirty_ptr(&f, old, 32);
         if ((copy[11] & ATTR_DIR) && rd16(copy + 26) >= 2) {
             uint8_t *dir = cluster_ptr(&f, rd16(copy + 26));
-            if (dir) wr16(dir + 32 + 26, newdir.root ? 0 : newdir.cluster);
+            if (dir) { wr16(dir + 32 + 26, newdir.root ? 0 : newdir.cluster); dirty_ptr(&f, dir + 32, 32); }
         }
     }
-    return dimonfs_sync(vm);
+    return dimonfs_sync(dk);
 }
 
-int dimonfs_copy(VM *vm, const char *src, const char *dst) {
+int dimonfs_copy(DimonDisk *dk, const char *src, const char *dst) {
     Fat f; Dir sd, dd; uint8_t sn[11], dn[11];
-    int rc = mount_fs(vm, &f); if (rc) return rc;
+    int rc = mount_fs(dk, &f); if (rc) return rc;
     rc = split_parent(&f, src, &sd, sn); if (rc) return rc;
     rc = split_parent(&f, dst, &dd, dn); if (rc) return rc;
     /* Identical source and destination: nothing to copy, leave the disk alone. */
@@ -432,67 +466,73 @@ int dimonfs_copy(VM *vm, const char *src, const char *dst) {
     uint8_t *buf = (uint8_t *)malloc(len ? len : 1u);
     if (!buf) return DFS_ERR_NO_SPACE;
     uint32_t size = 0;
-    rc = dimonfs_read(vm, src, 0, buf, len, &size);
+    rc = dimonfs_read(dk, src, 0, buf, len, &size);
     if (rc < 0) { free(buf); return rc; }
-    rc = dimonfs_write(vm, dst, buf, size, 1, 1);
+    rc = dimonfs_write(dk, dst, buf, size, 1, 1);
     free(buf);
     return rc;
 #else
     /* The advertised disk is at most 4 MiB. Use free guest-independent RAM as a
        bounded staging area, never silently truncating. */
     const uint32_t staging = 0x03000000u, limit = 0x00800000u;
-    if (len > limit || (uint64_t)staging + len > vm->memsize) return DFS_ERR_TOO_LARGE;
-    uint32_t size = 0; rc = dimonfs_read(vm, src, 0, vm->mem + staging, len, &size);
+    if (len > limit || (uint64_t)staging + len > dk->memsize) return DFS_ERR_TOO_LARGE;
+    uint32_t size = 0; rc = dimonfs_read(dk, src, 0, dk->mem + staging, len, &size);
     if (rc < 0) return rc;
-    return dimonfs_write(vm, dst, vm->mem + staging, size, 1, 1);
+    return dimonfs_write(dk, dst, dk->mem + staging, size, 1, 1);
 #endif
 }
 
-int dimonfs_sync(VM *vm) {
+int dimonfs_sync(DimonDisk *dk) {
 #ifdef BAREMETAL
-    /* Bare-metal write-back: the in-memory sector cache holds the updated
-     * clusters/FAT copies/directory entries. Push the full cached volume to
-     * the validated ATA data disk and flush. Never report success until the
-     * sector writes and flush all succeed. Embedded read-only fallback has
-     * no block device and needs no write-back. */
-    if (!vm || !vm->disk_data || !vm->disk_sectors) return DFS_ERR_NODISK;
-    if (!vm->disk_writable) return DFS_ERR_READ_ONLY;
-    if (!vm->block_device || !vm->block_device->write) return DFS_OK;
-    uint32_t remaining = vm->disk_sectors, lba = 0;
-    while (remaining > 0) {
-        uint32_t chunk = remaining > 32u ? 32u : remaining;
-        int rc = vm->block_device->write(vm->block_device->context, lba, chunk,
-                                         vm->disk_data + (size_t)lba * 512u);
+    /* Bare-metal write-back of modified (dirty) sectors to the ATA data disk
+     * using LBA28 PIO. The in-memory sector cache stays authoritative; only
+     * LBAs touched since the last sync are pushed, then the drive is flushed.
+     * Embedded read-only fallback has no block device and needs no write-back. */
+    if (!dk || !dk->disk_data || !dk->disk_sectors) return DFS_ERR_NODISK;
+    if (!dk->disk_writable) return DFS_ERR_READ_ONLY;
+    if (!dk->block_device || !dk->block_device->write) return DFS_OK;
+
+    uint32_t total = dk->disk_sectors;
+    uint32_t lba = 0;
+    int wrote = 0;
+    while (lba < total) {
+        if (!dirty_get(lba)) { lba++; continue; }
+        /* Coalesce consecutive dirty sectors into one write burst. */
+        uint32_t run = 1;
+        while (lba + run < total && run < 32u && dirty_get(lba + run)) run++;
+        int rc = dk->block_device->write(dk->block_device->context, lba, run,
+                                         dk->disk_data + (size_t)lba * 512u);
         if (rc != 0) return DFS_ERR_IO;
-        lba += chunk;
-        remaining -= chunk;
+        lba += run;
+        wrote = 1;
     }
-    if (vm->block_device->flush) {
-        if (vm->block_device->flush(vm->block_device->context) != 0) return DFS_ERR_IO;
+    if (wrote && dk->block_device->flush) {
+        if (dk->block_device->flush(dk->block_device->context) != 0) return DFS_ERR_IO;
     }
+    dirty_clear();
     return DFS_OK;
 #else
-    if (!vm || !vm->disk_path[0]) {
+    if (!dk || !dk->disk_path[0]) {
         /* Hosted block-device backend (tests): same write-back contract. */
-        if (!vm || !vm->disk_data || !vm->disk_sectors) return DFS_ERR_NODISK;
-        if (vm->block_device && vm->block_device->write) {
-            uint32_t remaining = vm->disk_sectors, lba = 0;
+        if (!dk || !dk->disk_data || !dk->disk_sectors) return DFS_ERR_NODISK;
+        if (dk->block_device && dk->block_device->write) {
+            uint32_t remaining = dk->disk_sectors, lba = 0;
             while (remaining > 0) {
                 uint32_t chunk = remaining > 32u ? 32u : remaining;
-                if (vm->block_device->write(vm->block_device->context, lba, chunk,
-                                            vm->disk_data + (size_t)lba * 512u) != 0)
+                if (dk->block_device->write(dk->block_device->context, lba, chunk,
+                                            dk->disk_data + (size_t)lba * 512u) != 0)
                     return DFS_ERR_IO;
                 lba += chunk;
                 remaining -= chunk;
             }
-            if (vm->block_device->flush &&
-                vm->block_device->flush(vm->block_device->context) != 0) return DFS_ERR_IO;
+            if (dk->block_device->flush &&
+                dk->block_device->flush(dk->block_device->context) != 0) return DFS_ERR_IO;
         }
         return DFS_OK;
     }
-    FILE *fp = fopen(vm->disk_path, "r+b"); if (!fp) return DFS_ERR_IO;
-    size_t bytes = (size_t)vm->disk_sectors * 512u;
-    int ok = fwrite(vm->disk_data, 1, bytes, fp) == bytes && fflush(fp) == 0;
+    FILE *fp = fopen(dk->disk_path, "r+b"); if (!fp) return DFS_ERR_IO;
+    size_t bytes = (size_t)dk->disk_sectors * 512u;
+    int ok = fwrite(dk->disk_data, 1, bytes, fp) == bytes && fflush(fp) == 0;
     if (fclose(fp) != 0) ok = 0;
     return ok ? DFS_OK : DFS_ERR_IO;
 #endif

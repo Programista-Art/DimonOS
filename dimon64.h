@@ -354,6 +354,18 @@ typedef struct {
     int (*flush)(void *);
 } Dimon64BlockDevice;
 
+/* Disk/filesystem context used by dimonfs.c (host tools and kernel). */
+typedef struct {
+    uint8_t  *mem;
+    uint64_t memsize;
+    uint8_t  *disk_data;
+    uint32_t disk_sectors;
+    uint8_t  disk_writable;
+    uint8_t  storage_mode;
+    Dimon64BlockDevice *block_device;
+    char     disk_path[256];
+} DimonDisk;
+
 /* Desktop-visible storage modes. */
 enum {
     DIMON_STORAGE_UNKNOWN = 0,
@@ -382,147 +394,11 @@ enum {
 
 #define PORT_CONSOLE 0
 
-/* Process states */
-enum {
-    DIMON64_PROC_FREE = 0,
-    DIMON64_PROC_READY = 1,
-    DIMON64_PROC_RUNNING = 2,
-    DIMON64_PROC_BLOCKED = 3,
-    DIMON64_PROC_TERMINATED = 4
-};
-
-/* Native process control block (host-side scheduler).
-   The OS-level PCB layout in guest memory is documented in docs/
-   and mirrors these fields: PID, STATE, SAVEDPC, SAVEDSP,
-   SAVEDREGS[32], STACKBASE, STACKSIZE, NAME[16]. */
-typedef struct {
-    uint64_t pid;
-    uint64_t state;
-    uint64_t pc;
-    uint64_t flags;
-    uint64_t regs[DIMON64_NUM_REGS];
-    uint64_t stack_base;
-    uint64_t stack_size;
-    uint64_t sleep_until;
-    uint64_t memory_base;
-    uint64_t memory_size;
-    uint64_t cpu_steps;
-    uint64_t context_switches;
-    char     name[16];
-    uint8_t  used;
-    uint8_t  essential;
-    uint8_t  isolated;
-    int32_t  last_fault;
-} Dimon64Proc;
-
-typedef struct {
-    uint64_t regs[DIMON64_NUM_REGS]; /* R0..R31 (x0..x31) */
-    uint64_t pc;      /* Program counter (byte address, 4-byte aligned) */
-    uint64_t flags;   /* Z/N/C/O/IE bits */
-    uint64_t timer_ticks;  /* Monotonic tick counter */
-    uint64_t timer_period; /* Cycles per tick */
-    uint64_t timer_vector; /* Timer ISR address (0 = none) */
-    uint64_t epc;     /* Saved PC on trap */
-    uint64_t eflags;  /* Saved FLAGS on trap */
-    uint8_t  halted;
-    uint8_t  in_isr;   /* 1 while servicing timer interrupt */
-    uint8_t *mem;
-    uint64_t memsize;
-    uint64_t steps;
-    uint64_t max_steps;
-    uint64_t cycle_counter; /* Cycles since last tick */
-
-    /* Preemptive multitasking engine (native scheduler) */
-    Dimon64Proc procs[DIMON64_MAX_PROCS];
-    int         cur_proc;
-    uint64_t    next_pid;
-    uint64_t    switches; /* Context switch counter */
-
-    /* Virtual disk: disk_data is the sector cache (512 B sectors).
-     * When block_device is bound (bare-metal ATA data disk), sector writes
-     * are written through to the device; the boot ISO is never bound. */
-    uint8_t  *disk_data;
-    uint32_t disk_sectors;
-    uint8_t  disk_writable;
-    uint8_t  storage_mode;
-    Dimon64BlockDevice *block_device;
-    char     disk_path[256];
-
-    /* GUI subsystem */
-    VMEvent  event_queue[VM_EVENT_QUEUE_SIZE];
-    int      event_head;
-    int      event_tail;
-    uint64_t event_owner_pid; /* foreground isolated app, 0 = desktop */
-    uint8_t  gui_active;
-    uint8_t  gui_dirty;
-    int32_t  draw_offset_x;
-    int32_t  draw_offset_y;
-    int32_t  draw_clip_x;
-    int32_t  draw_clip_y;
-    int32_t  draw_clip_w;
-    int32_t  draw_clip_h;
-    uint8_t  draw_context_active;
-    void    (*gui_init_cb)(void *userdata);
-    void    (*gui_flush_cb)(void *userdata);
-    void    (*gui_poll_cb)(void *userdata);
-    void     *gui_userdata;
-
-    /* Sound generator (PSG) */
-    uint32_t psg_freq;
-    uint8_t  psg_wave;
-    uint8_t  psg_vol;
-    uint32_t psg_duration_ms;
-    uint64_t psg_end_time_ms;
-    void   (*psg_play_cb)(void *userdata, uint32_t freq, uint32_t duration_ms, uint8_t wave, uint8_t vol);
-    void    *psg_userdata;
-} VM;
-
-/* GUI helpers */
-void vm_event_push(VM *vm, uint8_t type, uint16_t code, uint16_t data);
-void vm_event_push_ext(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button);
-void vm_event_push_mod(VM *vm, uint8_t type, uint16_t code, uint16_t data, uint8_t button, uint8_t modifiers);
-int  vm_event_pop(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data);
-int  vm_event_pop_ext(VM *vm, uint8_t *type, uint16_t *code, uint16_t *data, uint8_t *button);
-void vm_gui_draw_pixel(VM *vm, int x, int y, uint32_t color32);
-void vm_gui_fill_rect(VM *vm, int x, int y, int w, int h, uint32_t color32);
-void vm_gui_draw_line(VM *vm, int x0, int y0, int x1, int y1, uint32_t color32);
-void vm_gui_draw_string(VM *vm, int x, int y, const char *text, uint32_t fg, uint32_t bg);
-void vm_gui_draw_rect(VM *vm, int x, int y, int w, int h, uint8_t ch, uint8_t attr);
-void vm_gui_draw_text(VM *vm, int x, int y, const char *text, uint8_t attr);
-
-/* Lifecycle */
-void vm_init(VM *vm);
-void vm_free(VM *vm);
-#ifndef BAREMETAL
-int  vm_load(VM *vm, const char *path, uint64_t load_addr);
-void vm_dump_regs(VM *vm, FILE *out);
-int  vm_disk_attach(VM *vm, const char *path, int writable);
-#endif
-int  vm_load_buf(VM *vm, const uint8_t *buf, size_t len, uint64_t load_addr);
-void vm_reset(VM *vm, uint64_t start_pc);
-
-void vm_disk_detach(VM *vm);
-void vm_block_bind(VM *vm, Dimon64BlockDevice *device);
-void vm_block_unbind(VM *vm);
-int  vm_disk_boot(VM *vm, uint64_t load_addr);
-int  vm_disk_read(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count);
-int  vm_disk_write(VM *vm, uint32_t lba, uint64_t ram_addr, uint64_t count);
-int  vm_disk_sync(VM *vm);
-
-int  vm_step(VM *vm);
-int  vm_run(VM *vm);
-
-/* Helpers */
-const char *dimon64_reg_name(int r);
-const char *dimon64_reg_abi(int r);
-int  dimon64_disasm(VM *vm, uint64_t addr, char *out, size_t outsz);
+/* DimonDisk is defined above (near Dimon64BlockDevice). */
 
 /* Legacy compatibility shims */
 #ifndef DIMON64_NO_LEGACY
 const char *reg_name(int r);
-int  vm_disasm(VM *vm, uint64_t addr, char *out, size_t outsz);
-void vm_stb(VM *vm, uint64_t addr, uint8_t v);
-uint8_t vm_ldb(VM *vm, uint64_t addr);
 #endif
 
 /* Instruction encoding helpers (little-endian 32-bit words) */
@@ -574,7 +450,5 @@ static inline uint32_t dimon64_encode_j(uint8_t rd, int32_t offset, uint8_t opco
 }
 
 /* Memory access with bounds checking (0 ok, <0 error) */
-int vm_mem_read(VM *vm, uint64_t addr, void *out, size_t len);
-int vm_mem_write(VM *vm, uint64_t addr, const void *in, size_t len);
 
 #endif /* DIMON64_H */

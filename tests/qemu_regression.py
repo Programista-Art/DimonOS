@@ -213,7 +213,7 @@ def main():
     assert shutdown_succeeded, "QEMU did not reach the tested shutdown terminal condition"
     assert proc.returncode == 0, f"QEMU ACPI exit status {proc.returncode}; see {qemu_log}"
     serial_text = serial.read_text(errors="replace")
-    assert "Loaded embedded os.bin" in serial_text
+    assert "Starting DimonOS-64 native desktop" in serial_text
     assert "Shutdown requested; final frame flushed." in serial_text
     assert "Requesting QEMU ACPI power-off." in serial_text
     assert "stopped unexpectedly" not in serial_text

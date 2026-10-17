@@ -1,4 +1,4 @@
-/* DimonVirtualCPU-64 mkiso: builds standard FAT16 disk / ISO images (512B sectors).
+/* DimonOS mkiso: builds standard FAT16 disk / ISO images (512B sectors).
  *
  * FAT16 Image Layout:
  *   Sector 0     : MBR / Boot sector with BIOS Parameter Block (BPB)
@@ -38,7 +38,7 @@ static void usage(const char *p) {
         "  %s --add image.iso file[:NAME] [--force]\n"
         "Options:\n"
         "  -b FILE      Bootloader (sector 0, max 510 B)\n"
-        "  -o FILE      Output image (default dimon.iso)\n"
+        "  -o FILE      Output image (default dimon-disk.img)\n"
         "  --list FILE  List FAT16 image contents\n"
         "  --force      Allow replacing an existing output image\n"
         "Files: path[:NAME] - NAME is 8.3 filename (default basename).\n",
@@ -77,13 +77,13 @@ static int mkdir_in_iso(const char *image_path, const char *dir_path) {
     if (image_len % 512u || image_len / 512u > DISK_MAX_SECTORS) {
         fprintf(stderr, "Invalid image.\n"); free(image); return 1;
     }
-    VM vm; memset(&vm, 0, sizeof(vm)); vm.disk_data = image;
-    vm.disk_sectors = (uint32_t)(image_len / 512u); vm.disk_writable = 1;
-    snprintf(vm.disk_path, sizeof(vm.disk_path), "%s", image_path);
+    DimonDisk dk; memset(&dk, 0, sizeof(dk)); dk.disk_data = image;
+    dk.disk_sectors = (uint32_t)(image_len / 512u); dk.disk_writable = 1;
+    snprintf(dk.disk_path, sizeof(dk.disk_path), "%s", image_path);
     char path[128];
     if (dir_path[0] == '/') snprintf(path, sizeof(path), "%s", dir_path);
     else snprintf(path, sizeof(path), "/%s", dir_path);
-    int rc = dimonfs_mkdir(&vm, path);
+    int rc = dimonfs_mkdir(&dk, path);
     if (rc != DFS_OK && rc != DFS_ERR_EXISTS) {
         fprintf(stderr, "mkdir failed: %s (%d)\n", dimonfs_error(rc), rc);
         free(image); return 1;
@@ -105,18 +105,18 @@ static int add_to_iso(const char *image_path, char *spec, int replace) {
     if (image_len % 512u || image_len / 512u > DISK_MAX_SECTORS || file_len > UINT32_MAX) {
         fprintf(stderr, "Invalid image or oversized input.\n"); free(image); free(file); return 1;
     }
-    VM vm; memset(&vm, 0, sizeof(vm)); vm.disk_data = image;
-    vm.disk_sectors = (uint32_t)(image_len / 512u); vm.disk_writable = 1;
-    snprintf(vm.disk_path, sizeof(vm.disk_path), "%s", image_path);
+    DimonDisk dk; memset(&dk, 0, sizeof(dk)); dk.disk_data = image;
+    dk.disk_sectors = (uint32_t)(image_len / 512u); dk.disk_writable = 1;
+    snprintf(dk.disk_path, sizeof(dk.disk_path), "%s", image_path);
     char path[128];
     if (name[0] == '/') snprintf(path, sizeof(path), "%s", name);
     else snprintf(path, sizeof(path), "/%s", name);
     Dimon64DirEnt ent;
-    if (!replace && dimonfs_stat(&vm, path, &ent) == DFS_OK) {
+    if (!replace && dimonfs_stat(&dk, path, &ent) == DFS_OK) {
         fprintf(stderr, "Refusing to replace existing '%s' (use --force).\n", path);
         free(image); free(file); return 1;
     }
-    int rc = dimonfs_write(&vm, path, file, (uint32_t)file_len, 1, 1);
+    int rc = dimonfs_write(&dk, path, file, (uint32_t)file_len, 1, 1);
     if (rc != DFS_OK) { fprintf(stderr, "Add failed: %s (%d)\n", dimonfs_error(rc), rc); free(image); free(file); return 1; }
     printf("Added %s as %s to %s (%zu bytes)\n", spec, path, image_path, file_len);
     free(image); free(file); return 0;
@@ -249,7 +249,7 @@ static int list_iso(const char *path) {
 
 int main(int argc, char **argv) {
     const char *boot = NULL;
-    const char *out = "dimon.iso";
+    const char *out = "dimon-disk.img";
     const char *inputs[DISK_FILE_MAX];
     const char *names[DISK_FILE_MAX];
     int ninputs = 0;

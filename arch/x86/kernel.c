@@ -4,6 +4,8 @@
 #include "io.h"
 #include "ata.h"
 #include "../../dimon64.h"
+#include "../../kernel_runtime.h"
+#include "../../desktop.h"
 
 /* --- Standard Memory Functions (Freestanding) --- */
 void *memset(void *s, int c, size_t n) {
@@ -79,6 +81,17 @@ int64_t __moddi3(int64_t a, int64_t b) {
     uint64_t rem;
     __udivmoddi4((uint64_t)a, (uint64_t)b, &rem);
     return neg ? -(int64_t)rem : (int64_t)rem;
+}
+
+/* Combined signed divmod used by gcc for a/b and a%b pairs. */
+int64_t __divmoddi4(int64_t a, int64_t b, int64_t *rem_p) {
+    int neg_q = 0, neg_r = 0;
+    if (a < 0) { a = -a; neg_q = !neg_q; neg_r = 1; }
+    if (b < 0) { b = -b; neg_q = !neg_q; }
+    uint64_t rem;
+    uint64_t quot = __udivmoddi4((uint64_t)a, (uint64_t)b, &rem);
+    if (rem_p) *rem_p = neg_r ? -(int64_t)rem : (int64_t)rem;
+    return neg_q ? -(int64_t)quot : (int64_t)quot;
 }
 
 /* --- Lightweight Freestanding vsnprintf / snprintf --- */
@@ -397,6 +410,113 @@ static void pit_init(void) {
     outb(0x40, (uint8_t)((divisor >> 8) & 0xFF));
 }
 
+/* --- PC Speaker (PIT channel 2 + port 0x61) --- */
+static uint32_t g_speaker_end_ms = 0;
+static int g_speaker_on = 0;
+
+static void speaker_stop(void) {
+    outb(0x61, (uint8_t)(inb(0x61) & 0xFC));
+    g_speaker_on = 0;
+    g_speaker_end_ms = 0;
+}
+
+static void speaker_start(uint32_t freq_hz) {
+    if (freq_hz < 18) freq_hz = 18;
+    if (freq_hz > 20000) freq_hz = 20000;
+    uint32_t divisor = 1193182u / freq_hz;
+    if (divisor == 0) divisor = 1;
+    if (divisor > 65535u) divisor = 65535u;
+    outb(0x43, 0xB6); /* channel 2, lo/hi, square wave */
+    outb(0x42, (uint8_t)(divisor & 0xFF));
+    outb(0x42, (uint8_t)((divisor >> 8) & 0xFF));
+    uint8_t gate = inb(0x61);
+    if ((gate & 0x03) != 0x03) outb(0x61, (uint8_t)(gate | 0x03));
+    g_speaker_on = 1;
+}
+
+/* Non-blocking tone: starts playback, irq0 mutes it when duration elapses. */
+static void on_baremetal_psg_play(void *userdata, uint32_t freq, uint32_t duration_ms,
+                                  uint8_t wave, uint8_t vol) {
+    (void)userdata;
+    (void)wave;
+    (void)vol; /* PC speaker has no software volume; amplitude is fixed. */
+    if (freq == 0 || duration_ms == 0) {
+        speaker_stop();
+        return;
+    }
+    speaker_start(freq);
+    g_speaker_end_ms = g_ticks_ms + duration_ms;
+    g_speaker_on = 1;
+}
+
+/* --- CMOS Real-Time Clock (ports 0x70/0x71) --- */
+static uint8_t cmos_read(uint8_t reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static int cmos_update_in_progress(void) {
+    outb(0x70, 0x0A);
+    return (inb(0x71) & 0x80) != 0;
+}
+
+static uint8_t bcd_to_bin(uint8_t v) {
+    return (uint8_t)((v & 0x0F) + (v >> 4) * 10);
+}
+
+/* Days from civil (y, m, d) to Unix epoch (Howard Hinnant algorithm). */
+static int64_t days_from_civil(int y, int m, int d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - (int)era * 400);
+    unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* Returns Unix UTC seconds from the CMOS RTC, or -1 if unavailable. */
+int64_t baremetal_rtc_unix(void) {
+    /* Wait for any update-in-progress to finish (bounded). */
+    for (int i = 0; i < 1000000; i++) {
+        if (!cmos_update_in_progress()) break;
+        if (i == 999999) return -1;
+    }
+    uint8_t sec  = cmos_read(0x00);
+    uint8_t min  = cmos_read(0x02);
+    uint8_t hour = cmos_read(0x04);
+    uint8_t day  = cmos_read(0x07);
+    uint8_t mon  = cmos_read(0x08);
+    uint8_t year = cmos_read(0x09);
+    uint8_t cent = cmos_read(0x32);
+    uint8_t regb = cmos_read(0x0B);
+
+    /* Sanity-check the fields before converting. */
+    if (sec > 59 || min > 59 || hour > 23 || day < 1 || day > 31 || mon < 1 || mon > 12)
+        return -1;
+
+    if (!(regb & 0x04)) { /* BCD mode */
+        sec  = bcd_to_bin(sec);
+        min  = bcd_to_bin(min);
+        hour = bcd_to_bin(hour);
+        day  = bcd_to_bin(day);
+        mon  = bcd_to_bin(mon);
+        year = bcd_to_bin(year);
+        cent = bcd_to_bin(cent);
+    }
+
+    int full_year;
+    if (cent >= 19 && cent <= 21) {
+        full_year = (int)cent * 100 + year;
+    } else {
+        full_year = (year >= 70) ? (1900 + year) : (2000 + year);
+    }
+    if (full_year < 1970 || full_year > 2200) return -1;
+    if (day < 1 || mon < 1 || mon > 12) return -1;
+
+    int64_t days = days_from_civil(full_year, mon, day);
+    return days * 86400 + (int64_t)hour * 3600 + (int64_t)min * 60 + (int64_t)sec;
+}
+
 /* --- PIC 8259 Remapping --- */
 static void pic_remap(void) {
     outb(0x20, 0x11); io_wait();
@@ -467,6 +587,10 @@ void default_isr_c_handler(void) {
 
 void irq0_c_handler(void) {
     g_ticks_ms++;
+    /* Mute the PC speaker once its tone duration has elapsed. */
+    if (g_speaker_on && (int32_t)(g_ticks_ms - g_speaker_end_ms) >= 0) {
+        speaker_stop();
+    }
     outb(0x20, 0x20);
 }
 
@@ -567,13 +691,13 @@ void irq1_c_handler(void) {
     outb(0x20, 0x20);
 }
 
-/* --- PS/2 Mouse Driver (800x600 Scaled with Buttons) --- */
+/* --- PS/2 Mouse Driver (800x600 Scaled with Buttons + Wheel) --- */
 #define MOUSE_QUEUE_SIZE 128
 struct mouse_event {
-    uint8_t  type;   /* EVT_MOUSE_CLICK or EVT_MOUSE_MOVE */
+    uint8_t  type;   /* EVT_MOUSE_CLICK / EVT_MOUSE_MOVE / EVT_MOUSE_RELEASE */
     uint16_t x;      /* 0..799 */
     uint16_t y;      /* 0..599 */
-    uint8_t  button; /* 1=left, 2=right, 0=none */
+    uint8_t  button; /* 1=left, 2=right, 3=middle, 0=none */
 };
 
 static struct mouse_event g_mouse_queue[MOUSE_QUEUE_SIZE];
@@ -584,7 +708,9 @@ static int g_mouse_x = DIMON64_LFB_WIDTH / 2;
 static int g_mouse_y = DIMON64_LFB_HEIGHT / 2;
 static uint8_t g_mouse_last_btn = 0;
 static uint8_t g_mouse_cycle = 0;
-static uint8_t g_mouse_bytes[3];
+static uint8_t g_mouse_bytes[4];
+static uint8_t g_mouse_has_wheel = 0; /* IntelliMouse 4-byte packets */
+static uint8_t g_mouse_packet_len = 3;
 
 static void mouse_push(uint8_t type, uint16_t x, uint16_t y, uint8_t button) {
     int next = (g_mouse_tail + 1) % MOUSE_QUEUE_SIZE;
@@ -641,6 +767,18 @@ static void mouse_init(void) {
     mouse_write(0xF6); /* Set defaults */
     mouse_read();      /* Acknowledge */
 
+    /* IntelliMouse enable: magic sample-rate sequence switches the device
+     * into 4-byte packets with a Z scroll-wheel nibble and a 3rd button. */
+    mouse_write(0xF3); mouse_read(); outb(0x60, 200); io_wait(); mouse_read();
+    mouse_write(0xF3); mouse_read(); outb(0x60, 100); io_wait(); mouse_read();
+    mouse_write(0xF3); mouse_read(); outb(0x60, 80);  io_wait(); mouse_read();
+    mouse_write(0xF2); mouse_read();
+    uint8_t id = mouse_read();
+    if (id == 0x03 || id == 0x04) {
+        g_mouse_has_wheel = 1;
+        g_mouse_packet_len = 4;
+    }
+
     mouse_write(0xF4); /* Enable data reporting */
     mouse_read();      /* Acknowledge */
 }
@@ -654,59 +792,74 @@ void irq12_c_handler(void) {
     }
 
     uint8_t b = inb(0x60);
-    switch (g_mouse_cycle) {
-        case 0:
-            if ((b & 0x08) == 0x08) {
-                g_mouse_bytes[0] = b;
-                g_mouse_cycle = 1;
-            }
-            break;
-        case 1:
-            g_mouse_bytes[1] = b;
-            g_mouse_cycle = 2;
-            break;
-        case 2: {
-            g_mouse_bytes[2] = b;
-            g_mouse_cycle = 0;
+    g_mouse_bytes[g_mouse_cycle++] = b;
+    if (g_mouse_cycle < g_mouse_packet_len) {
+        outb(0xA0, 0x20);
+        outb(0x20, 0x20);
+        return;
+    }
+    g_mouse_cycle = 0;
 
-            /* Check overflow bits (bits 6 and 7 of byte 0) */
-            if ((g_mouse_bytes[0] & 0xC0) == 0) {
-                int rel_x = (int8_t)g_mouse_bytes[1];
-                int rel_y = (int8_t)g_mouse_bytes[2];
+    /* Byte 0 bit 3 is the sync bit; drop unsynchronized packets. */
+    if ((g_mouse_bytes[0] & 0x08) == 0 || (g_mouse_bytes[0] & 0xC0) != 0) {
+        outb(0xA0, 0x20);
+        outb(0x20, 0x20);
+        return;
+    }
 
-                int nx = g_mouse_x + rel_x;
-                int ny = g_mouse_y - rel_y; /* PS/2 Y is upward, screen Y is downward */
+    int rel_x = (int8_t)g_mouse_bytes[1];
+    int rel_y = (int8_t)g_mouse_bytes[2];
 
-                if (nx < 0) nx = 0;
-                if (nx >= DIMON64_LFB_WIDTH) nx = DIMON64_LFB_WIDTH - 1;
-                if (ny < 0) ny = 0;
-                if (ny >= DIMON64_LFB_HEIGHT) ny = DIMON64_LFB_HEIGHT - 1;
+    int nx = g_mouse_x + rel_x;
+    int ny = g_mouse_y - rel_y; /* PS/2 Y is upward, screen Y is downward */
 
-                uint8_t raw_btns   = g_mouse_bytes[0];
-                uint8_t left_down  = (raw_btns & 0x01) ? 1 : 0;
-                uint8_t right_down = (raw_btns & 0x02) ? 2 : 0;
-                uint8_t cur_btn    = left_down | right_down;
+    if (nx < 0) nx = 0;
+    if (nx >= DIMON64_LFB_WIDTH) nx = DIMON64_LFB_WIDTH - 1;
+    if (ny < 0) ny = 0;
+    if (ny >= DIMON64_LFB_HEIGHT) ny = DIMON64_LFB_HEIGHT - 1;
 
-                if (nx != g_mouse_x || ny != g_mouse_y) {
-                    g_mouse_x = nx;
-                    g_mouse_y = ny;
-                    mouse_push(EVT_MOUSE_MOVE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, cur_btn);
-                }
+    uint8_t raw_btns = g_mouse_bytes[0];
+    uint8_t left_down   = (raw_btns & 0x01) ? 1 : 0;
+    uint8_t right_down  = (raw_btns & 0x02) ? 2 : 0;
+    uint8_t middle_down = (raw_btns & 0x04) ? 4 : 0;
+    uint8_t cur_btn = (uint8_t)(left_down | right_down | middle_down);
+    /* Map bit mask to VMEvent button ids: 1=left, 2=right, 3=middle. */
+    uint8_t btn_id = 0;
+    if (left_down) btn_id = 1;
+    else if (right_down) btn_id = 2;
+    else if (middle_down) btn_id = 3;
 
-                if (left_down && !(g_mouse_last_btn & 0x01)) {
-                    mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 1);
-                } else if (right_down && !(g_mouse_last_btn & 0x02)) {
-                    mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
-                }
-                if (!left_down && (g_mouse_last_btn & 0x01))
-                    mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 1);
-                if (!right_down && (g_mouse_last_btn & 0x02))
-                    mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
-                g_mouse_last_btn = cur_btn;
-            }
-            break;
+    /* Scroll wheel (IntelliMouse byte 3 low nibble, signed). */
+    if (g_mouse_has_wheel && g_mouse_packet_len == 4) {
+        int8_t z = (int8_t)(g_mouse_bytes[3] & 0x0F);
+        if (g_mouse_bytes[3] & 0x08) z |= 0xF0; /* sign-extend 4-bit */
+        if (z != 0) {
+            /* Scroll up -> PageUp, scroll down -> PageDown (desktop scrolling). */
+            if (z > 0) kbd_push(KEY_PGUP);
+            else kbd_push(KEY_PGDN);
         }
     }
+
+    if (nx != g_mouse_x || ny != g_mouse_y) {
+        g_mouse_x = nx;
+        g_mouse_y = ny;
+        mouse_push(EVT_MOUSE_MOVE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, btn_id);
+    }
+
+    /* Edge-triggered click/release per button. */
+    if (left_down && !(g_mouse_last_btn & 0x01))
+        mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 1);
+    if (right_down && !(g_mouse_last_btn & 0x02))
+        mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
+    if (middle_down && !(g_mouse_last_btn & 0x04))
+        mouse_push(EVT_MOUSE_CLICK, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 3);
+    if (!left_down && (g_mouse_last_btn & 0x01))
+        mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 1);
+    if (!right_down && (g_mouse_last_btn & 0x02))
+        mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 2);
+    if (!middle_down && (g_mouse_last_btn & 0x04))
+        mouse_push(EVT_MOUSE_RELEASE, (uint16_t)g_mouse_x, (uint16_t)g_mouse_y, 3);
+    g_mouse_last_btn = cur_btn;
 
     outb(0xA0, 0x20);
     outb(0x20, 0x20);
@@ -735,45 +888,34 @@ static const char *cursor_arrow[19] = {
     "            "
 };
 
-/* --- Linear Framebuffer 32bpp Blitter --- */
+/* --- Linear Framebuffer 32bpp Blitter (double-buffered present) ---
+ * Guest VRAM (vm->mem + DIMON64_VRAM_BASE) is the back buffer. Every present
+ * composites the cursor into a RAM shadow, then blits once to the physical LFB
+ * so QEMU/VBox never show a torn frame. */
+static uint32_t g_present[DIMON64_LFB_WIDTH * DIMON64_LFB_HEIGHT]
+    __attribute__((aligned(16)));
+
 static void on_baremetal_gui_flush(void *userdata) {
     VM *vm = (VM *)userdata;
     if (!vm || !vm->mem || !g_lfb_base) return;
 
     const uint8_t *src = vm->mem + DIMON64_VRAM_BASE;
-    uint8_t *dst = (uint8_t *)g_lfb_base;
-
     int w = DIMON64_LFB_WIDTH;
-    if ((int)g_lfb_width < w && g_lfb_width > 0) w = (int)g_lfb_width;
+    if ((int)g_lfb_width > 0 && (int)g_lfb_width < w) w = (int)g_lfb_width;
     int h = DIMON64_LFB_HEIGHT;
-    if ((int)g_lfb_height < h && g_lfb_height > 0) h = (int)g_lfb_height;
+    if ((int)g_lfb_height > 0 && (int)g_lfb_height < h) h = (int)g_lfb_height;
 
     uint32_t pitch = g_lfb_pitch;
     if (pitch < (uint32_t)(w * 4)) pitch = (uint32_t)(w * 4);
 
-    /* 1. Blit the 800x600 TrueColor guest VRAM to physical LFB */
-    if (g_lfb_bpp == 32 || g_lfb_bpp == 0) {
-        if (pitch == (uint32_t)(w * 4) && w == DIMON64_LFB_WIDTH && h == DIMON64_LFB_HEIGHT) {
-            memcpy(dst, src, DIMON64_VRAM_SIZE);
-        } else {
-            for (int y = 0; y < h; y++) {
-                memcpy(dst + (size_t)y * pitch, src + (size_t)y * (DIMON64_LFB_WIDTH * 4), (size_t)w * 4);
-            }
-        }
-    } else if (g_lfb_bpp == 24) {
-        for (int y = 0; y < h; y++) {
-            const uint32_t *s = (const uint32_t *)(src + (size_t)y * (DIMON64_LFB_WIDTH * 4));
-            uint8_t *d = dst + (size_t)y * pitch;
-            for (int x = 0; x < w; x++) {
-                uint32_t px = s[x];
-                d[x * 3 + 0] = (uint8_t)(px & 0xFF);
-                d[x * 3 + 1] = (uint8_t)((px >> 8) & 0xFF);
-                d[x * 3 + 2] = (uint8_t)((px >> 16) & 0xFF);
-            }
-        }
+    /* 1. Compose into the RAM present buffer (back -> shadow). */
+    for (int y = 0; y < h; y++) {
+        memcpy(&g_present[y * DIMON64_LFB_WIDTH],
+               src + (size_t)y * (DIMON64_LFB_WIDTH * 4),
+               (size_t)w * sizeof(uint32_t));
     }
 
-    /* 2. Overlay hardware mouse arrow cursor directly onto physical LFB */
+    /* 2. Overlay the hardware mouse cursor into the shadow buffer. */
     int mx = g_mouse_x;
     int my = g_mouse_y;
     for (int cy = 0; cy < 19; cy++) {
@@ -784,19 +926,34 @@ static void on_baremetal_gui_flush(void *userdata) {
             if (px < 0 || px >= w) continue;
             char ch = cursor_arrow[cy][cx];
             if (ch == 'X') {
-                if (g_lfb_bpp == 32 || g_lfb_bpp == 0) {
-                    *(uint32_t *)(dst + (size_t)py * pitch + (size_t)px * 4) = 0xFF000000;
-                } else if (g_lfb_bpp == 24) {
-                    uint8_t *p = dst + (size_t)py * pitch + (size_t)px * 3;
-                    p[0] = 0; p[1] = 0; p[2] = 0;
-                }
+                g_present[py * DIMON64_LFB_WIDTH + px] = 0xFF000000;
             } else if (ch == '.') {
-                if (g_lfb_bpp == 32 || g_lfb_bpp == 0) {
-                    *(uint32_t *)(dst + (size_t)py * pitch + (size_t)px * 4) = 0xFFFFFFFF;
-                } else if (g_lfb_bpp == 24) {
-                    uint8_t *p = dst + (size_t)py * pitch + (size_t)px * 3;
-                    p[0] = 0xFF; p[1] = 0xFF; p[2] = 0xFF;
-                }
+                g_present[py * DIMON64_LFB_WIDTH + px] = 0xFFFFFFFF;
+            }
+        }
+    }
+
+    /* 3. Single blit of the composed frame to the physical LFB. */
+    uint8_t *dst = (uint8_t *)g_lfb_base;
+    if (g_lfb_bpp == 32 || g_lfb_bpp == 0) {
+        if (pitch == (uint32_t)(w * 4)) {
+            memcpy(dst, g_present, (size_t)h * (size_t)w * 4);
+        } else {
+            for (int y = 0; y < h; y++) {
+                memcpy(dst + (size_t)y * pitch,
+                       &g_present[y * DIMON64_LFB_WIDTH],
+                       (size_t)w * 4);
+            }
+        }
+    } else if (g_lfb_bpp == 24) {
+        for (int y = 0; y < h; y++) {
+            const uint32_t *s = &g_present[y * DIMON64_LFB_WIDTH];
+            uint8_t *d = dst + (size_t)y * pitch;
+            for (int x = 0; x < w; x++) {
+                uint32_t px = s[x];
+                d[x * 3 + 0] = (uint8_t)(px & 0xFF);
+                d[x * 3 + 1] = (uint8_t)((px >> 8) & 0xFF);
+                d[x * 3 + 2] = (uint8_t)((px >> 16) & 0xFF);
             }
         }
     }
@@ -900,7 +1057,7 @@ static int storage_bpb_valid(const uint8_t *b, uint32_t device_sectors, uint32_t
 
 /* Try to promote the ATA primary-master raw image to the desktop's primary
  * FAT16 volume. Returns 1 on success (vm now writable), 0 on fallback. */
-static int storage_try_mount_writable(VM *vm, Dimon64BlockDevice *dev) {
+static int storage_try_mount_writable(DimonSystem *vm, Dimon64BlockDevice *dev) {
     if (!vm || !dev || !dev->read) return 0;
     if (dev->sectors == 0 || dev->sectors > 0x0FFFFFFFu) {
         serial_puts("[STORAGE] ATA device reports unsupported capacity; ignoring.\n");
@@ -934,7 +1091,7 @@ static int storage_try_mount_writable(VM *vm, Dimon64BlockDevice *dev) {
     vm->disk_sectors = total;
     vm->disk_writable = 1;
     vm->storage_mode = DIMON_STORAGE_WRITABLE;
-    vm_block_bind(vm, dev);
+    vm_block_bind((DimonDisk *)vm, dev);
     char label[12];
     for (int i = 0; i < 11; i++) label[i] = (char)g_probe_sector[43 + i];
     label[11] = '\0';
@@ -945,8 +1102,6 @@ static int storage_try_mount_writable(VM *vm, Dimon64BlockDevice *dev) {
 }
 
 /* --- Embedded Assets from boot.S --- */
-extern uint8_t _os_bin_start[];
-extern uint8_t _os_bin_end[];
 extern uint8_t _dimon_iso_start[];
 extern uint8_t _dimon_iso_end[];
 
@@ -956,6 +1111,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     serial_puts("\n=======================================================\n");
     serial_puts("  DimonOS-64 Native Bare-Metal Kernel (x86_32 -> RV64)  \n");
     serial_puts("=======================================================\n");
+    serial_puts("Starting DimonOS-64 native desktop...\n");
 
     /* Parse Multiboot information & detect LFB */
     parse_multiboot(magic, mb_info);
@@ -971,7 +1127,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     serial_puts("[DimonOS] Hardware initialized (PIC, IDT, PIT 1000Hz, PS/2 Kbd, PS/2 Mouse 800x600).\n");
 
     /* Initialize DimonVirtualCPU-64 Virtual Machine */
-    static VM vm;
+    static DimonSystem vm;
     vm_init(&vm);
 
     /* Attach 64 MB Continuous Guest RAM */
@@ -986,6 +1142,10 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     vm.gui_flush_cb = on_baremetal_gui_flush;
     vm.gui_poll_cb  = on_baremetal_gui_poll;
 
+    /* PC Speaker as the PSG backend (non-blocking, muted by irq0). */
+    vm.psg_userdata = &vm;
+    vm.psg_play_cb  = on_baremetal_psg_play;
+
     /* Attach embedded ISO virtual disk first (read-only fallback). */
     size_t iso_size = (size_t)(_dimon_iso_end - _dimon_iso_start);
     if (iso_size >= 512) {
@@ -993,7 +1153,7 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
         vm.disk_sectors = (uint32_t)(iso_size / 512);
         vm.disk_writable = 0;
         vm.storage_mode = DIMON_STORAGE_READONLY;
-        vm_block_unbind(&vm);
+        vm_block_unbind((DimonDisk *)&vm);
         serial_printf("[DimonOS] Attached embedded ISO disk: %u sectors (%u KB, read-only).\n",
                       vm.disk_sectors, (unsigned)(iso_size / 1024));
     } else {
@@ -1026,41 +1186,17 @@ void kernel_main(uint32_t magic, uint32_t mb_info) {
     else
         serial_puts("[STORAGE] Mode=DISK UNAVAILABLE/ERROR | Open may fail.\n");
 
-    /* Load and launch DimonOS-64 binary */
-    size_t os_size = (size_t)(_os_bin_end - _os_bin_start);
-    if (os_size == 0) {
-        serial_puts("[FATAL] Embedded os.bin is empty!\n");
-        for (;;) hlt();
-    }
+    /* Launch the native C desktop (Window Manager + 7 apps).
+     * No os.bin / vm_step: all guest logic lives in desktop.c. */
+    serial_puts("[DimonOS] Starting native C desktop (no vm_step)...\n");
+    desktop_run(&vm);
 
-    if (vm_load_buf(&vm, _os_bin_start, os_size, 0) != 0) {
-        serial_puts("[FATAL] Failed to load os.bin into VM RAM!\n");
-        for (;;) hlt();
-    }
-    serial_printf("[DimonOS] Loaded embedded os.bin (%u bytes) into VM RAM.\n", (unsigned)os_size);
-
-    serial_puts("[DimonOS] Resetting virtual CPU to entry 0x00000000...\n");
-    vm_reset(&vm, 0);
-
-    /* Initial screen flush */
+    /* desktop_run returns after a clean Exit OS request. */
     on_baremetal_gui_flush(&vm);
-
-    serial_puts("[DimonOS] Starting DimonOS-64 TrueColor Desktop GUI execution loop...\n");
-    int vm_rc = vm_run(&vm);
-
-    if (vm_rc == 1) {
-        /* The guest has already drawn and flushed its terminal shutdown frame.
-           QEMU's PIIX4 ACPI PM control register accepts S5 at 0x604. If this
-           backend does not implement it, execution falls through to the
-           explicit halted state below. */
-        on_baremetal_gui_flush(&vm);
-        serial_puts("[DimonOS] Shutdown requested; final frame flushed.\n");
-        serial_puts("[DimonOS] Requesting QEMU ACPI power-off.\n");
-        outw(0x604, 0x2000);
-        serial_puts("[DimonOS] System halted. You may close QEMU.\n");
-    } else {
-        serial_printf("[DimonOS] VM stopped unexpectedly (rc=%d); halting.\n", vm_rc);
-    }
+    serial_puts("[DimonOS] Shutdown requested; final frame flushed.\n");
+    serial_puts("[DimonOS] Requesting QEMU ACPI power-off.\n");
+    outw(0x604, 0x2000);
+    serial_puts("[DimonOS] System halted. You may close QEMU.\n");
     for (;;) {
         cli();
         hlt();
