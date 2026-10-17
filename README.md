@@ -1,8 +1,8 @@
 # DimonOS-64 — Native Bare-Metal Multitasking OS
 
 <p align="center">
-  <img src="img/1.png" width="48%" />
-  <img src="img/2.png" width="48%" />
+  <img src="img/1.jpg" width="48%" />
+  <img src="img/2.jpg" width="48%" />
 </p>
 
 DimonOS-64 has evolved from a virtual machine concept into a **fully native bare-metal operating system**. It features a custom preemptive multitasking kernel, a graphical window manager, and a persistent FAT16 filesystem.
